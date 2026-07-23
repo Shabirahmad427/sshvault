@@ -1,0 +1,9 @@
+{
+  "terminal_scrollback_limit": 5000,
+  "connection_timeout": 15,
+  "default_download_directory": "",
+  "confirm_multiline_paste": true,
+  "confirm_delete": true,
+  "confirm_overwrite": true
+}
+

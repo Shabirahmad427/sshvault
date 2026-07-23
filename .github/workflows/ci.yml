@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -e '.[dev]'
+      - run: ruff check sshvault
+      - run: ruff format --check sshvault
+      - run: mypy sshvault/sshvault_core.py
+      - run: mypy sshvault/sshvault_security.py
+      # sshvault.py has documented UI-only diagnostics in typing-baseline.md;
+      # core and security modules are the enforced Mypy gate.
+      - run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sshvault python -m unittest discover -s sshvault/tests -v
+      - run: python -m build
