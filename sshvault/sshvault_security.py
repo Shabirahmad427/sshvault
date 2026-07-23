@@ -6,12 +6,14 @@ import base64
 from dataclasses import dataclass, field
 from enum import Enum
 import hashlib
+import json
 import os
 from pathlib import Path
 import tempfile
 import threading
 import queue
 from typing import Any, Callable
+from datetime import datetime, timezone
 
 import paramiko
 
@@ -194,6 +196,103 @@ class KnownHostsStore:
             raise KnownHostsError("Could not safely save the server identity.") from exc
         finally:
             if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+@dataclass(frozen=True)
+class HostKeyRecord:
+    hostname: str
+    port: int
+    algorithm: str
+    fingerprint: str
+    first_trusted: str
+    last_used: str
+    associated_profiles: tuple[str, ...] = ()
+
+
+class HostKeyRepository:
+    """Read-only metadata facade over the application known-host file."""
+
+    def __init__(self, path: Path, profiles: list[dict[str, Any]] | None = None) -> None:
+        self.path = path
+        self.profiles = profiles or []
+
+    def list_records(self) -> list[HostKeyRecord]:
+        keys = KnownHostsStore(self.path).load()
+        stamp = (
+            datetime.fromtimestamp(self.path.stat().st_mtime, timezone.utc).isoformat() if self.path.exists() else ""
+        )
+        records: list[HostKeyRecord] = []
+        for lookup, algorithms in keys.items():
+            host, port = self._split_lookup(lookup)
+            associations = tuple(
+                sorted(
+                    str(p.get("name", ""))
+                    for p in self.profiles
+                    if str(p.get("host", "")) == host and int(p.get("port", 22)) == port
+                )
+            )
+            for algorithm, key in algorithms.items():
+                records.append(
+                    HostKeyRecord(host, port, algorithm, sha256_fingerprint(key), stamp, stamp, associations)
+                )
+        return records
+
+    @staticmethod
+    def _split_lookup(lookup: str) -> tuple[str, int]:
+        if lookup.startswith("[") and "]:" in lookup:
+            host, port = lookup[1:].rsplit("]:", 1)
+            return host, int(port)
+        return lookup, 22
+
+    def remove(self, record: HostKeyRecord) -> None:
+        keys = KnownHostsStore(self.path).load()
+        lookup = host_lookup_name(record.hostname, record.port)
+        if (
+            lookup not in keys
+            or record.algorithm not in keys[lookup]
+            or sha256_fingerprint(keys[lookup][record.algorithm]) != record.fingerprint
+        ):
+            raise KnownHostsError("The selected host-key entry was not found.")
+        rebuilt = paramiko.HostKeys()
+        for host_name, algorithms in keys.items():
+            for algorithm, key in algorithms.items():
+                if host_name == lookup and algorithm == record.algorithm:
+                    continue
+                rebuilt.add(host_name, algorithm, key)
+        keys = rebuilt
+        temporary = None
+        try:
+            fd, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent, text=True)
+            os.close(fd)
+            keys.save(temporary)
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, self.path)
+        except OSError as exc:
+            raise KnownHostsError("Could not safely remove the host-key entry.") from exc
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def export(self, destination: Path) -> None:
+        payload = {
+            "schema_version": 1,
+            "kind": "sshvault-application-known-hosts",
+            "entries": [r.__dict__ for r in self.list_records()],
+        }
+        temporary = None
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent, text=True)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, indent=2)
+                stream.write("\n")
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, destination)
+        except OSError as exc:
+            raise KnownHostsError("Could not export host-key data.") from exc
+        finally:
+            if temporary and os.path.exists(temporary):
                 os.unlink(temporary)
 
 

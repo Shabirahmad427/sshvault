@@ -11,6 +11,9 @@ from datetime import datetime
 import ipaddress
 import json
 import os
+import platform
+import socket
+import time
 from pathlib import Path
 import re
 import shutil
@@ -40,6 +43,12 @@ _ALLOWED_FIELDS = {
     "timeout",
     "compression",
     "password",
+    "login_options",
+    "terminal_options",
+    "sftp_options",
+    "tunnel_options",
+    "connection_options",
+    "launch_preferences",
 }
 _SETTINGS_ALLOWED = {
     "scrollback_limit",
@@ -394,6 +403,379 @@ def atomic_json_write(path: Path, payload: dict[str, Any]) -> None:
             os.unlink(temp_name)
 
 
+@dataclass(frozen=True)
+class LoginOptions:
+    proxy_jump: str = ""
+    timeout: int = 15
+    keepalive_interval: int = 0
+    compression: bool = False
+
+
+@dataclass(frozen=True)
+class TerminalOptions:
+    terminal_type: str = "xterm-256color"
+    scrollback: int = 5000
+    starting_directory: str = ""
+    startup_command: str = ""
+    environment: tuple[tuple[str, str], ...] = ()
+    auto_open: bool = True
+    font_override: bool = False
+    font_size: int = 10
+
+
+@dataclass(frozen=True)
+class SFTPOptions:
+    initial_local_directory: str = ""
+    initial_remote_directory: str = ""
+    collision_behavior: str = "ask"
+    preserve_timestamps: bool = False
+    verify_transfers: bool = False
+    auto_open: bool = False
+
+
+@dataclass(frozen=True)
+class TunnelRule:
+    rule_id: str = field(default_factory=lambda: str(uuid4()))
+    enabled: bool = True
+    type: str = "Local"
+    bind_address: str = "127.0.0.1"
+    bind_port: int = 0
+    destination_host: str = ""
+    destination_port: int = 0
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class TunnelOptions:
+    rules: tuple[TunnelRule, ...] = ()
+
+
+@dataclass(frozen=True)
+class ConnectionOptions:
+    automatic_reconnect: bool = False
+    reconnect_delay: int = 5
+    maximum_reconnect_delay: int = 60
+    maximum_attempts: int = 3
+    exponential_backoff: bool = True
+    reopen_terminal: bool = True
+    reopen_sftp: bool = False
+    restart_tunnels: bool = False
+    logging_level: str = "normal"
+
+
+def reconnect_delay(initial: int, maximum: int, attempt: int, exponential: bool = True) -> int:
+    """Return the bounded delay before a 1-based reconnect attempt."""
+    initial = max(1, int(initial))
+    maximum = max(initial, int(maximum))
+    attempt = max(1, int(attempt))
+    return min(initial * (2 ** (attempt - 1)) if exponential else initial, maximum)
+
+
+class ReconnectController:
+    """UI-free reconnect state machine with injectable scheduling and connector."""
+
+    STATES = {
+        "connected",
+        "connection lost",
+        "waiting",
+        "reconnecting",
+        "reconnected",
+        "attempts exhausted",
+        "manually disconnected",
+    }
+
+    def __init__(
+        self, options: dict[str, Any] | ConnectionOptions | None = None, schedule: Any = None, connector: Any = None
+    ) -> None:
+        raw = options if isinstance(options, dict) else (options.__dict__ if options else {})
+        self.enabled = bool(raw.get("automatic_reconnect", False))
+        self.initial_delay = max(1, int(raw.get("reconnect_delay", 5)))
+        self.maximum_delay = max(self.initial_delay, int(raw.get("maximum_reconnect_delay", 60)))
+        self.maximum_attempts = max(0, int(raw.get("maximum_attempts", 3)))
+        self.exponential = bool(raw.get("exponential_backoff", True))
+        self.schedule = schedule or (lambda delay, callback: callback())
+        self.connector = connector
+        self.state = "connected"
+        self.attempt = 0
+        self.generation = 0
+        self.pending = False
+        self._cancelled = False
+
+    def unexpected_loss(self, generation: int) -> bool:
+        if not self.enabled or self.pending or self._cancelled or generation != self.generation:
+            return False
+        self.state, self.attempt, self.pending = "connection lost", 0, True
+        self._schedule_next()
+        return True
+
+    def _schedule_next(self) -> None:
+        if not self.pending or self.attempt >= self.maximum_attempts:
+            self.pending = False
+            self.state = "attempts exhausted"
+            return
+        self.attempt += 1
+        delay = reconnect_delay(self.initial_delay, self.maximum_delay, self.attempt, self.exponential)
+        self.state = "waiting"
+        self.schedule(delay, self._attempt)
+
+    def _attempt(self) -> None:
+        if not self.pending or self._cancelled:
+            return
+        self.state = "reconnecting"
+        try:
+            if self.connector is None or self.connector():
+                self.pending = False
+                self.state = "reconnected"
+                return
+        except Exception:
+            pass
+        self._schedule_next()
+
+    def reconnect_now(self) -> None:
+        if self._cancelled:
+            return
+        self.pending = True
+        self._attempt()
+
+    def cancel(self, manual: bool = True) -> None:
+        self.pending = False
+        self._cancelled = True
+        self.state = "manually disconnected" if manual else "attempts exhausted"
+
+    def new_session(self) -> int:
+        self.generation += 1
+        self._cancelled = False
+        self.pending = False
+        self.attempt = 0
+        self.state = "connected"
+        return self.generation
+
+
+@dataclass
+class StartupActionResult:
+    name: str
+    status: str = "pending"
+    error: str = ""
+
+
+class StartupActionCoordinator:
+    """Deterministic, generation-aware post-login action coordinator."""
+
+    ORDER = ("tunnels", "terminal", "sftp", "command")
+
+    def __init__(self, handlers: dict[str, Any] | None = None) -> None:
+        self.handlers = handlers or {}
+        self.generation = 0
+        self.running = False
+        self.results: list[StartupActionResult] = []
+        self.cancelled = False
+        self._completed_generation: int | None = None
+
+    def run(self, preferences: dict[str, Any], generation: int, *, manual: bool = False) -> list[StartupActionResult]:
+        if (self.running or self._completed_generation == generation) and not manual:
+            return list(self.results)
+        if generation != self.generation:
+            self.generation = generation
+        self.cancelled = False
+        self.running = True
+        self.results = []
+        enabled = {
+            "tunnels": bool(preferences.get("start_enabled_tunnels") or preferences.get("restart_tunnels")),
+            "terminal": bool(preferences.get("open_terminal", True)),
+            "sftp": bool(preferences.get("open_sftp", False)),
+            "command": bool(str(preferences.get("startup_command", "")).strip()),
+        }
+        for name in self.ORDER:
+            if self.cancelled or generation != self.generation:
+                self.results.append(StartupActionResult(name, "cancelled"))
+                continue
+            if not enabled[name]:
+                self.results.append(StartupActionResult(name, "skipped"))
+                continue
+            result = StartupActionResult(name, "running")
+            self.results.append(result)
+            try:
+                handler = self.handlers.get(name)
+                if handler is None:
+                    raise RuntimeError("Startup action unavailable.")
+                handler(preferences) if name == "command" else handler()
+                result.status = "completed"
+            except Exception as exc:
+                result.status = "failed"
+                result.error = str(redact_secrets(str(exc)))
+        self.running = False
+        self._completed_generation = generation
+        return list(self.results)
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        self.running = False
+
+    def invalidate(self, generation: int) -> None:
+        self.generation = generation
+        self._completed_generation = None
+        self.cancel()
+
+
+@dataclass(frozen=True)
+class DiagnosticRecord:
+    field: str
+    value: str
+
+
+@dataclass
+class ConnectionDiagnostics:
+    records: list[DiagnosticRecord] = field(default_factory=list)
+    generation: int = 0
+
+    def as_text(self) -> str:
+        return "SSHVault diagnostics (host and network metadata may be present)\n" + "\n".join(
+            f"{r.field}: {r.value}" for r in self.records
+        )
+
+
+class DiagnosticsCollector:
+    FIELDS = (
+        "SSHVault version",
+        "Python version",
+        "Paramiko version",
+        "Operating system",
+        "Profile name",
+        "Host",
+        "Port",
+        "Username",
+        "Authentication method",
+        "ProxyJump route",
+        "DNS result",
+        "TCP connection timing",
+        "Connection state",
+        "Session generation",
+        "Host-key algorithm",
+        "Host-key SHA-256 fingerprint",
+        "Key-exchange algorithm",
+        "Cipher",
+        "MAC algorithm",
+        "Compression",
+        "Keepalive interval",
+        "Terminal state",
+        "SFTP state",
+        "Running tunnel count",
+        "Reconnect state",
+        "Startup-action state",
+        "Last redacted connection error",
+    )
+
+    @classmethod
+    def collect(
+        cls, profile: dict[str, Any] | None = None, session: dict[str, Any] | None = None
+    ) -> ConnectionDiagnostics:
+        profile = profile or {}
+        session = session or {}
+        values = {
+            "SSHVault version": str(session.get("version", "0.3.2")),
+            "Python version": platform.python_version(),
+            "Paramiko version": str(session.get("paramiko_version", "Unavailable")),
+            "Operating system": platform.platform(),
+            "Profile name": str(profile.get("name", "Unavailable")),
+            "Host": str(profile.get("host", "Unavailable")),
+            "Port": str(profile.get("port", "Unavailable")),
+            "Username": str(profile.get("user", "Unavailable")),
+            "Authentication method": str(profile.get("auth_method", "Unavailable")),
+            "ProxyJump route": str(profile.get("proxy_jump") or "Direct"),
+            "DNS result": str(session.get("dns", "Unavailable")),
+            "TCP connection timing": str(session.get("tcp_timing", "Unavailable")),
+            "Connection state": str(session.get("state", "disconnected")),
+            "Session generation": str(session.get("generation", 0)),
+            "Host-key algorithm": str(session.get("host_key_algorithm", "Unavailable")),
+            "Host-key SHA-256 fingerprint": str(session.get("host_key_fingerprint", "Unavailable")),
+            "Key-exchange algorithm": str(session.get("kex", "Unavailable")),
+            "Cipher": str(session.get("cipher", "Unavailable")),
+            "MAC algorithm": str(session.get("mac", "Unavailable")),
+            "Compression": str(session.get("compression", "Unavailable")),
+            "Keepalive interval": str(session.get("keepalive", "Unavailable")),
+            "Terminal state": str(session.get("terminal", "Unavailable")),
+            "SFTP state": str(session.get("sftp", "Unavailable")),
+            "Running tunnel count": str(session.get("tunnels", 0)),
+            "Reconnect state": str(session.get("reconnect", "Unavailable")),
+            "Startup-action state": str(session.get("startup", "Unavailable")),
+            "Last redacted connection error": str(redact_secrets(session.get("error", "Unavailable"))),
+        }
+        return ConnectionDiagnostics(
+            [DiagnosticRecord(name, values.get(name, "Unavailable")) for name in cls.FIELDS],
+            int(session.get("generation", 0)),
+        )
+
+    @staticmethod
+    def network_check(
+        host: str,
+        port: int,
+        timeout: float = 3.0,
+        resolver: Any = socket.getaddrinfo,
+        connector: Any = socket.create_connection,
+    ) -> dict[str, str]:
+        started = time.monotonic()
+        try:
+            addresses = resolver(host, port, type=socket.SOCK_STREAM)
+            connector((host, port), timeout=timeout).close()
+            return {
+                "dns": ", ".join(sorted({str(item[4][0]) for item in addresses})),
+                "tcp": f"{time.monotonic() - started:.3f}s",
+            }
+        except Exception as exc:
+            return {"dns": "Unavailable", "tcp": str(redact_secrets(str(exc)))}
+
+
+@dataclass(frozen=True)
+class ProfileLaunchPreferences:
+    open_terminal: bool = True
+    open_sftp: bool = False
+    startup_command: str = ""
+
+
+def default_profile_sections(raw: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return migrated, secret-free section dictionaries for an old profile."""
+    raw = raw if isinstance(raw, dict) else {}
+    return {
+        "login_options": {
+            "proxy_jump": str(raw.get("proxy_jump", "")),
+            "timeout": int(raw.get("timeout", 15)),
+            "keepalive_interval": 0,
+            "compression": bool(raw.get("compression", False)),
+        },
+        "terminal_options": {
+            "terminal_type": "xterm-256color",
+            "scrollback": 5000,
+            "starting_directory": str(raw.get("startup_directory", "")),
+            "startup_command": str(raw.get("startup_command", "")),
+            "environment": {},
+            "auto_open": True,
+            "font_override": False,
+            "font_size": 10,
+        },
+        "sftp_options": {
+            "initial_local_directory": "",
+            "initial_remote_directory": "",
+            "collision_behavior": "ask",
+            "preserve_timestamps": False,
+            "verify_transfers": False,
+            "auto_open": False,
+        },
+        "tunnel_options": {"rules": []},
+        "connection_options": {
+            "automatic_reconnect": False,
+            "reconnect_delay": 5,
+            "maximum_reconnect_delay": 60,
+            "maximum_attempts": 3,
+            "exponential_backoff": True,
+            "reopen_terminal": True,
+            "reopen_sftp": False,
+            "restart_tunnels": False,
+            "logging_level": "normal",
+        },
+        "launch_preferences": {"open_terminal": True, "open_sftp": False, "startup_command": ""},
+    }
+
+
 @dataclass
 class ProfileFormState:
     """UI-independent state for the connection editor.
@@ -429,6 +811,79 @@ class ProfileFormState:
     @property
     def can_save(self) -> bool:
         return self.validation_error() is None
+
+
+@dataclass(frozen=True)
+class ProfileValidationIssue:
+    tab: str
+    field: str
+    message: str
+    related_id: str | None = None
+
+
+@dataclass
+class ProfileDraft:
+    """Staged, secret-free profile editing model."""
+
+    values: dict[str, Any] = field(default_factory=dict)
+    password: str = ""
+    passphrase: str = ""
+    remove_password: bool = False
+
+    @classmethod
+    def from_profile(cls, profile: dict[str, Any]) -> "ProfileDraft":
+        safe = {key: value for key, value in profile.items() if key not in {"password", "passphrase"}}
+        return cls(values=json.loads(json.dumps(safe, ensure_ascii=False)))
+
+    def set_value(self, key: str, value: Any) -> None:
+        self.values[key] = value
+
+    def issues(
+        self, profiles: list[dict[str, Any]] | None = None, editing_id: str | None = None
+    ) -> list[ProfileValidationIssue]:
+        issues: list[ProfileValidationIssue] = []
+        try:
+            validate_profile(self.values, check_key_exists=False)
+        except ProfileError as exc:
+            text = str(exc)
+            field = "host" if "host" in text.casefold() else "profile"
+            issues.append(ProfileValidationIssue("Login", field, text))
+        method = str(self.values.get("auth_method", "agent"))
+        if method == "key" and not str(self.values.get("key_path", "")).strip():
+            issues.append(ProfileValidationIssue("Login", "key_path", "Choose a private-key path."))
+        if profiles is not None:
+            name = str(self.values.get("name", "")).strip().casefold()
+            for profile in profiles:
+                if profile.get("id") != editing_id and str(profile.get("name", "")).casefold() == name:
+                    issues.append(ProfileValidationIssue("Login", "name", "Profile name already exists."))
+        try:
+            validate_environment(self.values.get("terminal_options", {}).get("environment", {}))
+        except ProfileError as exc:
+            issues.append(ProfileValidationIssue("Terminal", "environment", str(exc)))
+        try:
+            validate_tunnel_rules(self.values.get("tunnel_options", {}).get("rules", []))
+        except ProfileError as exc:
+            issues.append(ProfileValidationIssue("Tunnels", "rules", str(exc)))
+        return issues
+
+    def clean_profile(
+        self, profiles: list[dict[str, Any]] | None = None, editing_id: str | None = None
+    ) -> dict[str, Any]:
+        issues = self.issues(profiles, editing_id)
+        if issues:
+            raise ProfileError(issues[0].message)
+        return validate_profile(self.values, check_key_exists=False)
+
+    def duplicate(self) -> "ProfileDraft":
+        copy = ProfileDraft.from_profile(self.values)
+        copy.values["id"] = str(uuid4())
+        copy.values["name"] = f"{self.values.get('name', 'Profile')} Copy"
+        copy.password = copy.passphrase = ""
+        copy.remove_password = True
+        rules = copy.values.get("tunnel_options", {}).get("rules", [])
+        for rule in rules:
+            rule["rule_id"] = str(uuid4())
+        return copy
 
 
 @dataclass
@@ -584,6 +1039,250 @@ class TunnelRuntime:
             self.bytes_transferred = None
         else:
             self.bytes_transferred += max(0, count)
+
+
+@dataclass
+class RunningTunnel:
+    """UI-free runtime record for one saved tunnel rule."""
+
+    rule: dict[str, Any]
+    runtime: TunnelRuntime
+    status: str = "stopped"
+    error: str = ""
+
+
+class TunnelManager:
+    """Validate and own saved tunnel runtimes for one SSH session.
+
+    The Tk panel supplies the actual forwarding worker; this class owns the
+    lifecycle decisions and prevents stale or conflicting starts.
+    """
+
+    def __init__(self, transport: Any = None, generation: int = 0) -> None:
+        self.transport = transport
+        self.generation = generation
+        self.connected = transport is not None
+        self.running: dict[str, RunningTunnel] = {}
+
+    @staticmethod
+    def _bind(rule: dict[str, Any]) -> tuple[str, int]:
+        return (str(rule.get("bind_address", "127.0.0.1")).strip(), int(rule.get("bind_port", 0)))
+
+    def validate_start(self, rule: dict[str, Any]) -> str | None:
+        if not self.connected:
+            return "Not connected."
+        try:
+            validate_tunnel_rules([rule])
+        except ProfileError as exc:
+            return str(exc)
+        key = self._bind(rule)
+        if any(
+            self._bind(item.rule) == key for item in self.running.values() if item.status in {"starting", "running"}
+        ):
+            return "A tunnel already uses this bind endpoint."
+        return None
+
+    def start(self, rule: dict[str, Any], starter: Any = None) -> RunningTunnel:
+        issue = self.validate_start(rule)
+        if issue:
+            raise ProfileError(issue)
+        rule_id = str(rule.get("rule_id") or rule.get("id") or uuid4().hex)
+        runtime = RunningTunnel(dict(rule, id=rule_id), TunnelRuntime(generation=self.generation), "starting")
+        self.running[rule_id] = runtime
+        try:
+            if starter is not None:
+                starter(runtime)
+            runtime.status = "running"
+        except Exception as exc:
+            runtime.status = "failed"
+            runtime.error = str(redact_secrets(str(exc)))
+            runtime.runtime.stop()
+            raise
+        return runtime
+
+    def stop(self, rule_id: str) -> bool:
+        item = self.running.get(rule_id)
+        if item is None or item.status in {"stopped", "stopping"}:
+            return False
+        item.status = "stopping"
+        item.runtime.stop()
+        item.status = "stopped"
+        return True
+
+    def stop_all(self) -> None:
+        for rule_id in list(self.running):
+            self.stop(rule_id)
+
+    def invalidate(self, generation: int) -> None:
+        if generation != self.generation:
+            return
+        self.stop_all()
+        self.connected = False
+
+
+def parse_socks5_connect(data: bytes) -> tuple[str, int] | None:
+    """Parse a SOCKS5 CONNECT request, rejecting unsupported commands."""
+    if len(data) < 7 or data[0] != 5 or data[1] != 1:
+        return None
+    atyp = data[3]
+    pos = 4
+    try:
+        if atyp == 1 and len(data) >= pos + 4:
+            host = str(ipaddress.ip_address(data[pos : pos + 4]))
+            pos += 4
+        elif atyp == 3 and len(data) > pos:
+            length = data[pos]
+            pos += 1
+            if len(data) < pos + length:
+                return None
+            host = data[pos : pos + length].decode("idna")
+            pos += length
+        elif atyp == 4 and len(data) >= pos + 16:
+            host = str(ipaddress.ip_address(data[pos : pos + 16]))
+            pos += 16
+        else:
+            return None
+        if len(data) < pos + 2:
+            return None
+        return host, int.from_bytes(data[pos : pos + 2], "big")
+    except (UnicodeError, ValueError):
+        return None
+
+
+@dataclass
+class TransferItem:
+    """A serializable transfer request and its UI-independent progress."""
+
+    source: str
+    target: str
+    direction: str
+    total: int | None = None
+    status: str = "Queued"
+    transferred: int = 0
+    error: str = ""
+    generation: int = 0
+    item_id: str = field(default_factory=lambda: uuid4().hex)
+
+    def progress(self) -> float | None:
+        return None if not self.total or self.total < 0 else min(100.0, self.transferred * 100.0 / self.total)
+
+
+def safe_transfer_plan(root: str | Path, relative_paths: list[str]) -> list[tuple[Path, str]]:
+    """Build a root-confined plan, rejecting traversal and symlink loops."""
+    base = Path(root).resolve()
+    plan: list[tuple[Path, str]] = []
+    for raw in relative_paths:
+        candidate = (base / raw).resolve()
+        if candidate != base and base not in candidate.parents:
+            raise ProfileError("Transfer path escapes the selected root.")
+        if candidate.is_symlink():
+            raise ProfileError("Symlinks are not followed during recursive transfer.")
+        if candidate.is_dir():
+            for child in candidate.rglob("*"):
+                if child.is_symlink():
+                    continue
+                if child.is_file():
+                    plan.append((child, str(child.relative_to(base))))
+        elif candidate.is_file():
+            plan.append((candidate, str(candidate.relative_to(base))))
+    return plan
+
+
+class TransferQueueManager:
+    """FIFO, single-active transfer queue with cooperative lifecycle control."""
+
+    def __init__(self, generation: int = 0) -> None:
+        self.generation = generation
+        self.items: list[TransferItem] = []
+        self.active: TransferItem | None = None
+        self.closed = False
+
+    def enqueue(self, item: TransferItem) -> TransferItem:
+        if self.closed:
+            raise ProfileError("Transfer queue is closed.")
+        item.generation = self.generation
+        self.items.append(item)
+        self._activate_next()
+        return item
+
+    def _activate_next(self) -> None:
+        if self.active is not None:
+            return
+        next_item = next((x for x in self.items if x.status == "Queued"), None)
+        if next_item:
+            self.active = next_item
+            next_item.status = "Preparing"
+
+    def mark_transferring(self) -> bool:
+        if self.active is None:
+            return False
+        self.active.status = "Transferring"
+        return True
+
+    def pause(self, item_id: str) -> bool:
+        item = self.get(item_id)
+        if item and item.status == "Transferring":
+            item.status = "Paused"
+            return True
+        return False
+
+    def resume(self, item_id: str) -> bool:
+        item = self.get(item_id)
+        if item and item.status == "Paused":
+            item.status = "Transferring"
+            return True
+        return False
+
+    def cancel(self, item_id: str) -> bool:
+        item = self.get(item_id)
+        if item is None or item.status in {"Completed", "Cancelled"}:
+            return False
+        item.status = "Cancelled"
+        if self.active is item:
+            self.active = None
+            self._activate_next()
+        return True
+
+    def complete(self, item_id: str, *, error: str = "") -> bool:
+        item = self.get(item_id)
+        if item is None or item.generation != self.generation:
+            return False
+        item.status = "Failed" if error else "Completed"
+        item.error = error
+        if self.active is item:
+            self.active = None
+            self._activate_next()
+        return True
+
+    def retry_failed(self) -> None:
+        for item in self.items:
+            if item.status == "Failed":
+                item.status = "Queued"
+                item.error = ""
+        self._activate_next()
+
+    def move(self, item_id: str, delta: int) -> bool:
+        index = next((i for i, x in enumerate(self.items) if x.item_id == item_id), -1)
+        if index < 0 or self.items[index] is self.active or self.items[index].status != "Queued":
+            return False
+        target = index + delta
+        if target < 0 or target >= len(self.items) or self.items[target] is self.active:
+            return False
+        self.items[index], self.items[target] = self.items[target], self.items[index]
+        return True
+
+    def get(self, item_id: str) -> TransferItem | None:
+        return next((x for x in self.items if x.item_id == item_id), None)
+
+    def clear_completed(self) -> None:
+        self.items = [x for x in self.items if x.status != "Completed"]
+
+    def shutdown(self) -> None:
+        self.closed = True
+        for item in self.items:
+            if item.status in {"Queued", "Preparing", "Transferring", "Paused"}:
+                item.status = "Cancelled"
+        self.active = None
 
 
 @dataclass
@@ -931,7 +1630,7 @@ def validate_profile(raw: dict[str, Any], *, check_key_exists: bool = True) -> d
     compression = raw.get("compression", False)
     if not isinstance(compression, bool):
         raise ProfileError("Compression must be enabled or disabled.")
-    return {
+    result = {
         "id": str(raw.get("id") or uuid4()),
         "name": str(raw.get("name", "")).strip() or host,
         "host": host,
@@ -949,10 +1648,91 @@ def validate_profile(raw: dict[str, Any], *, check_key_exists: bool = True) -> d
         "timeout": timeout,
         "compression": compression,
     }
+    defaults = default_profile_sections(raw)
+    for section in (
+        "login_options",
+        "terminal_options",
+        "sftp_options",
+        "tunnel_options",
+        "connection_options",
+        "launch_preferences",
+    ):
+        value = raw.get(section)
+        result[section] = value if isinstance(value, dict) else defaults[section]
+    return result
 
 
 def profile_identity(profile: dict[str, Any]) -> tuple[str, int, str]:
     return (str(profile["host"]).lower(), int(profile["port"]), str(profile["user"]).lower())
+
+
+def validate_proxy_chain(profile: dict[str, Any], profiles: list[dict[str, Any]]) -> None:
+    """Reject missing, self-referential, and circular ProxyJump chains."""
+    by_name = {str(item.get("name", "")).casefold(): item for item in profiles}
+    current = profile
+    seen: set[str] = set()
+    while True:
+        name = str(current.get("name", "")).casefold()
+        if name in seen:
+            raise ProfileError("ProxyJump cycle detected: " + " → ".join(sorted(seen)))
+        seen.add(name)
+        target = str(current.get("proxy_jump", "")).strip()
+        if not target:
+            return
+        if target.casefold() == name:
+            raise ProfileError("A profile cannot use itself as ProxyJump.")
+        next_profile = by_name.get(target.casefold())
+        if next_profile is None:
+            raise ProfileError(f"ProxyJump profile not found: {target}.")
+        current = next_profile
+
+
+def validate_environment(environment: dict[str, Any]) -> dict[str, str]:
+    if not isinstance(environment, dict):
+        raise ProfileError("Environment variables must be an object.")
+    result: dict[str, str] = {}
+    for key, value in environment.items():
+        name = str(key)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ProfileError(f"Invalid environment variable name: {name}.")
+        if name in result:
+            raise ProfileError(f"Duplicate environment variable: {name}.")
+        result[name] = str(value)
+    return result
+
+
+def validate_tunnel_rules(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not isinstance(rules, list):
+        raise ProfileError("Tunnel rules must be a list.")
+    result: list[dict[str, Any]] = []
+    endpoints: set[tuple[str, int]] = set()
+    for raw in rules:
+        rule = dict(raw)
+        kind = str(rule.get("type", "Local"))
+        if kind not in {"Local", "Remote", "SOCKS"}:
+            raise ProfileError("Tunnel type must be Local, Remote, or SOCKS.")
+        bind_port = validate_port(rule.get("bind_port", 0)) if rule.get("bind_port", 0) else 0
+        destination_port = validate_port(rule.get("destination_port", 0)) if rule.get("destination_port", 0) else 0
+        if kind != "SOCKS" and (not str(rule.get("destination_host", "")).strip() or not destination_port):
+            raise ProfileError("Local and Remote tunnels require a destination host and port.")
+        if kind == "SOCKS":
+            destination_port, rule["destination_host"] = 0, ""
+        endpoint = (str(rule.get("bind_address", "127.0.0.1")), bind_port)
+        if bool(rule.get("enabled", True)) and endpoint in endpoints:
+            raise ProfileError("Enabled tunnel bind endpoints must be unique.")
+        endpoints.add(endpoint)
+        rule.update(
+            {
+                "rule_id": str(rule.get("rule_id") or uuid4()),
+                "enabled": bool(rule.get("enabled", True)),
+                "type": kind,
+                "bind_port": bind_port,
+                "destination_port": destination_port,
+                "description": str(rule.get("description", ""))[:200],
+            }
+        )
+        result.append(rule)
+    return result
 
 
 def connection_kwargs(profile: dict[str, Any], password: str | None = None) -> dict[str, Any]:

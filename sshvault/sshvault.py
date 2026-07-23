@@ -23,6 +23,7 @@ import tempfile
 import shutil
 from pathlib import Path
 from datetime import datetime
+from uuid import uuid4
 from sshvault_security import (
     ChangedHostKeyRejected,
     KnownHostsStore,
@@ -30,6 +31,7 @@ from sshvault_security import (
     TrustDecision,
     UnknownHostCancelled,
     ProxyConnectionContext,
+    HostKeyRepository,
 )
 from sshvault_security import SecurityRequestQueue
 from sshvault_core import (
@@ -45,6 +47,12 @@ from sshvault_core import (
     TerminalPanelState,
     TunnelFormState,
     TunnelRuntime,
+    TunnelManager,
+    ReconnectController,
+    StartupActionCoordinator,
+    DiagnosticsCollector,
+    TransferItem,
+    TransferQueueManager,
     CommandExecutionState,
     atomic_json_write,
     validate_settings,
@@ -257,6 +265,7 @@ class TerminalWidget(tk.Frame):
         self._find_matches: list[str] = []
         self._find_index = -1
         self.on_resize = None
+        self.on_connection_lost = None
 
         if pyte:
             self._screen = _ScrollbackScreen(cols, rows, self._queue_scrollback)
@@ -363,7 +372,13 @@ class TerminalWidget(tk.Frame):
             except Exception:
                 break
         if not stop.is_set():
-            self.after(0, lambda g=generation: self._terminal_state.ended(g, lost=True))
+            self.after(
+                0,
+                lambda g=generation: (
+                    self._terminal_state.ended(g, lost=True),
+                    self.on_connection_lost and self.on_connection_lost(g),
+                ),
+            )
 
     @staticmethod
     def _writer(channel, stop, outbound):
@@ -838,6 +853,7 @@ class SFTPPanel(tk.Frame):
         self._closed = False
         self._remote_generation = 0
         self._sftp_state = SFTPPanelState()
+        self._transfer_manager = TransferQueueManager()
         self._local_load_state = DirectoryLoadState()
         self._local_load_lock = threading.Lock()
         self._local_load_path = self._local_cwd
@@ -871,6 +887,22 @@ class SFTPPanel(tk.Frame):
         self._progress.pack(side="right", padx=8)
         self._status_var = tk.StringVar(value="Disconnected")
         tk.Label(top, textvariable=self._status_var, bg=PANEL, fg=MUTED, font=FONT).pack(side="right", padx=4)
+        queue_frame = tk.LabelFrame(self, text="Transfer queue", bg=PANEL, fg=TEXT, font=FONT)
+        queue_frame.pack(fill="x", padx=4, pady=2)
+        self._transfer_tree = ttk.Treeview(
+            queue_frame, columns=("file", "direction", "progress", "status", "error"), show="headings", height=4
+        )
+        for col, width in (("file", 180), ("direction", 80), ("progress", 90), ("status", 100), ("error", 180)):
+            self._transfer_tree.heading(col, text=col.title())
+            self._transfer_tree.column(col, width=width, anchor="w")
+        self._transfer_tree.pack(fill="x", padx=3, pady=2)
+        qbuttons = tk.Frame(queue_frame, bg=PANEL)
+        qbuttons.pack(fill="x")
+        self._btn(qbuttons, "Pause", self._pause_selected_transfer).pack(side="left", padx=2)
+        self._btn(qbuttons, "Resume", self._resume_selected_transfer).pack(side="left", padx=2)
+        self._btn(qbuttons, "Cancel", self._cancel_selected_transfer).pack(side="left", padx=2)
+        self._btn(qbuttons, "Retry failed", self._retry_failed_transfers).pack(side="left", padx=2)
+        self._btn(qbuttons, "Clear completed", self._clear_completed_transfers).pack(side="left", padx=2)
 
         panes = ttk.PanedWindow(self, orient="horizontal")
         panes.pack(fill="both", expand=True, padx=4, pady=4)
@@ -969,6 +1001,39 @@ class SFTPPanel(tk.Frame):
         panes.add(rf)
         self._update_transfer_actions()
 
+    def _refresh_transfer_tree(self):
+        for iid in self._transfer_tree.get_children():
+            self._transfer_tree.delete(iid)
+        for item in self._transfer_manager.items:
+            progress = "—" if item.progress() is None else f"{item.progress():.0f}%"
+            self._transfer_tree.insert(
+                "", "end", iid=item.item_id, values=(item.source, item.direction, progress, item.status, item.error)
+            )
+
+    def _pause_selected_transfer(self):
+        for iid in self._transfer_tree.selection():
+            self._transfer_manager.pause(iid)
+        self._refresh_transfer_tree()
+
+    def _resume_selected_transfer(self):
+        for iid in self._transfer_tree.selection():
+            self._transfer_manager.resume(iid)
+        self._refresh_transfer_tree()
+
+    def _cancel_selected_transfer(self):
+        for iid in self._transfer_tree.selection():
+            self._transfer_manager.cancel(iid)
+        self._transfer_cancel.set()
+        self._refresh_transfer_tree()
+
+    def _retry_failed_transfers(self):
+        self._transfer_manager.retry_failed()
+        self._refresh_transfer_tree()
+
+    def _clear_completed_transfers(self):
+        self._transfer_manager.clear_completed()
+        self._refresh_transfer_tree()
+
     def _btn(self, p, t, c):
         return tk.Button(
             p, text=t, command=c, bg=ACCENT, fg=BG, font=FONT, relief="flat", padx=6, pady=2, cursor="hand2"
@@ -1055,6 +1120,7 @@ class SFTPPanel(tk.Frame):
 
     def _cancel_transfer(self):
         self._transfer_cancel.set()
+        self._transfer_manager.shutdown()
         self._sftp_state.cancel()
         self._set_status(self._sftp_state.message)
         self._update_transfer_actions()
@@ -1704,9 +1770,18 @@ class SFTPPanel(tk.Frame):
                 self._sftp_state.start_transfer(name, now=time.monotonic())
                 self._update_transfer_actions()
                 self._set_status(f"Uploading {name}…")
+                transfer_item = self._transfer_manager.enqueue(
+                    TransferItem(
+                        local, remote, "Upload", total=Path(local).stat().st_size, generation=self._remote_generation
+                    )
+                )
+                self._refresh_transfer_tree()
                 self._transfer_queue.put(
                     lambda local_path=local, r=remote, n=name, replace=decision == "replace": (
+                        self._transfer_manager.mark_transferring(),
                         self._upload_with_cleanup(Path(local_path), r, replace),
+                        self._transfer_manager.complete(transfer_item.item_id),
+                        self.after(0, self._refresh_transfer_tree),
                         self.after(0, self._refresh_remote),
                     )
                 )
@@ -1756,9 +1831,16 @@ class SFTPPanel(tk.Frame):
             self._sftp_state.start_transfer(name, now=time.monotonic())
             self._update_transfer_actions()
             self._set_status(f"Downloading {name}…")
+            transfer_item = self._transfer_manager.enqueue(
+                TransferItem(remote, str(local), "Download", generation=self._remote_generation)
+            )
+            self._refresh_transfer_tree()
             self._transfer_queue.put(
                 lambda r=remote, local_path=local, replace=decision == "replace": (
+                    self._transfer_manager.mark_transferring(),
                     self._download_with_cleanup(r, local_path, replace),
+                    self._transfer_manager.complete(transfer_item.item_id),
+                    self.after(0, self._refresh_transfer_tree),
                     self.after(0, self._refresh_local),
                 )
             )
@@ -1960,10 +2042,15 @@ def simpledialog_ask(title, prompt, initial="", secret=False):
 
 # ── Port forwarding ──────────────────────────────────────────────────────────
 class PortForwardPanel(tk.Frame):
-    def __init__(self, parent, client, **kw):
+    def __init__(self, parent, client, saved_rules=None, **kw):
         super().__init__(parent, bg=PANEL, **kw)
         self._client = client
         self._tunnels: list[dict] = []
+        self._saved_rules = list(saved_rules or [])
+        self._saved_status = {
+            str(r.get("rule_id") or r.get("id") or i): "Stopped" for i, r in enumerate(self._saved_rules)
+        }
+        self._manager = TunnelManager(client.get_transport() if client else None, id(client))
         self._build()
 
     def _build(self):
@@ -2001,6 +2088,49 @@ class PortForwardPanel(tk.Frame):
             self._tree.column(c, width=w, anchor="w")
         self._tree.pack(fill="both", expand=True, padx=8, pady=4)
 
+        if self._saved_rules:
+            tk.Label(self, text="Saved tunnel rules", bg=PANEL, fg=ACCENT, font=FONT_B).pack(
+                anchor="w", padx=8, pady=(8, 2)
+            )
+            saved_cols = ("enabled", "type", "bind", "destination", "description", "status")
+            self._saved_tree = ttk.Treeview(self, columns=saved_cols, show="headings", height=5, selectmode="browse")
+            for col, width in zip(saved_cols, (65, 80, 140, 150, 180, 80)):
+                self._saved_tree.heading(col, text=col.title())
+                self._saved_tree.column(col, width=width, anchor="w")
+            self._saved_tree.pack(fill="x", padx=8, pady=3)
+            for index, rule in enumerate(self._saved_rules):
+                rid = str(rule.get("rule_id") or rule.get("id") or index)
+                kind = str(rule.get("type", "Local"))
+                bind = f"{rule.get('bind_address', '127.0.0.1')}:{rule.get('bind_port', '')}"
+                dest = (
+                    "(dynamic)"
+                    if kind == "SOCKS"
+                    else f"{rule.get('destination_host', '')}:{rule.get('destination_port', '')}"
+                )
+                self._saved_tree.insert(
+                    "",
+                    "end",
+                    iid=rid,
+                    values=(
+                        "Yes" if rule.get("enabled", True) else "No",
+                        kind,
+                        bind,
+                        dest,
+                        rule.get("description", ""),
+                        self._saved_status[rid],
+                    ),
+                )
+            saved_buttons = tk.Frame(self, bg=PANEL)
+            saved_buttons.pack(anchor="w", padx=8, pady=3)
+            tk.Button(
+                saved_buttons, text="Start selected", command=self._start_saved_selected, bg=GREEN, fg=BG, relief="flat"
+            ).pack(side="left", padx=(0, 4))
+            tk.Button(
+                saved_buttons, text="Start all enabled", command=self._start_all_saved, bg=GREEN, fg=BG, relief="flat"
+            ).pack(side="left")
+        else:
+            self._saved_tree = None
+
         tk.Button(
             self, text="Stop selected", command=self._stop_tunnel, bg=RED, fg=BG, font=FONT, relief="flat", padx=8
         ).pack(anchor="w", padx=8, pady=4)
@@ -2008,6 +2138,40 @@ class PortForwardPanel(tk.Frame):
             self, text="Stop all", command=self._stop_all_tunnels, bg=PANEL, fg=TEXT, font=FONT, relief="flat", padx=8
         ).pack(anchor="w", padx=8, pady=(0, 4))
         self._validate_tunnel()
+
+    def _start_saved_rule(self, rule):
+        try:
+            form_kind = "Dynamic/SOCKS" if rule.get("type") == "SOCKS" else str(rule.get("type", "Local"))
+            self._type_var.set(form_kind)
+            self._lhost.set(str(rule.get("bind_address", "127.0.0.1")))
+            self._lport.set(str(rule.get("bind_port", "")))
+            self._rhost.set(str(rule.get("destination_host", "")))
+            self._rport.set(str(rule.get("destination_port", "")))
+            self._add_tunnel()
+            rid = str(rule.get("rule_id") or rule.get("id"))
+            if self._saved_tree is not None and self._saved_tree.exists(rid):
+                self._saved_status[rid] = "Running"
+                self._saved_tree.set(rid, "status", "Running")
+        except Exception as exc:
+            self._tunnel_error.set("Could not start saved tunnel.")
+            log(f"Saved tunnel start failed: {redact_secrets(str(exc))}")
+
+    def _start_saved_selected(self):
+        if self._saved_tree is None:
+            return
+        selected = self._saved_tree.selection()
+        if not selected:
+            return
+        rid = selected[0]
+        for rule in self._saved_rules:
+            if str(rule.get("rule_id") or rule.get("id")) == rid:
+                self._start_saved_rule(rule)
+                return
+
+    def _start_all_saved(self):
+        for rule in self._saved_rules:
+            if rule.get("enabled", True):
+                self._start_saved_rule(rule)
 
     def _sync_tunnel_fields(self):
         visible = self._type_var.get() != "Dynamic/SOCKS"
@@ -2039,6 +2203,9 @@ class PortForwardPanel(tk.Frame):
         return var
 
     def _add_tunnel(self):
+        if not self._client:
+            self._tunnel_error.set("Not connected.")
+            return
         form_state = self._form_state()
         error = form_state.validate()
         if error:
@@ -2054,6 +2221,12 @@ class PortForwardPanel(tk.Frame):
         lport = int(self._lport.get())
         rhost = self._rhost.get().strip()
         rport = int(self._rport.get())
+        bind_key = (lhost, lport)
+        if any(
+            info.get("status") in {"active", "starting"} and info.get("bind_key") == bind_key for info in self._tunnels
+        ):
+            self._tunnel_error.set("A tunnel already uses this bind endpoint.")
+            return
 
         runtime = TunnelRuntime(generation=id(self._client))
         if kind == "Local":
@@ -2097,6 +2270,7 @@ class PortForwardPanel(tk.Frame):
 
         runtime.thread = t
         info["runtime"] = runtime
+        info["bind_key"] = bind_key
         info["bytes"] = "Unavailable"
         self._tunnels.append(info)
         iid = str(len(self._tunnels) - 1)
@@ -3037,11 +3211,51 @@ class ConnectionTab(tk.Frame):
             auth_method=str(entry.get("auth_method", "")),
         )
         self._session_generation = 0
+        reconnect_options = dict(entry.get("connection_options", {}))
+        for key in (
+            "automatic_reconnect",
+            "reconnect_delay",
+            "maximum_reconnect_delay",
+            "maximum_attempts",
+            "exponential_backoff",
+        ):
+            if key in entry:
+                reconnect_options[key] = entry[key]
+        self._reconnect_controller = ReconnectController(
+            reconnect_options, self._schedule_reconnect, self._reconnect_attempt
+        )
+        self._startup_actions = StartupActionCoordinator()
         self._sftp_opening = False
         self._sftp_open_thread = None
         self._trust_broker = TrustDecisionBroker(self)
         self._build()
         self._connect()
+
+    def _schedule_reconnect(self, delay, callback):
+        generation = self._session_generation
+        try:
+            self.after(int(delay * 1000), lambda: callback() if generation == self._session_generation else None)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _reconnect_attempt(self):
+        if self._workspace_state.status in {"connected", "connecting"}:
+            return False
+        self._disconnect(manual=False)
+        self._connect(reconnecting=True)
+        return True
+
+    def _on_connection_lost(self, generation):
+        if generation != self._session_generation or self._workspace_state.status != "connected":
+            return
+        self._set_workspace_status("failed", "Connection lost; reconnect scheduled.")
+        self._reconnect_controller.unexpected_loss(generation)
+
+    def _cancel_reconnect(self):
+        self._reconnect_controller.cancel()
+
+    def _reconnect_now(self):
+        self._reconnect_controller.reconnect_now()
 
     def _select_or_create(self, attr, factory, text):
         panel = getattr(self, attr)
@@ -3106,6 +3320,7 @@ class ConnectionTab(tk.Frame):
         self._nb = ttk.Notebook(self)
         self._nb.pack(fill="both", expand=True, padx=4, pady=4)
         self._terminal = self._create_terminal_tab(select=False)
+        self._terminal.on_connection_lost = self._on_connection_lost
         self._terminal.on_resize = lambda cols, rows: (
             self._terminal_size_var.set(f"{cols} × {rows}") if hasattr(self, "_terminal_size_var") else None
         )
@@ -3128,6 +3343,12 @@ class ConnectionTab(tk.Frame):
             ("Disconnect", self._disconnect),
         ):
             ttk.Button(terminal_toolbar, text=label, command=command).pack(side="right", padx=3, pady=3)
+        ttk.Button(terminal_toolbar, text="Reconnect now", command=self._reconnect_now).pack(
+            side="right", padx=3, pady=3
+        )
+        ttk.Button(terminal_toolbar, text="Cancel reconnect", command=self._cancel_reconnect).pack(
+            side="right", padx=3, pady=3
+        )
         self._apply_workspace_state()
 
     def _show_connection_log(self):
@@ -3221,7 +3442,7 @@ class ConnectionTab(tk.Frame):
             self._nb.select(terminal)
         return terminal
 
-    def _connect(self):
+    def _connect(self, reconnecting: bool = False):
         if self._workspace_state.status in {"connecting", "disconnecting", "connected"}:
             return
         if not paramiko:
@@ -3230,7 +3451,8 @@ class ConnectionTab(tk.Frame):
             return
         self._session_generation += 1
         generation = self._session_generation
-        self._set_workspace_status("connecting")
+        self._reconnect_controller.new_session()
+        self._set_workspace_status("connecting", "Reconnecting…" if reconnecting else "Connecting…")
         self._terminal.write(
             f"[connecting] {self._entry.get('user')}@{self._entry.get('host')}:{self._entry.get('port', 22)}\n", "info"
         )
@@ -3418,7 +3640,44 @@ class ConnectionTab(tk.Frame):
             return
         self._set_workspace_status("connected", "Connected securely.")
         self._terminal.write("[connected]\n", "ok")
-        self._attach_shell(self._terminal)
+        prefs = dict(self._entry.get("launch_preferences", {}))
+        prefs.update({"restart_tunnels": self._entry.get("connection_options", {}).get("restart_tunnels", False)})
+        self._startup_actions.handlers = {
+            "tunnels": self._start_saved_tunnels,
+            "terminal": lambda: self._attach_shell(self._terminal),
+            "sftp": self._open_sftp,
+            "command": lambda data: self._run_startup_command(
+                str(data.get("startup_command", "")), self._session_generation
+            ),
+        }
+        self._startup_actions.run(prefs, self._session_generation)
+        options = self._entry.get("connection_options", {})
+        if self._reconnect_controller.state == "reconnected":
+            if options.get("reopen_sftp"):
+                self._open_sftp()
+            if options.get("restart_tunnels"):
+                self._open_tunnels()
+                if self._tunnels_panel is not None and hasattr(self._tunnels_panel, "_start_all_saved"):
+                    self._tunnels_panel._start_all_saved()
+
+    def _start_saved_tunnels(self):
+        self._open_tunnels()
+        if self._tunnels_panel is not None and hasattr(self._tunnels_panel, "_start_all_saved"):
+            self._tunnels_panel._start_all_saved()
+
+    def _run_startup_command(self, command, generation):
+        if not command.strip() or generation != self._session_generation or not self._client:
+            return
+        client = self._client
+
+        def worker():
+            try:
+                _, stdout, _ = client.exec_command(command)
+                stdout.channel.recv_exit_status()
+            except Exception as exc:
+                log(f"Startup command failed: {redact_secrets(str(exc))}")
+
+        threading.Thread(target=worker, daemon=True, name="sshvault-startup-command").start()
 
     def _attach_shell(self, terminal: TerminalWidget):
         if not self._client:
@@ -3476,9 +3735,11 @@ class ConnectionTab(tk.Frame):
         self._terminal.write(f"[error] {message}\n", "err")
         log(f"Error: {err}")
 
-    def _disconnect(self):
+    def _disconnect(self, manual: bool = True):
         if self._workspace_state.status in {"disconnected", "disconnecting"}:
             return
+        if manual:
+            self._reconnect_controller.cancel()
         self._set_workspace_status("disconnecting")
         self._session_generation += 1
         self._sftp_opening = False
@@ -3601,7 +3862,8 @@ class ConnectionTab(tk.Frame):
         if not self._client:
             messagebox.showerror("Tunnels", "Not connected.")
             return
-        self._select_or_create("_tunnels_panel", lambda: PortForwardPanel(self._nb, self._client), "Tunnels")
+        rules = self._entry.get("tunnel_options", {}).get("rules", [])
+        self._select_or_create("_tunnels_panel", lambda: PortForwardPanel(self._nb, self._client, rules), "Tunnels")
 
     def _open_exec(self):
         if not self._client:
@@ -3697,8 +3959,18 @@ class EntryDialog(tk.Toplevel):
         return "key" if entry.get("key_path") else "agent"
 
     def _build(self, e):
-        self._f = tk.Frame(self, bg=BG)
-        self._f.pack(padx=8, pady=8)
+        self._notebook = ttk.Notebook(self)
+        self._notebook.pack(fill="both", expand=True, padx=8, pady=8)
+        self._f = tk.Frame(self._notebook, bg=BG)
+        self._notebook.add(self._f, text="Login")
+        terminal_tab = tk.Frame(self._notebook, bg=BG)
+        sftp_tab = tk.Frame(self._notebook, bg=BG)
+        tunnels_tab = tk.Frame(self._notebook, bg=BG)
+        options_tab = tk.Frame(self._notebook, bg=BG)
+        self._notebook.add(terminal_tab, text="Terminal")
+        self._notebook.add(sftp_tab, text="SFTP")
+        self._notebook.add(tunnels_tab, text="Tunnels")
+        self._notebook.add(options_tab, text="Options")
         self._f.columnconfigure(1, weight=1)
         self._name, *_name_parts = self._fld("Name", 0, e.get("name", ""))
         self._host, *_host_parts = self._fld("Host", 1, e.get("host", ""))
@@ -3762,6 +4034,30 @@ class EntryDialog(tk.Toplevel):
         self._proxy, *_ = self._fld("ProxyJump", 11, e.get("proxy_jump", ""))
         self._tags, *_ = self._fld("Tags", 12, ", ".join(e.get("tags", [])))
         self._notes, *_ = self._fld("Notes", 13, e.get("notes", ""))
+        terminal = e.get("terminal_options", {})
+        sftp = e.get("sftp_options", {})
+        connection = e.get("connection_options", {})
+        self._terminal_type = tk.StringVar(value=terminal.get("terminal_type", "xterm-256color"))
+        self._terminal_scrollback = tk.StringVar(value=str(terminal.get("scrollback", 5000)))
+        self._terminal_start = tk.StringVar(value=terminal.get("starting_directory", ""))
+        self._terminal_command = tk.StringVar(value=terminal.get("startup_command", ""))
+        self._terminal_auto = tk.BooleanVar(value=terminal.get("auto_open", True))
+        self._sftp_local = tk.StringVar(value=sftp.get("initial_local_directory", ""))
+        self._sftp_remote = tk.StringVar(value=sftp.get("initial_remote_directory", ""))
+        self._sftp_collision = tk.StringVar(value=sftp.get("collision_behavior", "ask"))
+        self._sftp_timestamps = tk.BooleanVar(value=sftp.get("preserve_timestamps", False))
+        self._sftp_verify = tk.BooleanVar(value=sftp.get("verify_transfers", False))
+        self._sftp_auto = tk.BooleanVar(value=sftp.get("auto_open", False))
+        self._reconnect = tk.BooleanVar(value=connection.get("automatic_reconnect", False))
+        self._reconnect_delay = tk.StringVar(value=str(connection.get("reconnect_delay", 5)))
+        self._reconnect_max = tk.StringVar(value=str(connection.get("maximum_reconnect_delay", 60)))
+        self._reconnect_attempts = tk.StringVar(value=str(connection.get("maximum_attempts", 3)))
+        self._backoff = tk.BooleanVar(value=connection.get("exponential_backoff", True))
+        self._reopen_terminal = tk.BooleanVar(value=connection.get("reopen_terminal", True))
+        self._reopen_sftp = tk.BooleanVar(value=connection.get("reopen_sftp", False))
+        self._restart_tunnels = tk.BooleanVar(value=connection.get("restart_tunnels", False))
+        self._logging_level = tk.StringVar(value=connection.get("logging_level", "normal"))
+        self._build_profile_sections(terminal_tab, sftp_tab, tunnels_tab, options_tab, e)
         self._error = tk.StringVar()
         tk.Label(self, textvariable=self._error, bg=BG, fg=RED, font=FONT, anchor="w").pack(fill="x", padx=16)
 
@@ -3781,6 +4077,243 @@ class EntryDialog(tk.Toplevel):
         self._remove_secret_var.trace_add("write", lambda *_: self._validate())
         self._sync_auth_fields()
         self._validate()
+
+    def _build_profile_sections(self, terminal, sftp, tunnels, options, entry):
+        self._env_rows = list(entry.get("terminal_options", {}).get("environment", {}).items())
+        self._env_tree = ttk.Treeview(terminal, columns=("name", "value"), show="headings", height=5)
+        self._env_tree.heading("name", text="Name")
+        self._env_tree.heading("value", text="Value")
+        self._env_tree.grid(row=5, column=0, columnspan=2, padx=8, pady=6)
+        for name, value in self._env_rows:
+            self._env_tree.insert("", "end", values=(name, value))
+        env_actions = tk.Frame(terminal, bg=BG)
+        env_actions.grid(row=6, column=0, columnspan=2, sticky="w", padx=8)
+        for label, command in (
+            ("Add", self._env_add),
+            ("Edit", self._env_edit),
+            ("Remove", self._env_remove),
+            ("Move Up", lambda: self._env_move(-1)),
+            ("Move Down", lambda: self._env_move(1)),
+        ):
+            ttk.Button(env_actions, text=label, command=command).pack(side="left", padx=2)
+        for row, (label, var) in enumerate(
+            (
+                ("Terminal type", self._terminal_type),
+                ("Scrollback", self._terminal_scrollback),
+                ("Starting directory", self._terminal_start),
+                ("Startup command", self._terminal_command),
+            )
+        ):
+            tk.Label(terminal, text=label, bg=BG, fg=TEXT, font=FONT).grid(
+                row=row, column=0, sticky="w", padx=8, pady=4
+            )
+            tk.Entry(terminal, textvariable=var, bg=PANEL, fg=TEXT, insertbackground=TEXT, font=FONT, width=34).grid(
+                row=row, column=1, sticky="ew", padx=8, pady=4
+            )
+        tk.Checkbutton(
+            terminal,
+            text="Open terminal automatically",
+            variable=self._terminal_auto,
+            bg=BG,
+            fg=TEXT,
+            selectcolor=PANEL,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=8)
+        for row, (label, var) in enumerate(
+            (("Initial local directory", self._sftp_local), ("Initial remote directory", self._sftp_remote))
+        ):
+            tk.Label(sftp, text=label, bg=BG, fg=TEXT, font=FONT).grid(row=row, column=0, sticky="w", padx=8, pady=4)
+            tk.Entry(sftp, textvariable=var, bg=PANEL, fg=TEXT, insertbackground=TEXT, font=FONT, width=34).grid(
+                row=row, column=1, sticky="ew", padx=8, pady=4
+            )
+        tk.Label(sftp, text="Collision behavior", bg=BG, fg=TEXT, font=FONT).grid(row=2, column=0, sticky="w", padx=8)
+        ttk.Combobox(
+            sftp, textvariable=self._sftp_collision, values=("ask", "skip", "overwrite", "rename"), state="readonly"
+        ).grid(row=2, column=1, sticky="w", padx=8)
+        for row, (label, var) in enumerate(
+            (
+                ("Preserve timestamps", self._sftp_timestamps),
+                ("Verify transfers", self._sftp_verify),
+                ("Open SFTP automatically", self._sftp_auto),
+            ),
+            start=3,
+        ):
+            tk.Checkbutton(sftp, text=label, variable=var, bg=BG, fg=TEXT, selectcolor=PANEL).grid(
+                row=row, column=0, columnspan=2, sticky="w", padx=8
+            )
+        self._tunnel_rules = [dict(rule) for rule in entry.get("tunnel_options", {}).get("rules", [])]
+        self._tunnel_tree = ttk.Treeview(
+            tunnels, columns=("enabled", "type", "bind", "destination", "description"), show="headings", height=7
+        )
+        for col in ("enabled", "type", "bind", "destination", "description"):
+            self._tunnel_tree.heading(col, text=col.title())
+        self._tunnel_tree.pack(fill="both", expand=True, padx=8, pady=8)
+        for rule in self._tunnel_rules:
+            destination = (
+                ""
+                if rule.get("type") == "SOCKS"
+                else f"{rule.get('destination_host', '')}:{rule.get('destination_port', '')}"
+            )
+            self._tunnel_tree.insert(
+                "",
+                "end",
+                values=(
+                    rule.get("enabled", True),
+                    rule.get("type", "Local"),
+                    f"{rule.get('bind_address', '127.0.0.1')}:{rule.get('bind_port', 0)}",
+                    destination,
+                    rule.get("description", ""),
+                ),
+            )
+        tunnel_actions = tk.Frame(tunnels, bg=BG)
+        tunnel_actions.pack(anchor="w", padx=8)
+        for label, command in (
+            ("Add", self._tunnel_add),
+            ("Edit", self._tunnel_edit),
+            ("Duplicate", self._tunnel_duplicate),
+            ("Remove", self._tunnel_remove),
+            ("Enable/Disable", self._tunnel_toggle),
+            ("Move Up", lambda: self._tunnel_move(-1)),
+            ("Move Down", lambda: self._tunnel_move(1)),
+        ):
+            ttk.Button(tunnel_actions, text=label, command=command).pack(side="left", padx=2)
+        for row, (label, var) in enumerate(
+            (
+                ("Automatic reconnect", self._reconnect),
+                ("Initial delay", self._reconnect_delay),
+                ("Maximum delay", self._reconnect_max),
+                ("Maximum attempts", self._reconnect_attempts),
+            )
+        ):
+            tk.Label(options, text=label, bg=BG, fg=TEXT, font=FONT).grid(row=row, column=0, sticky="w", padx=8, pady=4)
+            (tk.Checkbutton if isinstance(var, tk.BooleanVar) else tk.Entry)(
+                options,
+                textvariable=var,
+                bg=BG if isinstance(var, tk.BooleanVar) else PANEL,
+                fg=TEXT,
+                selectcolor=PANEL if isinstance(var, tk.BooleanVar) else None,
+            ).grid(row=row, column=1, sticky="w", padx=8, pady=4)
+        tk.Checkbutton(
+            options, text="Exponential backoff", variable=self._backoff, bg=BG, fg=TEXT, selectcolor=PANEL
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=8)
+        ttk.Combobox(
+            options, textvariable=self._logging_level, values=("errors", "normal", "detailed"), state="readonly"
+        ).grid(row=5, column=1, sticky="w", padx=8)
+
+    def _env_add(self):
+        name = simpledialog_ask("Environment variable", "Name:")
+        value = simpledialog_ask("Environment variable", "Value:") if name is not None else None
+        if name is not None and value is not None:
+            self._env_rows.append((name, value))
+            self._env_tree.insert("", "end", values=(name, value))
+
+    def _env_edit(self):
+        selected = self._env_tree.selection()
+        if selected:
+            index = self._env_tree.index(selected[0])
+            name = simpledialog_ask("Environment variable", "Name:", initialvalue=self._env_rows[index][0])
+            value = (
+                simpledialog_ask("Environment variable", "Value:", initialvalue=self._env_rows[index][1])
+                if name is not None
+                else None
+            )
+            if name is not None and value is not None:
+                self._env_rows[index] = (name, value)
+                self._env_tree.item(selected[0], values=(name, value))
+
+    def _env_remove(self):
+        selected = self._env_tree.selection()
+        if selected:
+            self._env_rows.pop(self._env_tree.index(selected[0]))
+            self._env_tree.delete(selected[0])
+
+    def _env_move(self, delta):
+        selected = self._env_tree.selection()
+        if not selected:
+            return
+        index = self._env_tree.index(selected[0])
+        target = index + delta
+        if 0 <= target < len(self._env_rows):
+            self._env_rows[index], self._env_rows[target] = self._env_rows[target], self._env_rows[index]
+            self._env_tree.move(selected[0], "", target)
+
+    def _tunnel_add(self):
+        self._tunnel_rules.append(
+            {
+                "rule_id": str(uuid4()),
+                "enabled": True,
+                "type": "Local",
+                "bind_address": "127.0.0.1",
+                "bind_port": 0,
+                "destination_host": "",
+                "destination_port": 0,
+                "description": "",
+            }
+        )
+        self._tunnel_refresh()
+
+    def _tunnel_refresh(self):
+        for item in self._tunnel_tree.get_children():
+            self._tunnel_tree.delete(item)
+        for rule in self._tunnel_rules:
+            destination = (
+                ""
+                if rule.get("type") == "SOCKS"
+                else f"{rule.get('destination_host', '')}:{rule.get('destination_port', '')}"
+            )
+            self._tunnel_tree.insert(
+                "",
+                "end",
+                values=(
+                    rule.get("enabled", True),
+                    rule.get("type", "Local"),
+                    f"{rule.get('bind_address', '127.0.0.1')}:{rule.get('bind_port', 0)}",
+                    destination,
+                    rule.get("description", ""),
+                ),
+            )
+
+    def _tunnel_edit(self):
+        selected = self._tunnel_tree.selection()
+        if selected:
+            rule = self._tunnel_rules[self._tunnel_tree.index(selected[0])]
+            rule["type"] = "SOCKS" if rule.get("type") != "SOCKS" else "Local"
+            if rule["type"] == "SOCKS":
+                rule["destination_host"], rule["destination_port"] = "", 0
+            self._tunnel_refresh()
+
+    def _tunnel_duplicate(self):
+        selected = self._tunnel_tree.selection()
+        if selected:
+            rule = dict(self._tunnel_rules[self._tunnel_tree.index(selected[0])])
+            rule["rule_id"] = str(uuid4())
+            self._tunnel_rules.append(rule)
+            self._tunnel_refresh()
+
+    def _tunnel_remove(self):
+        selected = self._tunnel_tree.selection()
+        if selected:
+            self._tunnel_rules.pop(self._tunnel_tree.index(selected[0]))
+            self._tunnel_refresh()
+
+    def _tunnel_toggle(self):
+        selected = self._tunnel_tree.selection()
+        if selected:
+            rule = self._tunnel_rules[self._tunnel_tree.index(selected[0])]
+            rule["enabled"] = not rule.get("enabled", True)
+            self._tunnel_refresh()
+
+    def _tunnel_move(self, delta):
+        selected = self._tunnel_tree.selection()
+        if not selected:
+            return
+        index = self._tunnel_tree.index(selected[0])
+        target = index + delta
+        if 0 <= target < len(self._tunnel_rules):
+            self._tunnel_rules[index], self._tunnel_rules[target] = (
+                self._tunnel_rules[target],
+                self._tunnel_rules[index],
+            )
+            self._tunnel_refresh()
 
     def _browse(self):
         p = filedialog.askopenfilename(title="Select SSH Key", initialdir=str(Path.home() / ".ssh"))
@@ -3830,6 +4363,34 @@ class EntryDialog(tk.Toplevel):
             "proxy_jump": self._proxy.get(),
             "tags": self._tags.get(),
             "notes": self._notes.get(),
+            "terminal_options": {
+                "terminal_type": self._terminal_type.get(),
+                "scrollback": self._terminal_scrollback.get(),
+                "starting_directory": self._terminal_start.get(),
+                "startup_command": self._terminal_command.get(),
+                "auto_open": self._terminal_auto.get(),
+                "environment": dict(self._env_rows),
+            },
+            "tunnel_options": {"rules": self._tunnel_rules},
+            "sftp_options": {
+                "initial_local_directory": self._sftp_local.get(),
+                "initial_remote_directory": self._sftp_remote.get(),
+                "collision_behavior": self._sftp_collision.get(),
+                "preserve_timestamps": self._sftp_timestamps.get(),
+                "verify_transfers": self._sftp_verify.get(),
+                "auto_open": self._sftp_auto.get(),
+            },
+            "connection_options": {
+                "automatic_reconnect": self._reconnect.get(),
+                "reconnect_delay": self._reconnect_delay.get(),
+                "maximum_reconnect_delay": self._reconnect_max.get(),
+                "maximum_attempts": self._reconnect_attempts.get(),
+                "exponential_backoff": self._backoff.get(),
+                "reopen_terminal": self._reopen_terminal.get(),
+                "reopen_sftp": self._reopen_sftp.get(),
+                "restart_tunnels": self._restart_tunnels.get(),
+                "logging_level": self._logging_level.get(),
+            },
         }
 
     def _show_validation_error(self, message: str):
@@ -3875,6 +4436,168 @@ class EntryDialog(tk.Toplevel):
             self._editing and self._original_auth == "password" and self._auth_method() != "password"
         )
         self.destroy()
+
+
+class DiagnosticsDialog(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Connection Diagnostics")
+        self.geometry("760x600")
+        self.transient(parent)
+        profile = getattr(parent, "_entry", {})
+        session = {
+            "state": getattr(getattr(parent, "_workspace_state", None), "status", "disconnected"),
+            "generation": getattr(parent, "_session_generation", 0),
+            "version": "0.3.2",
+        }
+        self._diagnostics = DiagnosticsCollector.collect(profile, session)
+        self._tree = ttk.Treeview(self, columns=("field", "value"), show="headings")
+        self._tree.heading("field", text="Field")
+        self._tree.heading("value", text="Value")
+        self._tree.column("field", width=250)
+        self._tree.column("value", width=470)
+        self._tree.pack(fill="both", expand=True, padx=8, pady=8)
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(bar, text="Refresh", command=self.refresh).pack(side="left", padx=3)
+        ttk.Button(bar, text="Run Network Check", command=self.network_check).pack(side="left", padx=3)
+        ttk.Button(bar, text="Copy Diagnostics", command=self.copy).pack(side="left", padx=3)
+        ttk.Button(bar, text="Save Diagnostics", command=self.save).pack(side="left", padx=3)
+        self.refresh()
+
+    def refresh(self):
+        for iid in self._tree.get_children():
+            self._tree.delete(iid)
+        for index, record in enumerate(self._diagnostics.records):
+            self._tree.insert("", "end", iid=str(index), values=(record.field, record.value))
+
+    def copy(self):
+        self.clipboard_clear()
+        self.clipboard_append(self._diagnostics.as_text())
+
+    def save(self):
+        destination = filedialog.asksaveasfilename(parent=self, title="Save diagnostics", defaultextension=".txt")
+        if destination:
+            try:
+                atomic_json_write(Path(destination), {"schema_version": 1, "diagnostics": self._diagnostics.as_text()})
+            except Exception:
+                messagebox.showerror("Diagnostics", "Could not save diagnostics.", parent=self)
+
+    def network_check(self):
+        host = str(getattr(self.master, "_entry", {}).get("host", ""))
+        port = int(getattr(self.master, "_entry", {}).get("port", 22))
+
+        def worker():
+            result = DiagnosticsCollector.network_check(host, port)
+            try:
+                self.after(0, lambda: self._network_done(result))
+            except (RuntimeError, tk.TclError):
+                pass
+
+        threading.Thread(target=worker, daemon=True, name="sshvault-network-check").start()
+
+    def _network_done(self, result):
+        records = [r for r in self._diagnostics.records if r.field not in {"DNS result", "TCP connection timing"}]
+        records.extend(
+            [
+                type(self._diagnostics.records[0])("DNS result", result["dns"]),
+                type(self._diagnostics.records[0])("TCP connection timing", result["tcp"]),
+            ]
+        )
+        self._diagnostics.records = records
+        self.refresh()
+
+
+class HostKeyManagerDialog(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Host Keys")
+        self.geometry("980x360")
+        self.transient(parent)
+        self._repo = HostKeyRepository(KNOWN_HOSTS_FILE, getattr(parent, "_entries", []))
+        cols = ("host", "port", "algorithm", "fingerprint", "first", "last", "profiles")
+        self._tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="browse")
+        for col, width in zip(cols, (150, 55, 100, 250, 170, 170, 180)):
+            self._tree.heading(col, text=col.title(), command=lambda c=col: self._sort(c))
+            self._tree.column(col, width=width, anchor="w")
+        self._tree.pack(fill="both", expand=True, padx=8, pady=8)
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill="x", padx=8, pady=(0, 8))
+        for label, command in (
+            ("Refresh", self.refresh),
+            ("Copy fingerprint", self.copy_fingerprint),
+            ("Copy selected row", self.copy_row),
+            ("Export", self.export),
+            ("Remove", self.remove),
+        ):
+            ttk.Button(bar, text=label, command=command).pack(side="left", padx=3)
+        self.refresh()
+
+    def refresh(self):
+        for iid in self._tree.get_children():
+            self._tree.delete(iid)
+        for index, record in enumerate(self._repo.list_records()):
+            self._tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    record.hostname,
+                    record.port,
+                    record.algorithm,
+                    record.fingerprint,
+                    record.first_trusted,
+                    record.last_used,
+                    ", ".join(record.associated_profiles),
+                ),
+            )
+
+    def _record(self):
+        selected = self._tree.selection()
+        if not selected:
+            return None
+        records = self._repo.list_records()
+        index = int(selected[0])
+        return records[index] if index < len(records) else None
+
+    def _sort(self, column):
+        rows = [(self._tree.set(iid, column), iid) for iid in self._tree.get_children()]
+        for position, (_, iid) in enumerate(sorted(rows, key=lambda row: row[0].casefold())):
+            self._tree.move(iid, "", position)
+
+    def copy_fingerprint(self):
+        record = self._record()
+        if record:
+            self.clipboard_clear()
+            self.clipboard_append(record.fingerprint)
+
+    def copy_row(self):
+        record = self._record()
+        if record:
+            self.clipboard_clear()
+            self.clipboard_append(f"{record.hostname}:{record.port} {record.algorithm} {record.fingerprint}")
+
+    def export(self):
+        destination = filedialog.asksaveasfilename(parent=self, title="Export host-key data", defaultextension=".json")
+        if destination:
+            try:
+                self._repo.export(Path(destination))
+                messagebox.showinfo("Host Keys", "Host-key data exported.", parent=self)
+            except Exception:
+                messagebox.showerror("Host Keys", "Could not export host-key data.", parent=self)
+
+    def remove(self):
+        record = self._record()
+        if record is None:
+            return
+        count = len(record.associated_profiles)
+        message = f"Remove {record.hostname}:{record.port} ({record.algorithm})\n{record.fingerprint}\nAssociated profiles: {count}"
+        if messagebox.askyesno("Remove host key", message + "\n\nThis cannot be undone.", parent=self):
+            try:
+                self._repo.remove(record)
+                self.refresh()
+            except Exception:
+                messagebox.showerror("Host Keys", "Could not remove the selected entry.", parent=self)
 
 
 class SettingsDialog(tk.Toplevel):
@@ -4111,6 +4834,8 @@ class SSHVaultApp(tk.Tk):
         tools_menu.add_command(label="Built-in SFTP Server Settings", command=self._sftp_server_settings)
         tools_menu.add_command(label="Activity Log", command=self._open_log)
         tools_menu.add_command(label="Settings", command=self._open_settings)
+        tools_menu.add_command(label="Host Keys", command=self._open_host_keys)
+        tools_menu.add_command(label="Diagnostics", command=self._open_diagnostics)
         menubar.add_cascade(label="Tools", menu=tools_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -5104,6 +5829,12 @@ class SSHVaultApp(tk.Tk):
 
     def _open_settings(self):
         SettingsDialog(self)
+
+    def _open_host_keys(self):
+        HostKeyManagerDialog(self)
+
+    def _open_diagnostics(self):
+        DiagnosticsDialog(self)
 
     def _restore_session(self):
         if not SESSION_FILE.exists():
