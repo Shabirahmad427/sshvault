@@ -45,6 +45,7 @@ from sshvault_core import (
     DirectoryLoadState,
     SFTPPanelState,
     TerminalPanelState,
+    terminal_key_sequence,
     TunnelFormState,
     TunnelRuntime,
     TunnelManager,
@@ -237,6 +238,7 @@ class TerminalWidget(tk.Frame):
             borderwidth=0,
             padx=4,
             pady=2,
+            state="disabled",
         )
         sb = ttk.Scrollbar(self, command=self._text.yview)
         self._text.configure(yscrollcommand=sb.set)
@@ -261,6 +263,8 @@ class TerminalWidget(tk.Frame):
         self._reader_thread = None
         self._writer_thread = None
         self._bracketed_paste = False
+        self._application_cursor_mode = False
+        self._mouse_tracking = False
         self._input_mode_tail = ""
         self._find_matches: list[str] = []
         self._find_index = -1
@@ -270,12 +274,21 @@ class TerminalWidget(tk.Frame):
         if pyte:
             self._screen = _ScrollbackScreen(cols, rows, self._queue_scrollback)
             self._stream = pyte.Stream(self._screen)
+            self._normal_screen = self._screen
+            self._alternate_screen = None
+            self._alternate_active = False
+            self._alternate_control_tail = ""
         else:
             self._screen = None
             self._stream = None
+            self._alternate_screen = None
+            self._alternate_active = False
+            self._alternate_control_tail = ""
 
         for _ in range(rows):
+            self._text.configure(state="normal")
             self._text.insert("end", "\n")
+            self._text.configure(state="disabled")
         self._text.mark_set("live_start", "1.0")
 
         self._text.bind("<Key>", self._on_key)
@@ -293,6 +306,8 @@ class TerminalWidget(tk.Frame):
         self._text.bind("<Button-1>", self._on_click)
         self._text.bind("<Motion>", self._on_motion)
         self._text.bind("<MouseWheel>", self._on_scroll)
+        self._text.bind("<Button-4>", self._on_scroll)
+        self._text.bind("<Button-5>", self._on_scroll)
         self._text.tag_configure("url", foreground=CYAN, underline=True)
         self._context_menu = tk.Menu(self, tearoff=0)
         # Tk is single-threaded. The SSH worker updates only the terminal
@@ -323,14 +338,54 @@ class TerminalWidget(tk.Frame):
             return
         with self._lock:
             self._track_input_modes(data)
-            self._stream.feed(data)
+            # pyte intentionally leaves DEC alternate-screen handling to
+            # applications.  Switch its listener at the DEC boundary so a
+            # full-screen application cannot overwrite normal scrollback.
+            data = self._alternate_control_tail + data
+            self._alternate_control_tail = ""
+            controls = ("\x1b[?47h", "\x1b[?47l", "\x1b[?1047h", "\x1b[?1047l", "\x1b[?1049h", "\x1b[?1049l")
+            # Keep a possibly split alternate-screen control out of pyte until
+            # it is complete; otherwise its parser binds the partial CSI to
+            # the normal screen before this widget can swap buffers.
+            marker = data.rfind("\x1b[?")
+            if (
+                marker >= 0
+                and data[marker:] not in controls
+                and any(control.startswith(data[marker:]) for control in controls)
+            ):
+                self._alternate_control_tail = data[marker:]
+                data = data[:marker]
+            parts = re.split(r"(\x1b\[\?(?:47|1047|1049)[hl])", data)
+            for part in parts:
+                if part in {"\x1b[?47h", "\x1b[?1047h", "\x1b[?1049h"}:
+                    self._enter_alternate()
+                elif part in {"\x1b[?47l", "\x1b[?1047l", "\x1b[?1049l"}:
+                    self._leave_alternate()
+                elif part:
+                    self._stream.feed(part)
             self._redraw_pending = True
+
+    def _enter_alternate(self):
+        if self._alternate_active:
+            return
+        self._alternate_screen = _ScrollbackScreen(self._cols, self._rows, lambda _line: None)
+        self._screen = self._alternate_screen
+        self._stream.attach(self._screen)
+        self._alternate_active = True
+
+    def _leave_alternate(self):
+        if not self._alternate_active:
+            return
+        self._screen = self._normal_screen
+        self._stream.attach(self._screen)
+        self._alternate_active = False
 
     def _fallback_append(self, data):
         self._text.configure(state="normal")
         self._text.insert("end", re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07", "", data))
         self._refresh_links()
         self._text.see("end")
+        self._text.configure(state="disabled")
 
     def attach_channel(self, channel):
         self.detach()
@@ -388,7 +443,7 @@ class TerminalWidget(tk.Frame):
                 data = outbound.get(timeout=0.1)
                 if data is None:
                     break
-                channel.sendall(data)
+                channel.sendall(data.encode("utf-8"))
             except queue.Empty:
                 continue
             except Exception:
@@ -403,6 +458,10 @@ class TerminalWidget(tk.Frame):
         scan = self._input_mode_tail + data
         for enabled in re.findall(r"\x1b\[\?2004([hl])", scan):
             self._bracketed_paste = enabled == "h"
+        for enabled in re.findall(r"\x1b\[\?1([hl])", scan):
+            self._application_cursor_mode = enabled == "h"
+        for enabled in re.findall(r"\x1b\[\?(?:1000|1002|1003|1006)([hl])", scan):
+            self._mouse_tracking = enabled == "h"
         self._input_mode_tail = scan[-16:]
 
     # ── redraw ───────────────────────────────────────────────────────────
@@ -519,6 +578,9 @@ class TerminalWidget(tk.Frame):
             self._terminal_state.follow_output = True
         if scrollback and self._terminal_state.follow_output:
             self._text.see("end")
+        elif scrollback:
+            self._terminal_state.note_output()
+        self._text.configure(state="disabled")
 
     def _trim_scrollback(self):
         limit = self._terminal_state.max_scrollback_lines
@@ -533,20 +595,9 @@ class TerminalWidget(tk.Frame):
         ks = event.keysym
         if ks in ("Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Super_L", "Super_R", "Caps_Lock"):
             return "break"
-        seq = _KEY_SEQS.get(ks)
-        # xterm's modified navigation sequences are needed by readline, tmux,
-        # vim, and full-screen programs. Tk exposes modifiers in state bits.
-        modifiers = event.state & (0x0001 | 0x0004 | 0x0008)  # Shift, Ctrl, Alt
-        if modifiers and ks in ("Up", "Down", "Right", "Left", "Home", "End"):
-            mod = 1 + bool(modifiers & 0x0001) + 4 * bool(modifiers & 0x0004) + 2 * bool(modifiers & 0x0008)
-            suffix = {"Up": "A", "Down": "B", "Right": "C", "Left": "D", "Home": "H", "End": "F"}[ks]
-            seq = f"\x1b[1;{mod}{suffix}"
-        if seq is None:
-            seq = event.char
-            if ks == "space" and modifiers & 0x0004:
-                seq = "\x00"
-            elif seq and modifiers & 0x0008:
-                seq = "\x1b" + seq
+        seq = terminal_key_sequence(ks, event.char, event.state, application_cursor=self._application_cursor_mode)
+        if ks == "space" and event.state & 0x0004:
+            seq = "\x00"
         if seq:
             self._send(seq)
         return "break"
@@ -567,9 +618,17 @@ class TerminalWidget(tk.Frame):
         return "break"
 
     def _on_scroll(self, event):
+        if self._mouse_tracking and self._channel:
+            direction = 64 if getattr(event, "delta", 0) > 0 or getattr(event, "num", 0) == 4 else 65
+            self._send(f"\x1b[<{direction};1;1M")
+            return "break"
         self._terminal_state.follow_output = self._text.yview()[1] >= 0.999
-        self._text.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        self._text.yview_scroll(-1 if getattr(event, "delta", 0) > 0 or getattr(event, "num", 0) == 4 else 1, "units")
         return "break"
+
+    def jump_to_bottom(self):
+        self._terminal_state.jump_to_bottom()
+        self._text.see("end")
 
     def find(self, query: str, *, previous: bool = False) -> tuple[int, int]:
         """Highlight case-insensitive matches without changing terminal data."""
@@ -634,6 +693,8 @@ class TerminalWidget(tk.Frame):
             except Exception:
                 pass
             return "break"
+        self._text.focus_set()
+        return "break"
 
     def _on_motion(self, event):
         cursor = "hand2" if self._url_at_index(f"@{event.x},{event.y}") else "xterm"
@@ -768,13 +829,19 @@ class TerminalWidget(tk.Frame):
             self.on_resize(cols, rows)
         with self._lock:
             self._screen.resize(rows, cols)
+            if self._alternate_screen is not None and self._screen is not self._alternate_screen:
+                self._alternate_screen.resize(rows, cols)
+            if self._normal_screen is not self._screen:
+                self._normal_screen.resize(rows, cols)
         # Rebuild only the live grid.  Incremental newline arithmetic here
         # used to delete an extra row on shrink, and inserting after a mark
         # with right gravity could move live_start below the terminal grid.
         grid_start = self._text.index("live_start")
+        self._text.configure(state="normal")
         self._text.delete(grid_start, "end")
         self._text.insert("end", "\n" * rows)
         self._text.mark_set("live_start", grid_start)
+        self._text.configure(state="disabled")
         if self._channel:
             try:
                 self._channel.resize_pty(width=cols, height=rows)
@@ -797,6 +864,7 @@ class TerminalWidget(tk.Frame):
             self._rec_file = None
 
     def clear(self):
+        self._text.configure(state="normal")
         self._text.delete("1.0", "end")
         self._cursor_range = None
         for _ in range(self._rows):
@@ -804,6 +872,7 @@ class TerminalWidget(tk.Frame):
         # Set the mark *after* creating the grid. Its right gravity is
         # intentional for scrollback, but would otherwise move it to the end.
         self._text.mark_set("live_start", "1.0")
+        self._text.configure(state="disabled")
         if self._screen:
             with self._lock:
                 self._screen.reset()
@@ -3339,6 +3408,7 @@ class ConnectionTab(tk.Frame):
             ("Copy", self._terminal._copy_selection),
             ("Paste", lambda: self._terminal._on_paste(None)),
             ("Find", self._find_terminal),
+            ("Jump to Bottom", self._terminal.jump_to_bottom),
             ("Reconnect", self._connect),
             ("Disconnect", self._disconnect),
         ):
