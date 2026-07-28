@@ -18,7 +18,7 @@ dependencies = [
 dev = [
   "build>=1,<2",
   "pytest>=8,<9",
-  "ruff>=0.5,<1",
+  "ruff==0.15.22",
   "mypy>=1.10,<2",
   "types-paramiko>=3.4,<4",
 ]
