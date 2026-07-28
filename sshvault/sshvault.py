@@ -1996,7 +1996,7 @@ class SFTPPanel(tk.Frame):
     def _remote_size(self, remote: str):
         try:
             return self._sftp.stat(remote).st_size
-        except (FileNotFoundError, IOError, OSError):
+        except (FileNotFoundError, OSError):
             return None
 
     @staticmethod
@@ -2026,7 +2026,7 @@ class SFTPPanel(tk.Frame):
         try:
             with self._sftp.open(remote, "rb") as source:
                 return source.check("sha1", length=length)
-        except (IOError, OSError, NotImplementedError):
+        except (OSError, NotImplementedError):
             return None
 
     def _same_file(self, local: Path, remote: str, total: int) -> bool:
@@ -2073,13 +2073,13 @@ class SFTPPanel(tk.Frame):
                 self._progress_cb(transferred, total)
 
         if not self._same_file(local, partial, total):
-            raise IOError(f"Upload verification failed for {local.name}")
+            raise OSError(f"Upload verification failed for {local.name}")
 
         # paramiko's standard rename is not guaranteed to overwrite an existing
         # target, so replace the known incomplete target before finalizing.
         try:
             self._sftp.remove(remote)
-        except (FileNotFoundError, IOError, OSError):
+        except (FileNotFoundError, OSError):
             pass
         self._sftp.rename(partial, remote)
         log(f"Uploaded {local} -> {remote}")
@@ -2127,7 +2127,7 @@ class SFTPPanel(tk.Frame):
                 self._progress_cb(transferred, total)
 
         if not self._same_file(partial, remote, total):
-            raise IOError(f"Download verification failed for {local.name}")
+            raise OSError(f"Download verification failed for {local.name}")
         os.replace(partial, local)
         log(f"Downloaded {remote} -> {local}")
         return True
@@ -2207,7 +2207,7 @@ class SFTPPanel(tk.Frame):
             current = posixpath.join(current, part)
             try:
                 sftp.mkdir(current)
-            except (IOError, OSError):
+            except OSError:
                 pass
         self._scheduled_upload(item, sftp, worker, local, remote, False)
 
@@ -2241,7 +2241,7 @@ class SFTPPanel(tk.Frame):
                     remote_size=attributes.st_size,
                     remote_mtime=getattr(attributes, "st_mtime", None),
                 )
-            except (IOError, OSError) as exc:
+            except OSError as exc:
                 messagebox.showerror("Download", str(redact_secrets(str(exc))), parent=self)
                 continue
             if plan.decision == DownloadResumeDecision.ALREADY_COMPLETE:
@@ -2331,7 +2331,7 @@ class SFTPPanel(tk.Frame):
             try:
                 sftp.stat(remote)
                 raise FileExistsError("A remote file with this name already exists.")
-            except (FileNotFoundError, IOError, OSError):
+            except (FileNotFoundError, OSError):
                 pass
         partial = self._partial_remote_path(remote)
         # A size alone cannot prove a remote prefix is safe.  Restart rather
@@ -2340,7 +2340,7 @@ class SFTPPanel(tk.Frame):
             if sftp.stat(partial).st_size:
                 item.restart_required = True
                 sftp.remove(partial)
-        except (FileNotFoundError, IOError, OSError):
+        except (FileNotFoundError, OSError):
             pass
         try:
             with local.open("rb") as source, sftp.open(partial, "wb") as target:
@@ -2348,10 +2348,10 @@ class SFTPPanel(tk.Frame):
                     target.write(chunk)
                     worker.checkpoint(source.tell(), total)
             if sftp.stat(partial).st_size != total:
-                raise IOError("Upload size verification failed")
+                raise OSError("Upload size verification failed")
             try:
                 sftp.remove(remote)
-            except (FileNotFoundError, IOError, OSError):
+            except (FileNotFoundError, OSError):
                 pass
             sftp.rename(partial, remote)
         except InterruptedError:
@@ -2428,7 +2428,7 @@ class SFTPPanel(tk.Frame):
                     )
                     worker.checkpoint(transferred, total)
             if partial.stat().st_size != total:
-                raise IOError("Download size verification failed")
+                raise OSError("Download size verification failed")
             item.status = TransferState.VERIFYING
             os.replace(partial, local)
             self._partial_local_metadata_path(local).unlink(missing_ok=True)
