@@ -58,6 +58,8 @@ from sshvault_core import (
     TransferState,
     TransferManagerWindowState,
     DownloadResumeDecision,
+    DurableProgressPolicy,
+    SFTP_TRANSFER_CHUNK_SIZES,
     adopt_legacy_download,
     inspect_download_resume,
     partial_download_metadata_path,
@@ -1165,7 +1167,7 @@ class SFTPPanel(tk.Frame):
         self._remote_open_cache = Path(tempfile.gettempdir()) / "sshvault-open"
         self._remote_open_cache.mkdir(parents=True, exist_ok=True)
         self._transfer_queue: queue.Queue = queue.Queue()
-        self._transfer_refresh_events: queue.SimpleQueue[bool] = queue.SimpleQueue()
+        self._transfer_refresh_events: queue.Queue[bool] = queue.Queue(maxsize=1)
         self._transfer_cancel = threading.Event()
         self._closed = False
         self._remote_generation = 0
@@ -1206,7 +1208,12 @@ class SFTPPanel(tk.Frame):
     def _request_transfer_refresh(self):
         """Queue worker state changes; only the Tk poller touches widgets."""
         if not self._closed:
-            self._transfer_refresh_events.put(True)
+            try:
+                self._transfer_refresh_events.put_nowait(True)
+            except queue.Full:
+                # The poller reads current scheduler state, so one pending token
+                # always represents the latest progress for every transfer.
+                pass
 
     def _poll_transfer_refresh(self):
         if self._closed:
@@ -1366,7 +1373,78 @@ class SFTPPanel(tk.Frame):
         """Open one Paramiko SFTP channel for exactly one scheduler worker."""
         if paramiko is None or self._transfer_transport is None or not self._transfer_transport.is_active():
             raise RuntimeError("The verified SFTP session is no longer available.")
-        return paramiko.SFTPClient.from_transport(self._transfer_transport)
+        try:
+            return paramiko.SFTPClient.from_transport(
+                self._transfer_transport, window_size=4 * 1024 * 1024, max_packet_size=32768
+            )
+        except TypeError:
+            # Older supported Paramiko releases expose the same safe default
+            # channel behaviour without these public tuning arguments.
+            return paramiko.SFTPClient.from_transport(self._transfer_transport)
+
+    def _transfer_chunk_size(self) -> int:
+        settings = getattr(self.winfo_toplevel(), "_runtime_settings", {})
+        configured = settings.get("sftp_chunk_size") if isinstance(settings, dict) else None
+        try:
+            value = int(configured)
+        except (TypeError, ValueError):
+            value = 1048576
+        return max(SFTP_TRANSFER_CHUNK_SIZES[0], min(value, SFTP_TRANSFER_CHUNK_SIZES[-1]))
+
+    @staticmethod
+    def _enable_download_prefetch(source, file_size: int) -> None:
+        prefetch = getattr(source, "prefetch", None)
+        if not callable(prefetch) or file_size <= 0:
+            return
+        try:
+            prefetch(file_size=file_size, max_concurrent_prefetch_requests=8)
+        except (AttributeError, NotImplementedError, OSError, TypeError):
+            # Normal ordered reads remain correct on servers without prefetch.
+            return
+
+    @staticmethod
+    def _enable_upload_pipelining(target) -> None:
+        set_pipelined = getattr(target, "set_pipelined", None)
+        if callable(set_pipelined):
+            try:
+                set_pipelined(True)
+            except (AttributeError, NotImplementedError, OSError, TypeError):
+                pass
+
+    @staticmethod
+    def _persist_download_progress(target, plan, local, completed, policy, metrics) -> None:
+        """Flush data before atomically recording an equal-or-smaller offset."""
+        started = time.perf_counter()
+        target.flush()
+        metrics.record("local_write", time.perf_counter() - started)
+        started = time.perf_counter()
+        write_partial_download_metadata(
+            local,
+            remote_identity=plan.remote_identity,
+            remote_path=plan.remote_path,
+            remote_size=plan.remote_size,
+            remote_mtime=plan.remote_mtime,
+            completed_bytes=completed,
+        )
+        metrics.record("sidecar_write", time.perf_counter() - started)
+        policy.persisted(completed, time.monotonic())
+
+    @staticmethod
+    def _persist_closed_download_progress(plan, local, partial, metrics) -> None:
+        """Record a closed file's flushed size after interruption or failure."""
+        completed = partial.stat().st_size
+        if completed > plan.remote_size:
+            return
+        started = time.perf_counter()
+        write_partial_download_metadata(
+            local,
+            remote_identity=plan.remote_identity,
+            remote_path=plan.remote_path,
+            remote_size=plan.remote_size,
+            remote_mtime=plan.remote_mtime,
+            completed_bytes=completed,
+        )
+        metrics.record("sidecar_write", time.perf_counter() - started)
 
     def _pause_selected_transfer(self):
         for iid in self._selected_transfer_ids():
@@ -2088,7 +2166,7 @@ class SFTPPanel(tk.Frame):
         with local.open("rb") as source, self._sftp.open(partial, remote_mode) as target:
             source.seek(offset)
             transferred = offset
-            while chunk := source.read(256 * 1024):
+            while chunk := source.read(self._transfer_chunk_size()):
                 target.write(chunk)
                 transferred += len(chunk)
                 self._progress_cb(transferred, total)
@@ -2142,7 +2220,7 @@ class SFTPPanel(tk.Frame):
         with self._sftp.open(remote, "rb") as source, partial.open(local_mode) as target:
             source.seek(offset)
             transferred = offset
-            while chunk := source.read(256 * 1024):
+            while chunk := source.read(self._transfer_chunk_size()):
                 target.write(chunk)
                 transferred += len(chunk)
                 self._progress_cb(transferred, total)
@@ -2201,6 +2279,8 @@ class SFTPPanel(tk.Frame):
             if local.is_dir():
                 remote_root = self._remote_join(self._remote_cwd, name)
                 children = []
+                created_directories: set[str] = set()
+                directory_cache_lock = threading.Lock()
                 for file_path in sorted(path for path in local.rglob("*") if path.is_file() and not path.is_symlink()):
                     relative = file_path.relative_to(local)
                     remote = posixpath.join(remote_root, str(relative).replace(os.sep, "/"))
@@ -2208,8 +2288,8 @@ class SFTPPanel(tk.Frame):
                     children.append(
                         (
                             item,
-                            lambda current, client, worker, p=file_path, r=remote: self._scheduled_upload_with_dirs(
-                                current, client, worker, p, r
+                            lambda current, client, worker, p=file_path, r=remote, cache=created_directories, lock=directory_cache_lock: (
+                                self._scheduled_upload_with_dirs(current, client, worker, p, r, cache, lock)
                             ),
                         )
                     )
@@ -2218,7 +2298,7 @@ class SFTPPanel(tk.Frame):
                 self._set_status(f"Queued folder {name} ({len(children)} files).")
                 self._refresh_transfer_tree()
 
-    def _scheduled_upload_with_dirs(self, item, sftp, worker, local, remote):
+    def _scheduled_upload_with_dirs(self, item, sftp, worker, local, remote, directory_cache=None, cache_lock=None):
         directory = posixpath.dirname(remote)
         parts = directory.strip("/").split("/")
         current = "/" if directory.startswith("/") else ""
@@ -2226,10 +2306,21 @@ class SFTPPanel(tk.Frame):
             if not part:
                 continue
             current = posixpath.join(current, part)
+            if directory_cache is not None and cache_lock is not None:
+                with cache_lock:
+                    if current in directory_cache:
+                        continue
             try:
                 sftp.mkdir(current)
+                if directory_cache is not None and cache_lock is not None:
+                    with cache_lock:
+                        directory_cache.add(current)
             except OSError:
-                pass
+                # Do not cache errors: a failed or changed session must retry
+                # directory creation on the next worker-owned channel.
+                if directory_cache is not None and cache_lock is not None:
+                    with cache_lock:
+                        directory_cache.discard(current)
         self._scheduled_upload(item, sftp, worker, local, remote, False)
 
     def _upload_dir(self, local: Path, remote: str):
@@ -2365,8 +2456,17 @@ class SFTPPanel(tk.Frame):
             pass
         try:
             with local.open("rb") as source, sftp.open(partial, "wb") as target:
-                while chunk := source.read(262144):
+                self._enable_upload_pipelining(target)
+                chunk_size = self._transfer_chunk_size()
+                while True:
+                    started = time.perf_counter()
+                    chunk = source.read(chunk_size)
+                    item.metrics.record("local_read", time.perf_counter() - started, len(chunk))
+                    if not chunk:
+                        break
+                    started = time.perf_counter()
                     target.write(chunk)
+                    item.metrics.record("remote_write", time.perf_counter() - started, len(chunk))
                     worker.checkpoint(source.tell(), total)
             if sftp.stat(partial).st_size != total:
                 raise OSError("Upload size verification failed")
@@ -2418,7 +2518,9 @@ class SFTPPanel(tk.Frame):
                 remote_mtime=getattr(attributes, "st_mtime", None),
             )
         partial, offset = plan.partial_path, plan.offset
+        policy = DurableProgressPolicy(offset, time.monotonic())
         if plan.decision == DownloadResumeDecision.DOWNLOAD:
+            started = time.perf_counter()
             write_partial_download_metadata(
                 local,
                 remote_identity=plan.remote_identity,
@@ -2427,6 +2529,7 @@ class SFTPPanel(tk.Frame):
                 remote_mtime=plan.remote_mtime,
                 completed_bytes=0,
             )
+            item.metrics.record("sidecar_write", time.perf_counter() - started)
         item.resume_offset, item.transferred = offset, offset
         try:
             local_mode = "r+b" if offset else "wb"
@@ -2438,19 +2541,24 @@ class SFTPPanel(tk.Frame):
                     # handles have reached the validated durable offset.
                     worker.mark_resuming()
                 transferred = offset
-                while chunk := source.read(262144):
+                self._enable_download_prefetch(source, total)
+                chunk_size = self._transfer_chunk_size()
+                while True:
+                    started = time.perf_counter()
+                    chunk = source.read(chunk_size)
+                    item.metrics.record("remote_read", time.perf_counter() - started, len(chunk))
+                    if not chunk:
+                        break
+                    started = time.perf_counter()
                     target.write(chunk)
+                    item.metrics.record("local_write", time.perf_counter() - started, len(chunk))
                     transferred += len(chunk)
-                    target.flush()
-                    write_partial_download_metadata(
-                        local,
-                        remote_identity=plan.remote_identity,
-                        remote_path=remote,
-                        remote_size=total,
-                        remote_mtime=plan.remote_mtime,
-                        completed_bytes=transferred,
-                    )
+                    now = time.monotonic()
+                    if policy.due(transferred, now) or worker.durable_update_required():
+                        self._persist_download_progress(target, plan, local, transferred, policy, item.metrics)
                     worker.checkpoint(transferred, total)
+                if policy.completed_bytes != transferred:
+                    self._persist_download_progress(target, plan, local, transferred, policy, item.metrics)
             if partial.stat().st_size != total:
                 raise OSError("Download size verification failed")
             item.status = TransferState.VERIFYING
@@ -2459,9 +2567,21 @@ class SFTPPanel(tk.Frame):
         except InterruptedError:
             # Keep the flushed staging file and matching sidecar for pause,
             # cancel, disconnect and application shutdown.
+            try:
+                self._persist_closed_download_progress(plan, local, partial, item.metrics)
+            except OSError:
+                pass
             if item.delete_partial_on_cancel:
                 partial.unlink(missing_ok=True)
                 self._partial_local_metadata_path(local).unlink(missing_ok=True)
+            raise
+        except Exception:
+            # The file context has closed (and therefore flushed) before this
+            # handler runs. Preserve that durable offset for a safe retry.
+            try:
+                self._persist_closed_download_progress(plan, local, partial, item.metrics)
+            except OSError:
+                pass
             raise
 
     def _collision_choice(self, direction: str, name: str) -> str:
@@ -5421,7 +5541,7 @@ class SettingsDialog(tk.Toplevel):
             "application_font_size": 10,
             "terminal_font_size": 10,
             "maximum_sftp_transfers": 3,
-            "sftp_chunk_size": 262144,
+            "sftp_chunk_size": 1048576,
             "show_transfer_manager_on_start": True,
         }
         try:
@@ -5431,7 +5551,13 @@ class SettingsDialog(tk.Toplevel):
             pass
         self._vars = {
             key: tk.StringVar(value=str(values[key]))
-            for key in ("scrollback_limit", "connection_timeout", "download_directory", "maximum_sftp_transfers")
+            for key in (
+                "scrollback_limit",
+                "connection_timeout",
+                "download_directory",
+                "maximum_sftp_transfers",
+                "sftp_chunk_size",
+            )
         }
         self._bools = {
             key: tk.BooleanVar(value=bool(values[key]))
@@ -5451,14 +5577,24 @@ class SettingsDialog(tk.Toplevel):
                 ("connection_timeout", "Connection timeout (seconds)"),
                 ("download_directory", "Default download directory"),
                 ("maximum_sftp_transfers", "Maximum simultaneous SFTP transfers"),
+                ("sftp_chunk_size", "SFTP transfer chunk size"),
             )
         ):
             tk.Label(form, text=label, bg=BG, fg=TEXT, font=FONT).grid(row=row, column=0, sticky="w", pady=3)
-            tk.Entry(form, textvariable=self._vars[key], bg=PANEL, fg=TEXT, insertbackground=TEXT).grid(
-                row=row, column=1, sticky="ew", padx=8
-            )
+            if key == "sftp_chunk_size":
+                ttk.Combobox(
+                    form,
+                    textvariable=self._vars[key],
+                    values=("64 KiB", "128 KiB", "256 KiB", "512 KiB", "1 MiB", "2 MiB"),
+                    state="readonly",
+                ).grid(row=row, column=1, sticky="ew", padx=8)
+                self._vars[key].set(self._chunk_size_label(values[key]))
+            else:
+                tk.Entry(form, textvariable=self._vars[key], bg=PANEL, fg=TEXT, insertbackground=TEXT).grid(
+                    row=row, column=1, sticky="ew", padx=8
+                )
         ttk.Button(form, text="Browse", command=self._browse).grid(row=2, column=2)
-        appearance_row = 4
+        appearance_row = 5
         tk.Label(form, text="Theme", bg=BG, fg=TEXT, font=FONT).grid(row=appearance_row, column=0, sticky="w", pady=3)
         self._theme_var = tk.StringVar(value=self._appearance.theme.title())
         ttk.Combobox(
@@ -5515,13 +5651,38 @@ class SettingsDialog(tk.Toplevel):
         self.grab_set()
 
     def _data(self):
+        chunk_sizes = {
+            "64 KiB": 65536,
+            "128 KiB": 131072,
+            "256 KiB": 262144,
+            "512 KiB": 524288,
+            "1 MiB": 1048576,
+            "2 MiB": 2097152,
+        }
+        values = {k: v.get() for k, v in self._vars.items()}
+        values["sftp_chunk_size"] = chunk_sizes.get(values["sftp_chunk_size"], values["sftp_chunk_size"])
         return {
-            **{k: v.get() for k, v in self._vars.items()},
+            **values,
             **{k: v.get() for k, v in self._bools.items()},
             "theme": self._theme_var.get().casefold(),
             "application_font_size": self._app_font_var.get(),
             "terminal_font_size": self._term_font_var.get(),
         }
+
+    @staticmethod
+    def _chunk_size_label(value):
+        labels = {
+            65536: "64 KiB",
+            131072: "128 KiB",
+            262144: "256 KiB",
+            524288: "512 KiB",
+            1048576: "1 MiB",
+            2097152: "2 MiB",
+        }
+        try:
+            return labels.get(int(value), "1 MiB")
+        except (TypeError, ValueError):
+            return "1 MiB"
 
     def _reset_appearance(self):
         self._theme_var.set("System")

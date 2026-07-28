@@ -71,13 +71,16 @@ DEFAULT_SETTINGS = {
     "confirm_multiline_paste": True,
     "confirm_delete": True,
     "confirm_overwrite": True,
-    # 256 KiB is deliberately conservative: it keeps cancellation and pause
-    # latency low while avoiding the overhead of tiny SFTP requests.
+    # One MiB amortizes SFTP round trips without allocating an unbounded buffer.
     "maximum_sftp_transfers": 3,
-    "sftp_chunk_size": 262144,
+    "sftp_chunk_size": 1048576,
     "show_transfer_manager_on_start": True,
     "transfer_manager_window": {},
 }
+SFTP_TRANSFER_CHUNK_SIZES = (65536, 131072, 262144, 524288, 1048576, 2097152)
+SFTP_SIDECAR_PROGRESS_BYTES = 4 * 1024 * 1024
+SFTP_SIDECAR_PROGRESS_SECONDS = 2.0
+SFTP_PROGRESS_INTERVAL = 0.2
 
 
 @dataclass
@@ -292,7 +295,7 @@ def validate_settings(raw: dict[str, Any]) -> dict[str, Any]:
         scrollback = int(raw.get("scrollback_limit", 5000))
         timeout = int(raw.get("connection_timeout", 15))
         maximum_sftp_transfers = int(raw.get("maximum_sftp_transfers", 3))
-        sftp_chunk_size = int(raw.get("sftp_chunk_size", 262144))
+        sftp_chunk_size = int(raw.get("sftp_chunk_size", DEFAULT_SETTINGS["sftp_chunk_size"]))
     except (TypeError, ValueError) as exc:
         raise ProfileError("Scrollback and timeout must be whole numbers.") from exc
     if not 100 <= scrollback <= 100000 or not 1 <= timeout <= 120 or not 1 <= maximum_sftp_transfers <= 8:
@@ -307,7 +310,9 @@ def validate_settings(raw: dict[str, Any]) -> dict[str, Any]:
             "confirm_delete": bool(raw.get("confirm_delete", True)),
             "confirm_overwrite": bool(raw.get("confirm_overwrite", True)),
             "maximum_sftp_transfers": maximum_sftp_transfers,
-            "sftp_chunk_size": max(16384, min(sftp_chunk_size, 1048576)),
+            # Older installations may have a valid custom value.  Keep it,
+            # while the UI presents the bounded supported choices for new edits.
+            "sftp_chunk_size": max(SFTP_TRANSFER_CHUNK_SIZES[0], min(sftp_chunk_size, SFTP_TRANSFER_CHUNK_SIZES[-1])),
             "show_transfer_manager_on_start": bool(raw.get("show_transfer_manager_on_start", True)),
             "transfer_manager_window": TransferManagerWindowState.from_settings(
                 raw.get("transfer_manager_window")
@@ -1245,6 +1250,77 @@ def parse_socks5_connect(data: bytes) -> tuple[str, int] | None:
 
 
 @dataclass
+class TransferTimingMetrics:
+    """Non-sensitive transfer timing counters, kept per transfer item."""
+
+    remote_read_seconds: float = 0.0
+    remote_write_seconds: float = 0.0
+    local_read_seconds: float = 0.0
+    local_write_seconds: float = 0.0
+    sidecar_write_seconds: float = 0.0
+    channel_creation_seconds: float = 0.0
+    remote_read_calls: int = 0
+    remote_write_calls: int = 0
+    local_read_calls: int = 0
+    local_write_calls: int = 0
+    sidecar_write_calls: int = 0
+    ui_progress_callbacks: int = 0
+    bytes_read_remote: int = 0
+    bytes_written_remote: int = 0
+    bytes_read_local: int = 0
+    bytes_written_local: int = 0
+
+    def record(self, operation: str, elapsed: float, byte_count: int = 0) -> None:
+        """Record only operation timing and byte counts, never path or data."""
+        if operation == "remote_read":
+            self.remote_read_seconds += elapsed
+            self.remote_read_calls += 1
+            self.bytes_read_remote += byte_count
+        elif operation == "remote_write":
+            self.remote_write_seconds += elapsed
+            self.remote_write_calls += 1
+            self.bytes_written_remote += byte_count
+        elif operation == "local_read":
+            self.local_read_seconds += elapsed
+            self.local_read_calls += 1
+            self.bytes_read_local += byte_count
+        elif operation == "local_write":
+            self.local_write_seconds += elapsed
+            self.local_write_calls += 1
+            self.bytes_written_local += byte_count
+        elif operation == "sidecar_write":
+            self.sidecar_write_seconds += elapsed
+            self.sidecar_write_calls += 1
+
+    def average_bytes_per_call(self, operation: str) -> float:
+        calls, byte_count = {
+            "remote_read": (self.remote_read_calls, self.bytes_read_remote),
+            "remote_write": (self.remote_write_calls, self.bytes_written_remote),
+            "local_read": (self.local_read_calls, self.bytes_read_local),
+            "local_write": (self.local_write_calls, self.bytes_written_local),
+        }.get(operation, (0, 0))
+        return byte_count / calls if calls else 0.0
+
+
+@dataclass
+class DurableProgressPolicy:
+    """Bound atomic sidecar rewrites while preserving a flushed offset."""
+
+    completed_bytes: int
+    updated_at: float
+    byte_interval: int = SFTP_SIDECAR_PROGRESS_BYTES
+    time_interval: float = SFTP_SIDECAR_PROGRESS_SECONDS
+
+    def due(self, completed_bytes: int, now: float) -> bool:
+        return (
+            completed_bytes - self.completed_bytes >= self.byte_interval or now - self.updated_at >= self.time_interval
+        )
+
+    def persisted(self, completed_bytes: int, now: float) -> None:
+        self.completed_bytes, self.updated_at = completed_bytes, now
+
+
+@dataclass
 class TransferItem:
     """A serializable transfer request and its UI-independent progress."""
 
@@ -1266,6 +1342,7 @@ class TransferItem:
     restart_required: bool = False
     delete_partial_on_cancel: bool = False
     parent_id: str | None = None
+    metrics: TransferTimingMetrics = field(default_factory=TransferTimingMetrics)
 
     def progress(self) -> float | None:
         return None if not self.total or self.total < 0 else min(100.0, self.transferred * 100.0 / self.total)
@@ -1585,6 +1662,10 @@ class TransferWorker:
         """Expose resume state only after both handles are positioned."""
         self.scheduler._mark_resuming(self.item_id, self.attempt, self.worker_id)
 
+    def durable_update_required(self) -> bool:
+        """Return whether pause/cancel/shutdown needs a durable local offset."""
+        return self.scheduler._durable_update_required(self.item_id, self.attempt)
+
     @property
     def cancelled(self) -> bool:
         return self.scheduler._cancelled(self.item_id, self.attempt)
@@ -1624,6 +1705,7 @@ class TransferScheduler:
         self._paused: set[str] = set()
         self._cancelled_ids: set[str] = set()
         self._stalled_ids: set[str] = set()
+        self._last_progress_notifications: dict[str, float] = {}
         self._condition = threading.Condition(threading.RLock())
         self.stall_timeout = max(1.0, float(stall_timeout))
         self.monitor_interval = max(0.05, float(monitor_interval))
@@ -1791,6 +1873,7 @@ class TransferScheduler:
         try:
             if self.client_factory is None:
                 raise RuntimeError("No SFTP client factory is available.")
+            channel_started = time.perf_counter()
             client = self.client_factory()
             worker = TransferWorker(self, item_id, attempt, client)
             with self._condition:
@@ -1804,6 +1887,7 @@ class TransferScheduler:
                 ):
                     return
                 self._clients[item_id] = client
+                item.metrics.channel_creation_seconds += time.perf_counter() - channel_started
                 item.status, item.updated_at = (
                     (TransferState.DOWNLOADING if item.direction == "Download" else TransferState.TRANSFERRING),
                     self.clock(),
@@ -1877,6 +1961,7 @@ class TransferScheduler:
     ) -> None:
         threads: list[threading.Thread] = []
         paused = False
+        state_changed = False
         with self._condition:
             item = self.get(item_id)
             if (
@@ -1908,13 +1993,17 @@ class TransferScheduler:
                 self._active.discard(item_id)
                 threads = self._schedule_locked()
                 paused = True
+                state_changed = True
             elif transferred is not None and item.transferred > item.resume_offset:
                 # The first completed read/write chunk ends the resume phase.
-                item.status = TransferState.DOWNLOADING if item.direction == "Download" else TransferState.TRANSFERRING
-                self._diagnostic_locked(item, worker_id, item.status)
+                next_state = TransferState.DOWNLOADING if item.direction == "Download" else TransferState.TRANSFERRING
+                if item.status != next_state:
+                    item.status = next_state
+                    self._diagnostic_locked(item, worker_id, item.status)
+                    state_changed = True
             self._condition.notify_all()
         self._start_threads(threads)
-        self._changed()
+        self._changed(item_id=item_id, progress=True, force=state_changed)
         if paused:
             with self._condition:
                 item = self.get(item_id)
@@ -1959,6 +2048,16 @@ class TransferScheduler:
     def _cancelled(self, item_id: str, attempt: int) -> bool:
         with self._condition:
             return self.closed or attempt != self._attempts.get(item_id) or item_id in self._cancelled_ids
+
+    def _durable_update_required(self, item_id: str, attempt: int) -> bool:
+        with self._condition:
+            return (
+                self.closed
+                or attempt != self._attempts.get(item_id)
+                or item_id in self._paused
+                or item_id in self._cancelled_ids
+                or item_id in self._stalled_ids
+            )
 
     def pause(self, item_id: str) -> bool:
         with self._condition:
@@ -2203,7 +2302,21 @@ class TransferScheduler:
             self._changed()
         return stalled
 
-    def _changed(self) -> None:
+    def _changed(self, *, item_id: str | None = None, progress: bool = False, force: bool = True) -> None:
+        if progress and item_id is not None and not force:
+            now = self.clock()
+            with self._condition:
+                if now - self._last_progress_notifications.get(item_id, float("-inf")) < SFTP_PROGRESS_INTERVAL:
+                    return
+                self._last_progress_notifications[item_id] = now
+                item = self.get(item_id)
+                if item is not None:
+                    item.metrics.ui_progress_callbacks += 1
+        elif progress and item_id is not None:
+            with self._condition:
+                item = self.get(item_id)
+                if item is not None:
+                    item.metrics.ui_progress_callbacks += 1
         if self.on_change:
             self.on_change()
 
