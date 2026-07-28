@@ -2971,7 +2971,10 @@ def connection_kwargs(profile: dict[str, Any], password: str | None = None) -> d
         "timeout": profile.get("timeout", 15),
         "compress": profile.get("compression", False),
         "allow_agent": profile.get("auth_method") == "agent",
-        "look_for_keys": True,
+        # An agent-only profile must not also parse unrelated ~/.ssh default
+        # keys.  A malformed legacy DSA key otherwise aborts authentication
+        # before the valid agent RSA/Ed25519 identities are attempted.
+        "look_for_keys": profile.get("auth_method") != "agent",
     }
     if profile.get("auth_method") == "key":
         result["key_filename"] = profile["key_path"]

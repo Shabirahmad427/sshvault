@@ -272,6 +272,7 @@ class ConnectionParameterTests(CoreTestCase):
             validate_profile(profile(auth_method="agent", port=2200, timeout=30, compression=True))
         )
         self.assertEqual((agent["port"], agent["timeout"], agent["compress"]), (2200, 30, True))
+        self.assertFalse(agent["look_for_keys"])
         self.assertNotIn("host_key_policy", agent)
         key = self.root / "id_test"
         key.write_text("private key contents")
