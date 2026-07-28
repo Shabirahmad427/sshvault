@@ -28,7 +28,7 @@ The direct development launch remains available: `python sshvault/sshvault.py`.
 To install a built wheel:
 
 ```bash
-python -m pip install dist/sshvault-0.3.3-py3-none-any.whl
+python -m pip install dist/sshvault-0.3.4-py3-none-any.whl
 ```
 
 ## Usage

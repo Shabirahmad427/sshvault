@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.3
+## 0.3.4
 
 - Separate the SFTP Transfer Manager into a dedicated modeless window.
 

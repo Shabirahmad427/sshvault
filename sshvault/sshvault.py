@@ -5223,7 +5223,7 @@ class DiagnosticsDialog(tk.Toplevel):
         session = {
             "state": getattr(getattr(parent, "_workspace_state", None), "status", "disconnected"),
             "generation": getattr(parent, "_session_generation", 0),
-            "version": "0.3.3",
+            "version": "0.3.4",
         }
         self._diagnostics = DiagnosticsCollector.collect(profile, session)
         self._tree = ttk.Treeview(self, columns=("field", "value"), show="headings")
