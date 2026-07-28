@@ -56,6 +56,7 @@ from sshvault_core import (
     TransferBatch,
     TransferScheduler,
     TransferState,
+    TransferManagerWindowState,
     DownloadResumeDecision,
     adopt_legacy_download,
     inspect_download_resume,
@@ -933,10 +934,21 @@ class SFTPTransferManagerWindow(tk.Toplevel):
     def __init__(self, panel):
         super().__init__(panel.winfo_toplevel())
         self.panel = panel
+        self._destroyed = False
+        self._refresh_after = None
+        self._fullscreen = False
+        settings = getattr(panel.winfo_toplevel(), "_runtime_settings", {})
+        self.state_model = TransferManagerWindowState.from_settings(
+            settings.get("transfer_manager_window") if isinstance(settings, dict) else None
+        )
         self.title("SFTP Transfer Manager")
-        self.geometry("1180x430")
+        width, height, x, y = self.state_model.geometry_for_screen(self.winfo_screenwidth(), self.winfo_screenheight())
+        self.geometry(f"{width}x{height}+{x}+{y}")
         self.minsize(760, 240)
-        self.protocol("WM_DELETE_WINDOW", self.withdraw)
+        self.protocol("WM_DELETE_WINDOW", self.hide)
+        self.bind("<F11>", self._toggle_fullscreen)
+        self.bind("<Escape>", self._exit_fullscreen)
+        self.bind("<Configure>", self._configured)
         top = tk.Frame(self, bg=PANEL)
         top.pack(fill="x", padx=6, pady=4)
         self.summary = tk.StringVar()
@@ -951,8 +963,6 @@ class SFTPTransferManagerWindow(tk.Toplevel):
             ("Pause All", panel._pause_all_transfers),
             ("Resume All", panel._resume_all_transfers),
             ("Cancel All", panel._cancel_all_transfers),
-            ("Move Up", lambda: panel._move_selected_transfer(-1)),
-            ("Move Down", lambda: panel._move_selected_transfer(1)),
         )
         bar = tk.Frame(self, bg=PANEL)
         bar.pack(fill="x", padx=6, pady=(0, 4))
@@ -960,20 +970,115 @@ class SFTPTransferManagerWindow(tk.Toplevel):
             tk.Button(bar, text=label, command=command, bg=ACCENT, fg=BG, font=FONT, relief="flat").pack(
                 side="left", padx=2
             )
-        self.tree = ttk.Treeview(self, columns=self.COLUMNS, show="headings", selectmode="extended")
+        frame = tk.Frame(self, bg=PANEL)
+        frame.pack(fill="both", expand=True, padx=6, pady=4)
+        self.tree = ttk.Treeview(frame, columns=self.COLUMNS, show="headings", selectmode="extended")
+        if set(self.state_model.column_order) == set(self.COLUMNS):
+            self.tree.configure(displaycolumns=self.state_model.column_order)
         for col in self.COLUMNS:
-            self.tree.heading(col, text=col.title())
-            self.tree.column(col, width=110 if col not in {"source", "destination", "error"} else 180, anchor="w")
-        self.tree.pack(fill="both", expand=True, padx=6, pady=4)
+            self.tree.heading(col, text=col.replace("_", " ").title(), command=lambda c=col: self._sort(c))
+            self.tree.column(
+                col,
+                width=self.state_model.column_widths.get(
+                    col, 110 if col not in {"source", "destination", "error"} else 180
+                ),
+                anchor="w",
+            )
+        xscroll = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(xscrollcommand=xscroll.set)
+        self.tree.pack(fill="both", expand=True)
+        xscroll.pack(fill="x")
         self.tree.bind("<Double-Button-1>", self._details)
         self.menu = tk.Menu(self, tearoff=0)
         for label, command in actions[:5]:
             self.menu.add_command(label=label, command=command)
         self.tree.bind("<Button-3>", self._popup)
+        self.tree.bind("<Delete>", lambda _event: panel._remove_selected_transfer())
+        self.tree.bind("<space>", self._space_action)
+        if self.state_model.maximized:
+            self.after_idle(self._restore_maximized)
+
+    def _restore_maximized(self):
+        try:
+            self.state("zoomed")
+        except tk.TclError:
+            pass
 
     def _popup(self, event):
         self.tree.selection_set(self.tree.identify_row(event.y))
         self.menu.tk_popup(event.x_root, event.y_root)
+
+    def _sort(self, column):
+        if self.state_model.sort_column == column:
+            self.state_model.sort_descending = not self.state_model.sort_descending
+        else:
+            self.state_model.sort_column, self.state_model.sort_descending = column, False
+        self.refresh()
+
+    def _space_action(self, _event):
+        for item_id in self.tree.selection():
+            item = self.panel._transfer_manager.get(item_id)
+            if item and item.status == TransferState.PAUSED:
+                self.panel._transfer_manager.resume(item_id)
+            elif item:
+                self.panel._transfer_manager.pause(item_id)
+        return "break"
+
+    def _toggle_fullscreen(self, _event=None):
+        self._fullscreen = not self._fullscreen
+        self.attributes("-fullscreen", self._fullscreen)
+        return "break"
+
+    def _exit_fullscreen(self, _event=None):
+        if self._fullscreen:
+            self._fullscreen = False
+            self.attributes("-fullscreen", False)
+        return "break"
+
+    def _configured(self, _event=None):
+        if self._destroyed or self._fullscreen:
+            return
+        self.state_model.width, self.state_model.height = self.winfo_width(), self.winfo_height()
+        self.state_model.x, self.state_model.y = self.winfo_x(), self.winfo_y()
+        self.state_model.maximized = self.state() == "zoomed"
+
+    def hide(self):
+        self._persist()
+        self.withdraw()
+
+    def destroy_manager(self):
+        if self._refresh_after is not None:
+            self.after_cancel(self._refresh_after)
+            self._refresh_after = None
+        self._persist()
+        self._destroyed = True
+        self.destroy()
+
+    def _persist(self):
+        if self._destroyed:
+            return
+        self.state_model.column_widths = {column: self.tree.column(column, "width") for column in self.COLUMNS}
+        displayed = self.tree.cget("displaycolumns")
+        self.state_model.column_order = list(displayed) if isinstance(displayed, tuple) else list(self.COLUMNS)
+        app = self.panel.winfo_toplevel()
+        settings = getattr(app, "_runtime_settings", None)
+        if isinstance(settings, dict):
+            settings["transfer_manager_window"] = self.state_model.to_settings()
+            try:
+                atomic_json_write(SETTINGS_FILE, validate_settings(settings))
+            except OSError:
+                pass
+
+    def request_refresh(self):
+        if self._destroyed or self._refresh_after is not None:
+            return
+        delay = 1000 if self.state() == "withdrawn" else 150
+        self._refresh_after = self.after(delay, self._run_refresh)
+
+    def _run_refresh(self):
+        self._refresh_after = None
+        if not self._destroyed:
+            self.refresh()
 
     def _details(self, _event):
         selected = self.tree.selection()
@@ -983,9 +1088,30 @@ class SFTPTransferManagerWindow(tk.Toplevel):
                 messagebox.showerror("Transfer failed", item.error or "Unknown transfer error", parent=self)
 
     def refresh(self):
+        if self._destroyed:
+            return
+        selected = self.tree.selection()
         for iid in self.tree.get_children():
             self.tree.delete(iid)
-        for item in self.panel._transfer_manager.items:
+        items = list(self.panel._transfer_manager.items)
+        key_map = {
+            "name": lambda item: Path(item.source).name.casefold(),
+            "direction": lambda item: item.direction,
+            "size": lambda item: item.total or -1,
+            "progress": lambda item: item.progress() or -1,
+            "speed": lambda item: item.speed,
+            "status": lambda item: item.status,
+        }
+        ordered = (
+            items
+            if self.state_model.sort_column == "queue"
+            else sorted(
+                items,
+                key=key_map.get(self.state_model.sort_column, lambda item: item.item_id),
+                reverse=self.state_model.sort_descending,
+            )
+        )
+        for item in ordered:
             pct = "—" if item.progress() is None else f"{item.progress():.1f}%"
             eta = "—" if item.remaining_seconds() is None else f"{item.remaining_seconds():.0f}s"
             size = "—" if item.total is None else self.panel._fmt_size(item.total)
@@ -1010,10 +1136,17 @@ class SFTPTransferManagerWindow(tk.Toplevel):
                     item.error,
                 ),
             )
+        self.tree.selection_set([item_id for item_id in selected if self.tree.exists(item_id)])
         data = self.panel._transfer_manager.summary()
         self.summary.set(
-            "Active: {active}   Pending: {pending}   Completed: {completed}   Failed: {failed}   "
-            "Total speed: {speed} B/s   Transferred: {transferred} B".format(**data)
+            "Active: {active}   Pending: {pending}   Paused: {paused}   Completed: {completed}   Failed: {failed}   "
+            "Total speed: {speed} B/s   Remaining: {remaining} B".format(
+                **{
+                    **data,
+                    "paused": sum(x.status == TransferState.PAUSED for x in items),
+                    "remaining": sum(max(0, (x.total or 0) - x.transferred) for x in items),
+                }
+            )
         )
 
 
@@ -1078,22 +1211,11 @@ class SFTPPanel(tk.Frame):
         self._progress.pack(side="right", padx=8)
         self._status_var = tk.StringVar(value="Disconnected")
         tk.Label(top, textvariable=self._status_var, bg=PANEL, fg=MUTED, font=FONT).pack(side="right", padx=4)
-        queue_frame = tk.LabelFrame(self, text="Transfer queue", bg=PANEL, fg=TEXT, font=FONT)
-        queue_frame.pack(fill="x", padx=4, pady=2)
-        self._transfer_tree = ttk.Treeview(
-            queue_frame, columns=("file", "direction", "progress", "status", "error"), show="headings", height=4
-        )
-        for col, width in (("file", 180), ("direction", 80), ("progress", 90), ("status", 100), ("error", 180)):
-            self._transfer_tree.heading(col, text=col.title())
-            self._transfer_tree.column(col, width=width, anchor="w")
-        self._transfer_tree.pack(fill="x", padx=3, pady=2)
-        qbuttons = tk.Frame(queue_frame, bg=PANEL)
-        qbuttons.pack(fill="x")
-        self._btn(qbuttons, "Pause", self._pause_selected_transfer).pack(side="left", padx=2)
-        self._btn(qbuttons, "Resume", self._resume_selected_transfer).pack(side="left", padx=2)
-        self._btn(qbuttons, "Cancel", self._cancel_selected_transfer).pack(side="left", padx=2)
-        self._btn(qbuttons, "Retry failed", self._retry_failed_transfers).pack(side="left", padx=2)
-        self._btn(qbuttons, "Clear completed", self._clear_completed_transfers).pack(side="left", padx=2)
+        compact = tk.Frame(self, bg=PANEL)
+        compact.pack(fill="x", padx=6, pady=(0, 2))
+        self._transfer_summary_var = tk.StringVar(value="Transfers: 0 active · 0 pending · 0 B/s")
+        tk.Label(compact, textvariable=self._transfer_summary_var, bg=PANEL, fg=MUTED, font=FONT).pack(side="left")
+        self._btn(compact, "Open Transfer Manager", self._show_transfer_manager).pack(side="right")
 
         panes = ttk.PanedWindow(self, orient="horizontal")
         panes.pack(fill="both", expand=True, padx=4, pady=4)
@@ -1193,20 +1315,29 @@ class SFTPPanel(tk.Frame):
         self._update_transfer_actions()
 
     def _refresh_transfer_tree(self):
-        for iid in self._transfer_tree.get_children():
-            self._transfer_tree.delete(iid)
-        for item in self._transfer_manager.items:
-            progress = "—" if item.progress() is None else f"{item.progress():.0f}%"
-            self._transfer_tree.insert(
-                "", "end", iid=item.item_id, values=(item.source, item.direction, progress, item.status, item.error)
-            )
+        data = self._transfer_manager.summary()
+        self._transfer_summary_var.set(
+            f"Transfers: {data['active']} active · {data['pending']} pending · {self._fmt_size(data['speed'])}/s"
+        )
+        settings = getattr(self.winfo_toplevel(), "_runtime_settings", {})
+        if (
+            self._transfer_window is None
+            and isinstance(settings, dict)
+            and settings.get("show_transfer_manager_on_start", True)
+            and any(item.status not in TransferState.TERMINAL for item in self._transfer_manager.items)
+        ):
+            # Showing is intentionally not focus_force(): terminal typing must
+            # remain uninterrupted when a background transfer starts.
+            self._transfer_window = SFTPTransferManagerWindow(self)
         if self._transfer_window is not None and self._transfer_window.winfo_exists():
-            self._transfer_window.refresh()
+            self._transfer_window.request_refresh()
 
     def _show_transfer_manager(self):
         if self._transfer_window is None or not self._transfer_window.winfo_exists():
             self._transfer_window = SFTPTransferManagerWindow(self)
         self._transfer_window.deiconify()
+        if self._transfer_window.state() == "iconic":
+            self._transfer_window.state("normal")
         self._transfer_window.lift()
         self._transfer_window.refresh()
 
@@ -1270,7 +1401,7 @@ class SFTPPanel(tk.Frame):
         self._refresh_transfer_tree()
 
     def _selected_transfer_ids(self):
-        selected = list(self._transfer_tree.selection())
+        selected = []
         if self._transfer_window is not None and self._transfer_window.winfo_exists():
             selected.extend(self._transfer_window.tree.selection())
         return set(selected)
@@ -2633,6 +2764,8 @@ class SFTPPanel(tk.Frame):
             self._local_load_state.close()
         self._transfer_cancel.set()
         self._transfer_manager.shutdown()
+        if self._transfer_window is not None and self._transfer_window.winfo_exists():
+            self._transfer_window.destroy_manager()
         try:
             self._sftp.close()
         except Exception as exc:
@@ -5265,6 +5398,7 @@ class SettingsDialog(tk.Toplevel):
             "terminal_font_size": 10,
             "maximum_sftp_transfers": 3,
             "sftp_chunk_size": 262144,
+            "show_transfer_manager_on_start": True,
         }
         try:
             if SETTINGS_FILE.exists():
@@ -5277,7 +5411,12 @@ class SettingsDialog(tk.Toplevel):
         }
         self._bools = {
             key: tk.BooleanVar(value=bool(values[key]))
-            for key in ("confirm_multiline_paste", "confirm_delete", "confirm_overwrite")
+            for key in (
+                "confirm_multiline_paste",
+                "confirm_delete",
+                "confirm_overwrite",
+                "show_transfer_manager_on_start",
+            )
         }
         self._appearance = AppearanceState.from_settings(values)
         form = tk.Frame(self, bg=BG)
@@ -5320,6 +5459,7 @@ class SettingsDialog(tk.Toplevel):
                 ("confirm_multiline_paste", "Confirm multiline paste"),
                 ("confirm_delete", "Confirm delete"),
                 ("confirm_overwrite", "Confirm overwrite"),
+                ("show_transfer_manager_on_start", "Show Transfer Manager when a transfer starts"),
             ),
             start=appearance_row + 3,
         ):
@@ -5479,6 +5619,7 @@ class SSHVaultApp(tk.Tk):
 
         tools_menu = tk.Menu(menubar, tearoff=0)
         tools_menu.add_command(label="Generate Key Pair", command=self._keygen)
+        tools_menu.add_command(label="Transfer Manager", command=self._open_transfer_manager)
         tools_menu.add_command(label="Built-in SFTP Server Settings", command=self._sftp_server_settings)
         tools_menu.add_command(label="Activity Log", command=self._open_log)
         tools_menu.add_command(label="Settings", command=self._open_settings)
@@ -5491,6 +5632,16 @@ class SSHVaultApp(tk.Tk):
         menubar.add_cascade(label="Help", menu=help_menu)
 
         self.config(menu=menubar)
+        self.bind_all("<Control-Shift-T>", lambda _event: self._open_transfer_manager())
+
+    def _open_transfer_manager(self):
+        """Open the selected session's manager without disturbing workspace focus."""
+        for tab in self._conn_tabs.values():
+            panel = getattr(tab, "_sftp_panel", None)
+            if panel is not None:
+                panel._show_transfer_manager()
+                return "break"
+        return "break"
 
     def _show_about(self):
         messagebox.showinfo(

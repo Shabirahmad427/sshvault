@@ -61,6 +61,8 @@ _SETTINGS_ALLOWED = {
     "confirm_overwrite",
     "maximum_sftp_transfers",
     "sftp_chunk_size",
+    "show_transfer_manager_on_start",
+    "transfer_manager_window",
 }
 DEFAULT_SETTINGS = {
     "scrollback_limit": 5000,
@@ -73,6 +75,8 @@ DEFAULT_SETTINGS = {
     # latency low while avoiding the overhead of tiny SFTP requests.
     "maximum_sftp_transfers": 3,
     "sftp_chunk_size": 262144,
+    "show_transfer_manager_on_start": True,
+    "transfer_manager_window": {},
 }
 
 
@@ -304,12 +308,91 @@ def validate_settings(raw: dict[str, Any]) -> dict[str, Any]:
             "confirm_overwrite": bool(raw.get("confirm_overwrite", True)),
             "maximum_sftp_transfers": maximum_sftp_transfers,
             "sftp_chunk_size": max(16384, min(sftp_chunk_size, 1048576)),
+            "show_transfer_manager_on_start": bool(raw.get("show_transfer_manager_on_start", True)),
+            "transfer_manager_window": TransferManagerWindowState.from_settings(
+                raw.get("transfer_manager_window")
+            ).to_settings(),
             "theme": AppearanceState.normalize_theme(raw.get("theme", "system")),
             "application_font_size": AppearanceState.clamp_application_font(raw.get("application_font_size", 10)),
             "terminal_font_size": AppearanceState.clamp_terminal_font(raw.get("terminal_font_size", 10)),
         }
     )
     return result
+
+
+@dataclass
+class TransferManagerWindowState:
+    """Display-free persistent state for the modeless transfer window."""
+
+    width: int = 1180
+    height: int = 430
+    x: int | None = None
+    y: int | None = None
+    maximized: bool = False
+    column_widths: dict[str, int] = field(default_factory=dict)
+    column_order: list[str] = field(default_factory=list)
+    sort_column: str = "queue"
+    sort_descending: bool = False
+
+    @classmethod
+    def from_settings(cls, raw: object) -> "TransferManagerWindowState":
+        data = raw if isinstance(raw, dict) else {}
+
+        def integer(name: str, default: int) -> int:
+            try:
+                return int(data.get(name, default))
+            except (TypeError, ValueError):
+                return default
+
+        widths = data.get("column_widths", {})
+        return cls(
+            width=max(760, min(integer("width", 1180), 4000)),
+            height=max(240, min(integer("height", 430), 3000)),
+            x=integer("x", 0) if data.get("x") is not None else None,
+            y=integer("y", 0) if data.get("y") is not None else None,
+            maximized=bool(data.get("maximized", False)),
+            column_widths={
+                str(k): max(40, min(int(v), 2000)) for k, v in widths.items() if str(v).lstrip("-").isdigit()
+            },
+            column_order=[str(value) for value in data.get("column_order", []) if isinstance(value, str)],
+            sort_column=str(data.get("sort_column", "queue")),
+            sort_descending=bool(data.get("sort_descending", False)),
+        )
+
+    def to_settings(self) -> dict[str, Any]:
+        return {
+            "width": self.width,
+            "height": self.height,
+            "x": self.x,
+            "y": self.y,
+            "maximized": self.maximized,
+            "column_widths": self.column_widths,
+            "column_order": self.column_order,
+            "sort_column": self.sort_column,
+            "sort_descending": self.sort_descending,
+        }
+
+    def geometry_for_screen(self, screen_width: int, screen_height: int) -> tuple[int, int, int, int]:
+        width, height = min(self.width, screen_width), min(self.height, screen_height)
+        x = (
+            (screen_width - width) // 2
+            if self.x is None or self.x < 0 or self.x + 80 > screen_width or self.x + width < 80
+            else self.x
+        )
+        y = (
+            (screen_height - height) // 2
+            if self.y is None or self.y < 0 or self.y + 80 > screen_height or self.y + height < 80
+            else self.y
+        )
+        return width, height, x, y
+
+    def sorted_ids(self, items: list["TransferItem"], key: Callable[["TransferItem"], Any] | None = None) -> list[str]:
+        rows = (
+            list(items)
+            if self.sort_column == "queue" or key is None
+            else sorted(items, key=key, reverse=self.sort_descending)
+        )
+        return [item.item_id for item in rows]
 
 
 @dataclass(frozen=True)
