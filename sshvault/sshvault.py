@@ -59,6 +59,7 @@ from sshvault_core import (
     TransferManagerWindowState,
     DownloadResumeDecision,
     DurableProgressPolicy,
+    AdaptiveTransferTuner,
     SFTP_TRANSFER_CHUNK_SIZES,
     adopt_legacy_download,
     inspect_download_resume,
@@ -2543,6 +2544,10 @@ class SFTPPanel(tk.Frame):
                 transferred = offset
                 self._enable_download_prefetch(source, total)
                 chunk_size = self._transfer_chunk_size()
+                # A non-default chunk selection is an explicit manual choice.
+                tuner = AdaptiveTransferTuner(
+                    total if chunk_size == 1048576 else 0, chunk_size=chunk_size, prefetch_depth=8
+                )
                 while True:
                     started = time.perf_counter()
                     chunk = source.read(chunk_size)
@@ -2553,6 +2558,7 @@ class SFTPPanel(tk.Frame):
                     target.write(chunk)
                     item.metrics.record("local_write", time.perf_counter() - started, len(chunk))
                     transferred += len(chunk)
+                    chunk_size, _prefetch_depth = tuner.observe(transferred, time.monotonic())
                     now = time.monotonic()
                     if policy.due(transferred, now) or worker.durable_update_required():
                         self._persist_download_progress(target, plan, local, transferred, policy, item.metrics)

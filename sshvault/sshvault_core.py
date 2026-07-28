@@ -78,9 +78,44 @@ DEFAULT_SETTINGS = {
     "transfer_manager_window": {},
 }
 SFTP_TRANSFER_CHUNK_SIZES = (65536, 131072, 262144, 524288, 1048576, 2097152)
-SFTP_SIDECAR_PROGRESS_BYTES = 4 * 1024 * 1024
-SFTP_SIDECAR_PROGRESS_SECONDS = 2.0
-SFTP_PROGRESS_INTERVAL = 0.2
+SFTP_SIDECAR_PROGRESS_BYTES = 16 * 1024 * 1024
+SFTP_SIDECAR_PROGRESS_SECONDS = 5.0
+SFTP_PROGRESS_INTERVAL = 0.25
+SFTP_PREFETCH_DEPTHS = (4, 8, 16, 32)
+SFTP_PREFETCH_WORKER_MEMORY_LIMIT = 32 * 1024 * 1024
+SFTP_PREFETCH_TOTAL_MEMORY_LIMIT = 96 * 1024 * 1024
+
+
+def bounded_prefetch_depth(chunk_size: int, requested_depth: int, workers: int = 1) -> int:
+    """Return a tested prefetch depth that cannot exceed the memory budget."""
+    if requested_depth not in SFTP_PREFETCH_DEPTHS:
+        requested_depth = min(32, max(4, requested_depth))
+    safe_workers = max(1, workers)
+    budget = min(SFTP_PREFETCH_WORKER_MEMORY_LIMIT, SFTP_PREFETCH_TOTAL_MEMORY_LIMIT // safe_workers)
+    allowed = max(1, budget // max(1, chunk_size))
+    return max(depth for depth in SFTP_PREFETCH_DEPTHS if depth <= min(requested_depth, allowed)) if allowed >= 4 else 0
+
+
+def ssh_compression_recommended(filename: str, *, latency_seconds: float | None = None) -> bool:
+    """Recommend compression only for likely-compressible payloads on slower links."""
+    compressed = {
+        ".7z",
+        ".bz2",
+        ".dcd",
+        ".gz",
+        ".jpeg",
+        ".jpg",
+        ".mp4",
+        ".nc",
+        ".png",
+        ".tar",
+        ".tgz",
+        ".xtc",
+        ".xz",
+        ".zip",
+    }
+    suffix = Path(filename).suffix.casefold()
+    return suffix not in compressed and (latency_seconds is None or latency_seconds >= 0.02)
 
 
 @dataclass
@@ -1318,6 +1353,53 @@ class DurableProgressPolicy:
 
     def persisted(self, completed_bytes: int, now: float) -> None:
         self.completed_bytes, self.updated_at = completed_bytes, now
+
+
+@dataclass
+class AdaptiveTransferTuner:
+    """Small, session-only controller for a stable large-file download."""
+
+    total: int | None
+    chunk_size: int = 1048576
+    prefetch_depth: int = 8
+    active: bool = False
+    stopped: bool = False
+    last_bytes: int = 0
+    last_time: float | None = None
+    last_rate: float = 0.0
+    non_improvements: int = 0
+
+    def observe(self, completed_bytes: int, now: float, *, stable: bool = True) -> tuple[int, int]:
+        """Evaluate one change at a time; never rewinds active transfer data."""
+        if self.total is None or self.total < 32 * 1024 * 1024 or not stable or self.stopped:
+            return self.chunk_size, self.prefetch_depth
+        if not self.active:
+            if completed_bytes < 8 * 1024 * 1024:
+                return self.chunk_size, self.prefetch_depth
+            self.active, self.last_bytes, self.last_time = True, completed_bytes, now
+            return self.chunk_size, self.prefetch_depth
+        if self.last_time is None or completed_bytes - self.last_bytes < 4 * 1024 * 1024 or now - self.last_time < 2.0:
+            return self.chunk_size, self.prefetch_depth
+        rate = (completed_bytes - self.last_bytes) / max(0.001, now - self.last_time)
+        self.last_bytes, self.last_time = completed_bytes, now
+        if self.last_rate == 0.0:
+            self.last_rate = rate
+            return self.chunk_size, self.prefetch_depth
+        if rate > self.last_rate * 1.05:
+            self.last_rate, self.non_improvements = rate, 0
+            if self.chunk_size < 2 * 1024 * 1024:
+                self.chunk_size = min(2 * 1024 * 1024, self.chunk_size * 2)
+            elif self.prefetch_depth < 32:
+                self.prefetch_depth *= 2
+            return self.chunk_size, self.prefetch_depth
+        if rate < self.last_rate * 0.9:
+            self.non_improvements += 1
+            self.chunk_size = max(256 * 1024, self.chunk_size // 2)
+        else:
+            self.non_improvements += 1
+        if self.non_improvements >= 2:
+            self.stopped = True
+        return self.chunk_size, self.prefetch_depth
 
 
 @dataclass

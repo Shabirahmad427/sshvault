@@ -117,9 +117,9 @@ class ThroughputSettingsTests(unittest.TestCase):
     def test_durable_progress_is_due_by_bytes_or_time_only(self):
         policy = DurableProgressPolicy(0, 0)
         self.assertFalse(policy.due(1048576, 1))
-        self.assertTrue(policy.due(4 * 1024 * 1024, 1))
-        policy.persisted(4 * 1024 * 1024, 1)
-        self.assertTrue(policy.due(4 * 1024 * 1024 + 1, 3.1))
+        self.assertTrue(policy.due(16 * 1024 * 1024, 1))
+        policy.persisted(16 * 1024 * 1024, 1)
+        self.assertTrue(policy.due(16 * 1024 * 1024 + 1, 6.1))
 
     def test_progress_callbacks_are_throttled_but_state_callback_is_immediate(self):
         now = [0.0]
@@ -134,8 +134,8 @@ class ThroughputSettingsTests(unittest.TestCase):
         now[0] = 0.2
         scheduler._changed(item_id=item.item_id, progress=True, force=False)
         scheduler._changed()
-        self.assertEqual(callbacks, [0.0, 0.2, 0.2])
-        self.assertEqual(item.metrics.ui_progress_callbacks, 2)
+        self.assertEqual(callbacks, [0.0, 0.2])
+        self.assertEqual(item.metrics.ui_progress_callbacks, 1)
 
 
 class BufferedDownloadTests(unittest.TestCase):
@@ -157,7 +157,7 @@ class BufferedDownloadTests(unittest.TestCase):
             self.assertEqual(local.read_bytes(), data)
         self.assertTrue(all(size == 1048576 for size in sftp.source.read_sizes[:-1]))
         self.assertEqual(sftp.source.prefetch_calls, [{"file_size": len(data), "max_concurrent_prefetch_requests": 8}])
-        self.assertEqual(writes, [0, 4 * 1024 * 1024, len(data)])
+        self.assertEqual(writes, [0, len(data)])
         self.assertEqual(item.metrics.average_bytes_per_call("remote_read"), 5 * 1024 * 1024 / 6)
         self.assertEqual(worker.progress[-1], (len(data), len(data)))
 
