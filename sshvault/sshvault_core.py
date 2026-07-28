@@ -1259,6 +1259,7 @@ class TransferItem:
     item_id: str = field(default_factory=lambda: uuid4().hex)
     started_at: float | None = None
     updated_at: float | None = None
+    last_progress_at: float | None = None
     speed: float = 0.0
     average_speed: float = 0.0
     resume_offset: int = 0
@@ -1573,15 +1574,20 @@ class TransferWorker:
     releases its scheduler slot while paused, permitting pending work to run.
     """
 
-    def __init__(self, scheduler: "TransferScheduler", item_id: str, client: Any) -> None:
-        self.scheduler, self.item_id, self.client = scheduler, item_id, client
+    def __init__(self, scheduler: "TransferScheduler", item_id: str, attempt: int, client: Any) -> None:
+        self.scheduler, self.item_id, self.attempt, self.client = scheduler, item_id, attempt, client
+        self.worker_id = uuid4().hex
 
     def checkpoint(self, transferred: int | None = None, total: int | None = None) -> None:
-        self.scheduler._checkpoint(self.item_id, transferred, total)
+        self.scheduler._checkpoint(self.item_id, self.attempt, transferred, total, self.worker_id)
+
+    def mark_resuming(self) -> None:
+        """Expose resume state only after both handles are positioned."""
+        self.scheduler._mark_resuming(self.item_id, self.attempt, self.worker_id)
 
     @property
     def cancelled(self) -> bool:
-        return self.scheduler._cancelled(self.item_id)
+        return self.scheduler._cancelled(self.item_id, self.attempt)
 
 
 class TransferScheduler:
@@ -1598,6 +1604,10 @@ class TransferScheduler:
         concurrency: int = 3,
         clock: Callable[[], float] = time.monotonic,
         on_change: Callable[[], None] | None = None,
+        *,
+        stall_timeout: float = 60.0,
+        monitor_interval: float = 1.0,
+        debug_transfers: bool = False,
     ) -> None:
         self.client_factory = client_factory
         self.concurrency = max(1, min(8, int(concurrency)))
@@ -1609,9 +1619,23 @@ class TransferScheduler:
         self._operations: dict[str, TransferOperation] = {}
         self._active: set[str] = set()
         self._threads: dict[str, threading.Thread] = {}
+        self._clients: dict[str, Any] = {}
+        self._attempts: dict[str, int] = {}
         self._paused: set[str] = set()
         self._cancelled_ids: set[str] = set()
+        self._stalled_ids: set[str] = set()
         self._condition = threading.Condition(threading.RLock())
+        self.stall_timeout = max(1.0, float(stall_timeout))
+        self.monitor_interval = max(0.05, float(monitor_interval))
+        self.debug_transfers = debug_transfers
+        self.diagnostic_events: list[dict[str, Any]] = []
+        self._monitor_stop = threading.Event()
+        self._monitor_thread: threading.Thread | None = None
+        if client_factory is not None:
+            self._monitor_thread = threading.Thread(
+                target=self._monitor_stalls, daemon=True, name="sshvault-sftp-transfer-monitor"
+            )
+            self._monitor_thread.start()
 
     @property
     def active(self) -> TransferItem | None:
@@ -1626,7 +1650,9 @@ class TransferScheduler:
     def set_concurrency(self, value: int) -> None:
         with self._condition:
             self.concurrency = max(1, min(8, int(value)))
-            self._schedule_locked()
+            threads = self._schedule_locked()
+        self._start_threads(threads)
+        self._changed()
 
     def enqueue(self, item: TransferItem, operation: TransferOperation | None = None) -> TransferItem:
         with self._condition:
@@ -1637,7 +1663,8 @@ class TransferScheduler:
             self.items.append(item)
             if operation:
                 self._operations[item.item_id] = operation
-            self._schedule_locked()
+            threads = self._schedule_locked()
+        self._start_threads(threads)
         self._changed()
         return item
 
@@ -1701,7 +1728,9 @@ class TransferScheduler:
                 self.retry(item_id)
         return True
 
-    def _schedule_locked(self) -> None:
+    def _schedule_locked(self) -> list[threading.Thread]:
+        """Reserve slots and create workers while locked; start them after unlock."""
+        threads: list[threading.Thread] = []
         # The compatibility queue deliberately has no client factory.  Keep its
         # historical manual lifecycle without spawning a worker.
         if self.client_factory is None:
@@ -1712,55 +1741,115 @@ class TransferScheduler:
                 if item:
                     item.status = TransferState.PREPARING
                     self._active.add(item.item_id)
-            return
+            return threads
         while not self.closed and len(self._active) < self.concurrency:
             item = next(
                 (x for x in self.items if x.status == TransferState.PENDING and x.item_id not in self._paused), None
             )
             if item is None:
-                return
+                return threads
             item.status = TransferState.PREPARING
+            item.started_at = self.clock()
+            item.updated_at = item.started_at
+            item.last_progress_at = item.started_at
             self._active.add(item.item_id)
+            attempt = self._attempts.get(item.item_id, 0) + 1
+            self._attempts[item.item_id] = attempt
             thread = threading.Thread(
-                target=self._run, args=(item.item_id, self.generation), daemon=True, name="sshvault-sftp-transfer"
+                target=self._run,
+                args=(item.item_id, self.generation, attempt),
+                daemon=True,
+                name="sshvault-sftp-transfer",
             )
             self._threads[item.item_id] = thread
+            threads.append(thread)
+        return threads
+
+    @staticmethod
+    def _start_threads(threads: list[threading.Thread]) -> None:
+        for thread in threads:
             thread.start()
 
-    def _run(self, item_id: str, generation: int) -> None:
+    def _diagnostic_locked(self, item: TransferItem, worker_id: str, state: str, *, reason: str = "") -> None:
+        if not self.debug_transfers:
+            return
+        self.diagnostic_events.append(
+            {
+                "transfer_id": item.item_id,
+                "worker_id": worker_id,
+                "state": state,
+                "resume_offset": item.resume_offset,
+                "completed_bytes": item.transferred,
+                "last_progress_timestamp": item.last_progress_at,
+                "reason": reason,
+            }
+        )
+
+    def _run(self, item_id: str, generation: int, attempt: int) -> None:
         client = None
+        worker: TransferWorker | None = None
         try:
             if self.client_factory is None:
                 raise RuntimeError("No SFTP client factory is available.")
             client = self.client_factory()
+            worker = TransferWorker(self, item_id, attempt, client)
             with self._condition:
                 item = self.get(item_id)
-                if item is None or generation != self.generation or item_id in self._cancelled_ids:
+                if (
+                    item is None
+                    or generation != self.generation
+                    or attempt != self._attempts.get(item_id)
+                    or item_id in self._cancelled_ids
+                    or item_id in self._stalled_ids
+                ):
                     return
-                item.status, item.started_at, item.updated_at = (
+                self._clients[item_id] = client
+                item.status, item.updated_at = (
                     (TransferState.DOWNLOADING if item.direction == "Download" else TransferState.TRANSFERRING),
                     self.clock(),
-                    self.clock(),
                 )
+                self._diagnostic_locked(item, worker.worker_id, "channel-created")
             self._changed()
             operation = self._operations.get(item_id)
             if operation is None:
                 raise RuntimeError("No transfer operation is available.")
-            operation(item, client, TransferWorker(self, item_id, client))
+            operation(item, client, worker)
             with self._condition:
                 item = self.get(item_id)
-                if item and generation == self.generation and item_id not in self._cancelled_ids:
+                if (
+                    item
+                    and generation == self.generation
+                    and attempt == self._attempts.get(item_id)
+                    and item_id not in self._cancelled_ids
+                    and item_id not in self._stalled_ids
+                ):
                     item.status = TransferState.COMPLETED
+                    self._diagnostic_locked(item, worker.worker_id, TransferState.COMPLETED)
         except InterruptedError:
             with self._condition:
                 item = self.get(item_id)
-                if item and generation == self.generation:
+                if (
+                    item
+                    and generation == self.generation
+                    and attempt == self._attempts.get(item_id)
+                    and item_id not in self._stalled_ids
+                ):
                     item.status = TransferState.CANCELLED
+                    self._diagnostic_locked(item, worker.worker_id if worker else "", TransferState.CANCELLED)
         except Exception as exc:
             with self._condition:
                 item = self.get(item_id)
-                if item and generation == self.generation and item_id not in self._cancelled_ids:
+                if (
+                    item
+                    and generation == self.generation
+                    and attempt == self._attempts.get(item_id)
+                    and item_id not in self._cancelled_ids
+                    and item_id not in self._stalled_ids
+                ):
                     item.status, item.error = TransferState.FAILED, str(redact_secrets(str(exc)))
+                    self._diagnostic_locked(
+                        item, worker.worker_id if worker else "", TransferState.FAILED, reason="error"
+                    )
         finally:
             if client is not None:
                 try:
@@ -1768,16 +1857,36 @@ class TransferScheduler:
                 except Exception:
                     pass
             with self._condition:
-                self._active.discard(item_id)
-                self._threads.pop(item_id, None)
-                self._schedule_locked()
+                if attempt == self._attempts.get(item_id):
+                    self._active.discard(item_id)
+                    self._threads.pop(item_id, None)
+                    if self._clients.get(item_id) is client:
+                        self._clients.pop(item_id, None)
+                    threads = self._schedule_locked()
+                else:
+                    threads = []
                 self._condition.notify_all()
+                item = self.get(item_id)
+                if item is not None:
+                    self._diagnostic_locked(item, worker.worker_id if worker else "", "worker-exit")
+            self._start_threads(threads)
             self._changed()
 
-    def _checkpoint(self, item_id: str, transferred: int | None, total: int | None) -> None:
+    def _checkpoint(
+        self, item_id: str, attempt: int, transferred: int | None, total: int | None, worker_id: str
+    ) -> None:
+        threads: list[threading.Thread] = []
+        paused = False
         with self._condition:
             item = self.get(item_id)
-            if item is None or item.generation != self.generation or item_id in self._cancelled_ids or self.closed:
+            if (
+                item is None
+                or item.generation != self.generation
+                or attempt != self._attempts.get(item_id)
+                or item_id in self._cancelled_ids
+                or item_id in self._stalled_ids
+                or self.closed
+            ):
                 raise InterruptedError("Transfer cancelled")
             now = self.clock()
             if transferred is not None:
@@ -1788,34 +1897,68 @@ class TransferScheduler:
                 item.speed = delta / elapsed
                 if item.started_at is not None:
                     item.average_speed = item.transferred / max(0.001, now - item.started_at)
+                if delta:
+                    item.last_progress_at = now
+                    self._diagnostic_locked(item, worker_id, "read-write-complete")
             if total is not None:
                 item.total = total
             item.updated_at = now
-            while item_id in self._paused and item_id not in self._cancelled_ids and not self.closed:
+            if item_id in self._paused:
                 item.status = TransferState.PAUSED
                 self._active.discard(item_id)
-                self._schedule_locked()
-                self._changed()
-                self._condition.wait()
-            if item_id in self._cancelled_ids or self.closed:
+                threads = self._schedule_locked()
+                paused = True
+            elif transferred is not None and item.transferred > item.resume_offset:
+                # The first completed read/write chunk ends the resume phase.
+                item.status = TransferState.DOWNLOADING if item.direction == "Download" else TransferState.TRANSFERRING
+                self._diagnostic_locked(item, worker_id, item.status)
+            self._condition.notify_all()
+        self._start_threads(threads)
+        self._changed()
+        if paused:
+            with self._condition:
+                item = self.get(item_id)
+                while (
+                    item is not None
+                    and item_id in self._paused
+                    and attempt == self._attempts.get(item_id)
+                    and item_id not in self._cancelled_ids
+                    and not self.closed
+                ):
+                    self._condition.wait()
+                if (
+                    item is None
+                    or attempt != self._attempts.get(item_id)
+                    or item_id in self._cancelled_ids
+                    or item_id in self._stalled_ids
+                    or self.closed
+                ):
+                    raise InterruptedError("Transfer cancelled")
+                while len(self._active) >= self.concurrency and not self.closed:
+                    self._condition.wait()
+                if self.closed:
+                    raise InterruptedError("Transfer cancelled")
+                self._active.add(item_id)
+
+    def _mark_resuming(self, item_id: str, attempt: int, worker_id: str) -> None:
+        with self._condition:
+            item = self.get(item_id)
+            if (
+                item is None
+                or attempt != self._attempts.get(item_id)
+                or item_id in self._cancelled_ids
+                or item_id in self._stalled_ids
+                or self.closed
+            ):
                 raise InterruptedError("Transfer cancelled")
-            while len(self._active) >= self.concurrency and not self.closed:
-                self._condition.wait()
-            if self.closed:
-                raise InterruptedError("Transfer cancelled")
-            item.status = (
-                TransferState.RESUMING
-                if item.direction == "Download" and item.resume_offset
-                else TransferState.DOWNLOADING
-                if item.direction == "Download"
-                else TransferState.TRANSFERRING
-            )
-            self._active.add(item_id)
+            item.status = TransferState.RESUMING
+            item.updated_at = self.clock()
+            self._diagnostic_locked(item, worker_id, TransferState.RESUMING)
         self._changed()
 
-    def _cancelled(self, item_id: str) -> bool:
+    def _cancelled(self, item_id: str, attempt: int) -> bool:
         with self._condition:
-            return self.closed or item_id in self._cancelled_ids
+            return self.closed or attempt != self._attempts.get(item_id) or item_id in self._cancelled_ids
 
     def pause(self, item_id: str) -> bool:
         with self._condition:
@@ -1824,6 +1967,8 @@ class TransferScheduler:
                 TransferState.PENDING,
                 TransferState.PREPARING,
                 TransferState.TRANSFERRING,
+                TransferState.RESUMING,
+                TransferState.DOWNLOADING,
             }:
                 return False
             self._paused.add(item_id)
@@ -1843,10 +1988,12 @@ class TransferScheduler:
             # do not launch a second worker for the same item.
             if item_id in self._threads:
                 item.status = TransferState.PREPARING
+                threads: list[threading.Thread] = []
             else:
                 item.status = TransferState.PENDING
-                self._schedule_locked()
+                threads = self._schedule_locked()
             self._condition.notify_all()
+        self._start_threads(threads)
         self._changed()
         return True
 
@@ -1859,7 +2006,13 @@ class TransferScheduler:
             self._paused.discard(item_id)
             if item.status in {TransferState.PENDING, TransferState.PAUSED}:
                 item.status = TransferState.CANCELLED
+            client = self._clients.get(item_id)
             self._condition.notify_all()
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
         self._changed()
         return True
 
@@ -1867,6 +2020,10 @@ class TransferScheduler:
         with self._condition:
             item = self.get(item_id)
             if item is None or item.status not in {TransferState.FAILED, TransferState.CANCELLED}:
+                return False
+            # A stalled SFTP channel is closed before the row is marked failed.
+            # Do not let an uninterruptible legacy channel write beside a retry.
+            if item_id in self._threads:
                 return False
             # Download operations revalidate their sidecar and resume from the
             # durable partial offset.  Upload retains its historical restart.
@@ -1880,7 +2037,10 @@ class TransferScheduler:
             )
             item.restart_required = False
             self._cancelled_ids.discard(item_id)
-            self._schedule_locked()
+            self._stalled_ids.discard(item_id)
+            item.last_progress_at = None
+            threads = self._schedule_locked()
+        self._start_threads(threads)
         self._changed()
         return True
 
@@ -1967,7 +2127,13 @@ class TransferScheduler:
                     if fail_active:
                         item.error = "SFTP session disconnected"
             self._cancelled_ids.update(self._active)
+            clients = list(self._clients.values())
             self._condition.notify_all()
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                pass
         self._changed()
 
     def shutdown(self, timeout: float = 1.0) -> None:
@@ -1978,11 +2144,64 @@ class TransferScheduler:
                     item.status = TransferState.CANCELLED
             self._cancelled_ids.update(self._active)
             threads = list(self._threads.values())
+            clients = list(self._clients.values())
             self._condition.notify_all()
+        self._monitor_stop.set()
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                pass
         for thread in threads:
             if thread is not threading.current_thread():
                 thread.join(timeout=timeout)
+        if self._monitor_thread is not None and self._monitor_thread is not threading.current_thread():
+            self._monitor_thread.join(timeout=timeout)
         self._changed()
+
+    def _monitor_stalls(self) -> None:
+        while not self._monitor_stop.wait(self.monitor_interval):
+            self.check_stalls()
+
+    def check_stalls(self) -> list[str]:
+        """Fail stalled workers without holding the scheduler lock for cleanup.
+
+        Closing a worker-owned SFTP client closes only its channel.  Paramiko
+        uses the already verified shared transport underneath, which remains
+        available to browsing and the other worker channels.
+        """
+        threads: list[threading.Thread] = []
+        clients: list[Any] = []
+        stalled: list[str] = []
+        with self._condition:
+            now = self.clock()
+            for item_id in list(self._active):
+                item = self.get(item_id)
+                if item is None or item.last_progress_at is None:
+                    continue
+                if now - item.last_progress_at < self.stall_timeout:
+                    continue
+                item.status = TransferState.FAILED
+                item.error = "Transfer stalled: no completed read/write progress."
+                self._stalled_ids.add(item_id)
+                self._active.discard(item_id)
+                stalled.append(item_id)
+                client = self._clients.get(item_id)
+                if client is not None:
+                    clients.append(client)
+                self._diagnostic_locked(item, "", TransferState.FAILED, reason="stall")
+            if stalled:
+                threads = self._schedule_locked()
+                self._condition.notify_all()
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                pass
+        self._start_threads(threads)
+        if stalled:
+            self._changed()
+        return stalled
 
     def _changed(self) -> None:
         if self.on_change:
@@ -2035,7 +2254,8 @@ class TransferQueueManager(TransferScheduler):
         item.status, item.error = (TransferState.FAILED if error else TransferState.COMPLETED), error
         with self._condition:
             self._active.discard(item_id)
-            self._schedule_locked()
+            threads = self._schedule_locked()
+        self._start_threads(threads)
         return True
 
 

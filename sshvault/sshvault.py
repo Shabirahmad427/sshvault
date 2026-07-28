@@ -1165,6 +1165,7 @@ class SFTPPanel(tk.Frame):
         self._remote_open_cache = Path(tempfile.gettempdir()) / "sshvault-open"
         self._remote_open_cache.mkdir(parents=True, exist_ok=True)
         self._transfer_queue: queue.Queue = queue.Queue()
+        self._transfer_refresh_events: queue.SimpleQueue[bool] = queue.SimpleQueue()
         self._transfer_cancel = threading.Event()
         self._closed = False
         self._remote_generation = 0
@@ -1174,7 +1175,7 @@ class SFTPPanel(tk.Frame):
         self._transfer_manager = TransferScheduler(
             self._new_transfer_client,
             concurrency=settings.get("maximum_sftp_transfers", 3) if isinstance(settings, dict) else 3,
-            on_change=lambda: self._dispatch(self._refresh_transfer_tree),
+            on_change=self._request_transfer_refresh,
         )
         self._transfer_window = None
         self._local_load_state = DirectoryLoadState()
@@ -1186,6 +1187,7 @@ class SFTPPanel(tk.Frame):
         self._build()
         self._transfer_thread = threading.Thread(target=self._transfer_worker, daemon=True)
         self._transfer_thread.start()
+        self.after(150, self._poll_transfer_refresh)
         self._refresh_local()
         self._refresh_remote()
 
@@ -1200,6 +1202,25 @@ class SFTPPanel(tk.Frame):
             self.after(0, guarded)
         except (RuntimeError, tk.TclError):
             pass
+
+    def _request_transfer_refresh(self):
+        """Queue worker state changes; only the Tk poller touches widgets."""
+        if not self._closed:
+            self._transfer_refresh_events.put(True)
+
+    def _poll_transfer_refresh(self):
+        if self._closed:
+            return
+        changed = False
+        while True:
+            try:
+                self._transfer_refresh_events.get_nowait()
+                changed = True
+            except queue.Empty:
+                break
+        if changed:
+            self._refresh_transfer_tree()
+        self.after(150, self._poll_transfer_refresh)
 
     def _build(self):
         top = tk.Frame(self, bg=PANEL)
@@ -2407,12 +2428,15 @@ class SFTPPanel(tk.Frame):
                 completed_bytes=0,
             )
         item.resume_offset, item.transferred = offset, offset
-        item.status = TransferState.RESUMING if offset else TransferState.DOWNLOADING
         try:
             local_mode = "r+b" if offset else "wb"
             with sftp.open(remote, "rb") as source, partial.open(local_mode) as target:
                 source.seek(offset)
                 target.seek(offset)
+                if offset:
+                    # Do not advertise a resume until both independently owned
+                    # handles have reached the validated durable offset.
+                    worker.mark_resuming()
                 transferred = offset
                 while chunk := source.read(262144):
                     target.write(chunk)
