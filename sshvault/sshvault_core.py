@@ -767,7 +767,7 @@ class DiagnosticsCollector:
         profile = profile or {}
         session = session or {}
         values = {
-            "SSHVault version": str(session.get("version", "0.3.2")),
+            "SSHVault version": str(session.get("version", "0.3.3")),
             "Python version": platform.python_version(),
             "Paramiko version": str(session.get("paramiko_version", "Unavailable")),
             "Operating system": platform.platform(),

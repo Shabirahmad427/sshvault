@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.3
+
+- Separate the SFTP Transfer Manager into a dedicated modeless window.
+
 ## 0.3.2
 
 - Added a session dashboard state model with safe connection event history.
