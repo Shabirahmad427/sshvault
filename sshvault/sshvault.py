@@ -56,6 +56,12 @@ from sshvault_core import (
     TransferBatch,
     TransferScheduler,
     TransferState,
+    DownloadResumeDecision,
+    adopt_legacy_download,
+    inspect_download_resume,
+    partial_download_metadata_path,
+    partial_download_path,
+    write_partial_download_metadata,
     CommandExecutionState,
     atomic_json_write,
     validate_settings,
@@ -915,6 +921,8 @@ class SFTPTransferManagerWindow(tk.Toplevel):
         "destination",
         "size",
         "transferred",
+        "resume_offset",
+        "remaining_bytes",
         "progress",
         "speed",
         "remaining",
@@ -981,6 +989,7 @@ class SFTPTransferManagerWindow(tk.Toplevel):
             pct = "—" if item.progress() is None else f"{item.progress():.1f}%"
             eta = "—" if item.remaining_seconds() is None else f"{item.remaining_seconds():.0f}s"
             size = "—" if item.total is None else self.panel._fmt_size(item.total)
+            remaining = "—" if item.total is None else self.panel._fmt_size(max(0, item.total - item.transferred))
             self.tree.insert(
                 "",
                 "end",
@@ -992,6 +1001,8 @@ class SFTPTransferManagerWindow(tk.Toplevel):
                     item.target,
                     size,
                     self.panel._fmt_size(item.transferred),
+                    self.panel._fmt_size(item.resume_offset),
+                    remaining,
                     pct,
                     self.panel._fmt_size(item.speed) + "/s",
                     eta,
@@ -1217,6 +1228,16 @@ class SFTPPanel(tk.Frame):
 
     def _cancel_selected_transfer(self):
         for iid in self._selected_transfer_ids():
+            item = self._transfer_manager.get(iid)
+            if item and item.direction == "Download":
+                choice = messagebox.askyesnocancel(
+                    "Cancel download",
+                    "Keep the partial file for later resume?\n\nYes: Keep partial\nNo: Delete partial\nCancel: Keep downloading",
+                    parent=self,
+                )
+                if choice is None:
+                    continue
+                item.delete_partial_on_cancel = choice is False
             self._transfer_manager.cancel(iid)
         self._refresh_transfer_tree()
 
@@ -1824,8 +1845,22 @@ class SFTPPanel(tk.Frame):
 
     @staticmethod
     def _partial_local_path(local: Path) -> Path:
-        """Return the hidden, resumable staging path for a local file."""
-        return local.parent / f".{local.name}.sshvault-partial"
+        """Return the dedicated, metadata-backed local download staging path."""
+        return partial_download_path(local)
+
+    @staticmethod
+    def _partial_local_metadata_path(local: Path) -> Path:
+        return partial_download_metadata_path(local)
+
+    def _remote_identity(self, sftp=None) -> str:
+        """Stable non-secret identity used only to bind download sidecars."""
+        client = sftp or self._sftp
+        try:
+            peer = client.get_channel().getpeername()
+            return f"sftp://{peer[0]}:{peer[1]}"
+        except Exception:
+            # The path still cannot be adopted across an unknown identity.
+            return "sftp://unknown"
 
     def _remote_size(self, remote: str):
         try:
@@ -2066,15 +2101,91 @@ class SFTPPanel(tk.Frame):
                 continue
             remote = self._remote_join(self._remote_cwd, name)
             local = Path(self._local_cwd) / name
-            decision, local = self._download_collision_decision(name, local)
-            if decision == "skip":
+            try:
+                attributes = self._sftp.stat(remote)
+                plan = inspect_download_resume(
+                    local,
+                    remote_identity=self._remote_identity(),
+                    remote_path=remote,
+                    remote_size=attributes.st_size,
+                    remote_mtime=getattr(attributes, "st_mtime", None),
+                )
+            except (IOError, OSError) as exc:
+                messagebox.showerror("Download", str(redact_secrets(str(exc))), parent=self)
                 continue
+            if plan.decision == DownloadResumeDecision.ALREADY_COMPLETE:
+                self._transfer_manager.record(
+                    TransferItem(
+                        remote,
+                        str(local),
+                        "Download",
+                        total=plan.remote_size,
+                        transferred=plan.remote_size,
+                        status=TransferState.ALREADY_COMPLETE,
+                        resume_offset=plan.remote_size,
+                    )
+                )
+                self._set_status(f"Already complete: {name}")
+                self._refresh_transfer_tree()
+                continue
+            if plan.decision == DownloadResumeDecision.ADOPT_LEGACY:
+                if messagebox.askyesno(
+                    "Resume existing download", plan.message + "\n\nAdopt and resume it?", parent=self
+                ):
+                    try:
+                        plan = adopt_legacy_download(plan)
+                        decision = "replace"
+                    except (OSError, ProfileError) as exc:
+                        messagebox.showerror("Download", str(exc), parent=self)
+                        continue
+                else:
+                    decision, local = self._download_collision_decision(name, local)
+                    if decision == "skip":
+                        continue
+                    plan = inspect_download_resume(
+                        local,
+                        remote_identity=self._remote_identity(),
+                        remote_path=remote,
+                        remote_size=attributes.st_size,
+                        remote_mtime=getattr(attributes, "st_mtime", None),
+                    )
+            elif plan.decision == DownloadResumeDecision.CONFLICT:
+                # Type and untrusted-sidecar conflicts are explicit; a size
+                # collision still uses the user's normal collision preference.
+                if local.is_file() and "larger" in plan.message:
+                    messagebox.showwarning("Download", plan.message, parent=self)
+                    decision, local = self._download_collision_decision(name, local)
+                    if decision == "skip":
+                        continue
+                else:
+                    self._transfer_manager.record(
+                        TransferItem(
+                            remote,
+                            str(local),
+                            "Download",
+                            total=plan.remote_size,
+                            status=TransferState.CONFLICT,
+                            error=plan.message,
+                        )
+                    )
+                    self._refresh_transfer_tree()
+                    continue
+            else:
+                decision = "replace"
             self._transfer_cancel.clear()
             self._sftp_state.start_transfer(name, now=time.monotonic())
             self._update_transfer_actions()
             self._set_status(f"Downloading {name}…")
             self._transfer_manager.enqueue(
-                TransferItem(remote, str(local), "Download", generation=self._remote_generation),
+                TransferItem(
+                    remote,
+                    str(local),
+                    "Download",
+                    total=plan.remote_size,
+                    transferred=plan.offset,
+                    resume_offset=plan.offset,
+                    generation=self._remote_generation,
+                ),
                 lambda item, client, worker, r=remote, local_path=local, replace=decision == "replace": (
                     self._scheduled_download(item, client, worker, r, local_path, replace)
                 ),
@@ -2120,31 +2231,82 @@ class SFTPPanel(tk.Frame):
             raise
 
     def _scheduled_download(self, item, sftp, worker, remote: str, local: Path, replace: bool):
-        """Worker-owned, atomic download with conservative restart semantics."""
-        total = sftp.stat(remote).st_size
+        """Worker-owned, sidecar-validated resumable and atomic download."""
+        attributes = sftp.stat(remote)
+        total = attributes.st_size
         item.total = total
-        if local.exists() and not replace:
-            raise FileExistsError("A local file with this name already exists.")
         local.parent.mkdir(parents=True, exist_ok=True)
-        partial = self._partial_local_path(local)
-        if partial.exists() and partial.stat().st_size:
-            item.restart_required = True
-            partial.unlink()
+        plan = inspect_download_resume(
+            local,
+            remote_identity=self._remote_identity(sftp),
+            remote_path=remote,
+            remote_size=total,
+            remote_mtime=getattr(attributes, "st_mtime", None),
+        )
+        if plan.decision == DownloadResumeDecision.ALREADY_COMPLETE:
+            item.transferred = total
+            item.status = TransferState.ALREADY_COMPLETE
+            return
+        if plan.decision == DownloadResumeDecision.ADOPT_LEGACY:
+            # Adoption is only allowed after the UI obtained explicit consent.
+            raise FileExistsError("Existing local file was not approved for resumable-download adoption.")
+        if plan.decision == DownloadResumeDecision.CONFLICT:
+            if not replace:
+                raise FileExistsError(plan.message)
+            # Overwrite is an explicit collision policy.  It also discards an
+            # incompatible staging pair, never a matching resumable pair.
+            local.unlink(missing_ok=True)
+            plan.partial_path.unlink(missing_ok=True)
+            plan.metadata_path.unlink(missing_ok=True)
+            plan = inspect_download_resume(
+                local,
+                remote_identity=self._remote_identity(sftp),
+                remote_path=remote,
+                remote_size=total,
+                remote_mtime=getattr(attributes, "st_mtime", None),
+            )
+        partial, offset = plan.partial_path, plan.offset
+        if plan.decision == DownloadResumeDecision.DOWNLOAD:
+            write_partial_download_metadata(
+                local,
+                remote_identity=plan.remote_identity,
+                remote_path=remote,
+                remote_size=total,
+                remote_mtime=plan.remote_mtime,
+                completed_bytes=0,
+            )
+        item.resume_offset, item.transferred = offset, offset
+        item.status = TransferState.RESUMING if offset else TransferState.DOWNLOADING
         try:
-            with sftp.open(remote, "rb") as source, partial.open("wb") as target:
-                transferred = 0
+            local_mode = "r+b" if offset else "wb"
+            with sftp.open(remote, "rb") as source, partial.open(local_mode) as target:
+                source.seek(offset)
+                target.seek(offset)
+                transferred = offset
                 while chunk := source.read(262144):
                     target.write(chunk)
                     transferred += len(chunk)
+                    target.flush()
+                    write_partial_download_metadata(
+                        local,
+                        remote_identity=plan.remote_identity,
+                        remote_path=remote,
+                        remote_size=total,
+                        remote_mtime=plan.remote_mtime,
+                        completed_bytes=transferred,
+                    )
                     worker.checkpoint(transferred, total)
             if partial.stat().st_size != total:
                 raise IOError("Download size verification failed")
+            item.status = TransferState.VERIFYING
             os.replace(partial, local)
+            self._partial_local_metadata_path(local).unlink(missing_ok=True)
         except InterruptedError:
-            try:
+            # Keep the flushed staging file and matching sidecar for pause,
+            # cancel, disconnect and application shutdown.
+            if item.delete_partial_on_cancel:
                 partial.unlink(missing_ok=True)
-            except OSError:
-                pass
+                self._partial_local_metadata_path(local).unlink(missing_ok=True)
             raise
 
     def _collision_choice(self, direction: str, name: str) -> str:
@@ -2196,13 +2358,189 @@ class SFTPPanel(tk.Frame):
                 continue
             remote = self._remote_join(self._remote_cwd, name)
             local = Path(self._local_cwd) / name
-            self._set_status(f"Downloading folder {name}…")
-            self._transfer_queue.put(
-                lambda r=remote, local_path=local: (
-                    self._download_dir(r, local_path),
-                    self.after(0, self._refresh_local),
+            if local.exists() and not local.is_dir():
+                self._transfer_manager.record(
+                    TransferItem(
+                        remote,
+                        str(local),
+                        "Download",
+                        status=TransferState.CONFLICT,
+                        error="Type conflict: remote directory cannot replace a local file.",
+                    )
+                )
+                continue
+            children = self._plan_folder_download(remote, local)
+            batch = TransferBatch(name, "Download", remote, str(local))
+            self._transfer_manager.add_batch(batch, children)
+            self._set_status(f"Queued folder {name} ({len(children)} files).")
+            self._refresh_transfer_tree()
+
+    def _plan_folder_download(self, remote: str, local: Path):
+        """Build independent resumable rows for every regular remote child."""
+        local.mkdir(parents=True, exist_ok=True)
+        children = []
+        for attributes in self._sftp.listdir_attr(remote):
+            remote_child = self._remote_join(remote, attributes.filename)
+            local_child = local / attributes.filename
+            if stat.S_ISDIR(attributes.st_mode):
+                if local_child.exists() and not local_child.is_dir():
+                    children.append(
+                        (
+                            TransferItem(
+                                remote_child,
+                                str(local_child),
+                                "Download",
+                                status=TransferState.CONFLICT,
+                                error="Type conflict: remote directory cannot replace a local file.",
+                            ),
+                            None,
+                        )
+                    )
+                else:
+                    children.extend(self._plan_folder_download(remote_child, local_child))
+                continue
+            try:
+                plan = inspect_download_resume(
+                    local_child,
+                    remote_identity=self._remote_identity(),
+                    remote_path=remote_child,
+                    remote_size=attributes.st_size,
+                    remote_mtime=getattr(attributes, "st_mtime", None),
+                )
+            except OSError as exc:
+                children.append(
+                    (
+                        TransferItem(
+                            remote_child,
+                            str(local_child),
+                            "Download",
+                            status=TransferState.FAILED,
+                            error=str(redact_secrets(str(exc))),
+                        ),
+                        None,
+                    )
+                )
+                continue
+            if plan.decision == DownloadResumeDecision.ALREADY_COMPLETE:
+                children.append(
+                    (
+                        TransferItem(
+                            remote_child,
+                            str(local_child),
+                            "Download",
+                            total=plan.remote_size,
+                            transferred=plan.remote_size,
+                            status=TransferState.ALREADY_COMPLETE,
+                        ),
+                        None,
+                    )
+                )
+                continue
+            if plan.decision == DownloadResumeDecision.ADOPT_LEGACY:
+                if messagebox.askyesno(
+                    "Resume existing download",
+                    f"{local_child.name}: {plan.message}\n\nAdopt and resume it?",
+                    parent=self,
+                ):
+                    try:
+                        plan = adopt_legacy_download(plan)
+                    except (OSError, ProfileError) as exc:
+                        children.append(
+                            (
+                                TransferItem(
+                                    remote_child,
+                                    str(local_child),
+                                    "Download",
+                                    total=plan.remote_size,
+                                    status=TransferState.CONFLICT,
+                                    error=str(exc),
+                                ),
+                                None,
+                            )
+                        )
+                        continue
+                else:
+                    decision, destination = self._download_collision_decision(local_child.name, local_child)
+                    if decision == "skip":
+                        children.append(
+                            (
+                                TransferItem(
+                                    remote_child,
+                                    str(local_child),
+                                    "Download",
+                                    total=plan.remote_size,
+                                    status=TransferState.CANCELLED,
+                                ),
+                                None,
+                            )
+                        )
+                        continue
+                    local_child = destination
+                    plan = inspect_download_resume(
+                        local_child,
+                        remote_identity=self._remote_identity(),
+                        remote_path=remote_child,
+                        remote_size=attributes.st_size,
+                        remote_mtime=getattr(attributes, "st_mtime", None),
+                    )
+            elif plan.decision == DownloadResumeDecision.CONFLICT:
+                if local_child.is_file() and "larger" in plan.message:
+                    messagebox.showwarning("Download", plan.message, parent=self)
+                    decision, destination = self._download_collision_decision(local_child.name, local_child)
+                    if decision == "skip":
+                        children.append(
+                            (
+                                TransferItem(
+                                    remote_child,
+                                    str(local_child),
+                                    "Download",
+                                    total=plan.remote_size,
+                                    status=TransferState.CANCELLED,
+                                ),
+                                None,
+                            )
+                        )
+                        continue
+                    local_child = destination
+                    plan = inspect_download_resume(
+                        local_child,
+                        remote_identity=self._remote_identity(),
+                        remote_path=remote_child,
+                        remote_size=attributes.st_size,
+                        remote_mtime=getattr(attributes, "st_mtime", None),
+                    )
+                else:
+                    children.append(
+                        (
+                            TransferItem(
+                                remote_child,
+                                str(local_child),
+                                "Download",
+                                total=plan.remote_size,
+                                status=TransferState.CONFLICT,
+                                error=plan.message,
+                            ),
+                            None,
+                        )
+                    )
+                    continue
+            item = TransferItem(
+                remote_child,
+                str(local_child),
+                "Download",
+                total=plan.remote_size,
+                transferred=plan.offset,
+                resume_offset=plan.offset,
+            )
+            children.append(
+                (
+                    item,
+                    lambda current, client, worker, r=remote_child, p=local_child: self._scheduled_download(
+                        current, client, worker, r, p, True
+                    ),
                 )
             )
+        return children
 
     def _download_dir(self, remote: str, local: Path):
         local.mkdir(exist_ok=True)

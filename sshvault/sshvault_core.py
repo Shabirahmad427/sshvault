@@ -12,6 +12,7 @@ import ipaddress
 import json
 import os
 import platform
+import posixpath
 import socket
 import time
 from pathlib import Path
@@ -1179,6 +1180,7 @@ class TransferItem:
     average_speed: float = 0.0
     resume_offset: int = 0
     restart_required: bool = False
+    delete_partial_on_cancel: bool = False
     parent_id: str | None = None
 
     def progress(self) -> float | None:
@@ -1214,6 +1216,12 @@ class TransferProgress:
 
 
 class TransferState:
+    CHECKING = "Checking"
+    ALREADY_COMPLETE = "Already complete"
+    RESUME_AVAILABLE = "Resume available"
+    RESUMING = "Resuming"
+    DOWNLOADING = "Downloading"
+    CONFLICT = "Conflict"
     PENDING = "Pending"
     PREPARING = "Preparing"
     TRANSFERRING = "Transferring"
@@ -1222,7 +1230,254 @@ class TransferState:
     COMPLETED = "Completed"
     FAILED = "Failed"
     CANCELLED = "Cancelled"
-    TERMINAL = {COMPLETED, FAILED, CANCELLED}
+    TERMINAL = {ALREADY_COMPLETE, COMPLETED, CONFLICT, FAILED, CANCELLED}
+
+
+class DownloadResumeDecision:
+    """The safe action for one local SFTP download destination."""
+
+    DOWNLOAD = "download"
+    ALREADY_COMPLETE = "already_complete"
+    RESUME = "resume"
+    ADOPT_LEGACY = "adopt_legacy"
+    CONFLICT = "conflict"
+
+
+@dataclass(frozen=True)
+class DownloadResumePlan:
+    """Display-free resume decision made before normal collision handling."""
+
+    decision: str
+    status: str
+    destination: Path
+    partial_path: Path
+    metadata_path: Path
+    remote_path: str
+    remote_size: int
+    remote_mtime: int | None
+    remote_identity: str
+    offset: int = 0
+    message: str = ""
+
+    @property
+    def remaining_bytes(self) -> int:
+        return max(0, self.remote_size - self.offset)
+
+
+def partial_download_path(destination: str | Path) -> Path:
+    """Return the public, predictable staging name for a download."""
+    path = Path(destination)
+    return path.with_name(path.name + ".sshvault-part")
+
+
+def partial_download_metadata_path(destination: str | Path) -> Path:
+    path = Path(destination)
+    return path.with_name(path.name + ".sshvault-part.json")
+
+
+def _absolute_destination(path: Path) -> str:
+    return str(path.expanduser().resolve(strict=False))
+
+
+def _normal_remote_path(path: str) -> str:
+    normal = posixpath.normpath(path)
+    return normal if normal.startswith("/") else "/" + normal
+
+
+def read_partial_download_metadata(path: str | Path) -> dict[str, Any] | None:
+    """Read untrusted sidecar data without allowing it to affect a resume."""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def write_partial_download_metadata(
+    destination: str | Path,
+    *,
+    remote_identity: str,
+    remote_path: str,
+    remote_size: int,
+    remote_mtime: int | None,
+    completed_bytes: int,
+    now: float | None = None,
+    created_at: float | None = None,
+) -> Path:
+    """Atomically persist non-secret identity and progress for a partial file."""
+    timestamp = time.time() if now is None else now
+    destination_path = Path(destination)
+    metadata_path = partial_download_metadata_path(destination_path)
+    existing = read_partial_download_metadata(metadata_path) or {}
+    atomic_json_write(
+        metadata_path,
+        {
+            "format_version": 1,
+            "remote_identity": remote_identity,
+            "remote_path": _normal_remote_path(remote_path),
+            "expected_remote_size": int(remote_size),
+            "remote_modification_time": remote_mtime,
+            "local_destination_path": _absolute_destination(destination_path),
+            "completed_byte_count": int(completed_bytes),
+            "creation_time": existing.get("creation_time", timestamp) if created_at is None else created_at,
+            "last_update_time": timestamp,
+        },
+    )
+    return metadata_path
+
+
+def _metadata_matches_download(
+    metadata: dict[str, Any] | None,
+    *,
+    destination: Path,
+    remote_identity: str,
+    remote_path: str,
+    remote_size: int,
+    remote_mtime: int | None,
+    partial_size: int,
+) -> bool:
+    if not metadata or metadata.get("format_version") != 1:
+        return False
+    expected = {
+        "remote_identity": remote_identity,
+        "remote_path": _normal_remote_path(remote_path),
+        "expected_remote_size": int(remote_size),
+        "local_destination_path": _absolute_destination(destination),
+    }
+    if any(metadata.get(key) != value for key, value in expected.items()):
+        return False
+    # A modification time is identity data when the server supplies it.  A
+    # missing value cannot prove that a partial belongs to this remote object.
+    if remote_mtime is not None and metadata.get("remote_modification_time") != remote_mtime:
+        return False
+    return (
+        isinstance(metadata.get("completed_byte_count"), int)
+        and metadata["completed_byte_count"] == partial_size
+        and 0 <= partial_size <= remote_size
+    )
+
+
+def inspect_download_resume(
+    destination: str | Path,
+    *,
+    remote_identity: str,
+    remote_path: str,
+    remote_size: int,
+    remote_mtime: int | None = None,
+) -> DownloadResumePlan:
+    """Decide whether a download can be safely resumed without opening it.
+
+    This deliberately treats a sidecar as an identity assertion, not merely a
+    progress cache: host/profile identity, absolute paths, size and available
+    modification time must all still match.
+    """
+    local = Path(destination)
+    partial = partial_download_path(local)
+    sidecar = partial_download_metadata_path(local)
+    normalized_remote = _normal_remote_path(remote_path)
+
+    def make(decision: str, status: str, offset: int = 0, message: str = "") -> DownloadResumePlan:
+        return DownloadResumePlan(
+            decision,
+            status,
+            local,
+            partial,
+            sidecar,
+            normalized_remote,
+            int(remote_size),
+            remote_mtime,
+            remote_identity,
+            offset,
+            message,
+        )
+
+    if remote_size < 0:
+        return make(DownloadResumeDecision.CONFLICT, TransferState.CONFLICT, message="Invalid remote file size.")
+    if local.exists() and local.is_dir():
+        return make(
+            DownloadResumeDecision.CONFLICT,
+            TransferState.CONFLICT,
+            message="Type conflict: remote file cannot replace a local directory.",
+        )
+    if partial.exists() and partial.is_dir():
+        return make(
+            DownloadResumeDecision.CONFLICT,
+            TransferState.CONFLICT,
+            message="Type conflict: partial download path is a directory.",
+        )
+    if local.is_file():
+        local_size = local.stat().st_size
+        if local_size == remote_size:
+            return make(DownloadResumeDecision.ALREADY_COMPLETE, TransferState.ALREADY_COMPLETE, local_size)
+        if local_size > remote_size:
+            return make(
+                DownloadResumeDecision.CONFLICT,
+                TransferState.CONFLICT,
+                local_size,
+                "The local file is larger than the remote file and cannot be resumed safely.",
+            )
+        # An old SSHVault release wrote incomplete data to the final name.
+        return make(
+            DownloadResumeDecision.ADOPT_LEGACY,
+            TransferState.RESUME_AVAILABLE,
+            local_size,
+            "Existing local file can be adopted as a resumable SSHVault partial download.",
+        )
+    if partial.is_file():
+        partial_size = partial.stat().st_size
+        metadata = read_partial_download_metadata(sidecar)
+        if _metadata_matches_download(
+            metadata,
+            destination=local,
+            remote_identity=remote_identity,
+            remote_path=remote_path,
+            remote_size=remote_size,
+            remote_mtime=remote_mtime,
+            partial_size=partial_size,
+        ):
+            return make(DownloadResumeDecision.RESUME, TransferState.RESUME_AVAILABLE, partial_size)
+        return make(
+            DownloadResumeDecision.CONFLICT,
+            TransferState.CONFLICT,
+            partial_size,
+            "Partial-download metadata does not match this remote file; it cannot be resumed safely.",
+        )
+    return make(DownloadResumeDecision.DOWNLOAD, TransferState.DOWNLOADING)
+
+
+def adopt_legacy_download(plan: DownloadResumePlan, *, now: float | None = None) -> DownloadResumePlan:
+    """Safely migrate a user-confirmed old final-name partial to staging."""
+    if plan.decision != DownloadResumeDecision.ADOPT_LEGACY:
+        raise ProfileError("Only an eligible legacy partial can be adopted.")
+    if plan.partial_path.exists():
+        raise ProfileError("A partial download already exists; legacy file was not changed.")
+    os.replace(plan.destination, plan.partial_path)
+    write_partial_download_metadata(
+        plan.destination,
+        remote_identity=plan.remote_identity,
+        remote_path=plan.remote_path,
+        remote_size=plan.remote_size,
+        remote_mtime=plan.remote_mtime,
+        completed_bytes=plan.offset,
+        now=now,
+    )
+    return DownloadResumePlan(
+        DownloadResumeDecision.RESUME,
+        TransferState.RESUME_AVAILABLE,
+        **{
+            key: getattr(plan, key)
+            for key in (
+                "destination",
+                "partial_path",
+                "metadata_path",
+                "remote_path",
+                "remote_size",
+                "remote_mtime",
+                "remote_identity",
+            )
+        },
+        offset=plan.offset,
+    )
 
 
 TransferOperation = Callable[[TransferItem, Any, "TransferWorker"], None]
@@ -1303,12 +1558,24 @@ class TransferScheduler:
         self._changed()
         return item
 
-    def add_batch(self, batch: TransferBatch, children: list[tuple[TransferItem, TransferOperation]]) -> TransferBatch:
+    def record(self, item: TransferItem) -> TransferItem:
+        """Add an already-resolved transfer row without scheduling I/O."""
+        with self._condition:
+            if self.closed:
+                raise ProfileError("Transfer queue is closed.")
+            item.generation = self.generation
+            self.items.append(item)
+        self._changed()
+        return item
+
+    def add_batch(
+        self, batch: TransferBatch, children: list[tuple[TransferItem, TransferOperation | None]]
+    ) -> TransferBatch:
         with self._condition:
             self.batches.append(batch)
         for item, operation in children:
             item.parent_id = batch.batch_id
-            batch.children.append(self.enqueue(item, operation).item_id)
+            batch.children.append((self.enqueue(item, operation) if operation else self.record(item)).item_id)
         return batch
 
     def batch_progress(self, batch_id: str) -> TransferProgress | None:
@@ -1387,7 +1654,11 @@ class TransferScheduler:
                 item = self.get(item_id)
                 if item is None or generation != self.generation or item_id in self._cancelled_ids:
                     return
-                item.status, item.started_at, item.updated_at = TransferState.TRANSFERRING, self.clock(), self.clock()
+                item.status, item.started_at, item.updated_at = (
+                    (TransferState.DOWNLOADING if item.direction == "Download" else TransferState.TRANSFERRING),
+                    self.clock(),
+                    self.clock(),
+                )
             self._changed()
             operation = self._operations.get(item_id)
             if operation is None:
@@ -1449,7 +1720,13 @@ class TransferScheduler:
                 self._condition.wait()
             if self.closed:
                 raise InterruptedError("Transfer cancelled")
-            item.status = TransferState.TRANSFERRING
+            item.status = (
+                TransferState.RESUMING
+                if item.direction == "Download" and item.resume_offset
+                else TransferState.DOWNLOADING
+                if item.direction == "Download"
+                else TransferState.TRANSFERRING
+            )
             self._active.add(item_id)
         self._changed()
 
@@ -1508,10 +1785,13 @@ class TransferScheduler:
             item = self.get(item_id)
             if item is None or item.status not in {TransferState.FAILED, TransferState.CANCELLED}:
                 return False
+            # Download operations revalidate their sidecar and resume from the
+            # durable partial offset.  Upload retains its historical restart.
+            transferred = item.transferred if item.direction == "Download" else 0
             item.status, item.error, item.transferred, item.speed, item.average_speed = (
                 TransferState.PENDING,
                 "",
-                0,
+                transferred,
                 0.0,
                 0.0,
             )
@@ -1574,7 +1854,18 @@ class TransferScheduler:
 
     def summary(self) -> dict[str, float | int]:
         with self._condition:
-            active = [x for x in self.items if x.status in {TransferState.PREPARING, TransferState.TRANSFERRING}]
+            active = [
+                x
+                for x in self.items
+                if x.status
+                in {
+                    TransferState.PREPARING,
+                    TransferState.TRANSFERRING,
+                    TransferState.DOWNLOADING,
+                    TransferState.RESUMING,
+                    TransferState.VERIFYING,
+                }
+            ]
             return {
                 "active": len(active),
                 "pending": sum(x.status == TransferState.PENDING for x in self.items),
