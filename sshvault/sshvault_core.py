@@ -18,7 +18,8 @@ from pathlib import Path
 import re
 import shutil
 import tempfile
-from typing import Any, cast
+from typing import Any, Callable, cast
+import threading
 from uuid import uuid4
 
 SCHEMA_VERSION = 2
@@ -57,6 +58,8 @@ _SETTINGS_ALLOWED = {
     "confirm_multiline_paste",
     "confirm_delete",
     "confirm_overwrite",
+    "maximum_sftp_transfers",
+    "sftp_chunk_size",
 }
 DEFAULT_SETTINGS = {
     "scrollback_limit": 5000,
@@ -65,6 +68,10 @@ DEFAULT_SETTINGS = {
     "confirm_multiline_paste": True,
     "confirm_delete": True,
     "confirm_overwrite": True,
+    # 256 KiB is deliberately conservative: it keeps cancellation and pause
+    # latency low while avoiding the overhead of tiny SFTP requests.
+    "maximum_sftp_transfers": 3,
+    "sftp_chunk_size": 262144,
 }
 
 
@@ -279,9 +286,11 @@ def validate_settings(raw: dict[str, Any]) -> dict[str, Any]:
     try:
         scrollback = int(raw.get("scrollback_limit", 5000))
         timeout = int(raw.get("connection_timeout", 15))
+        maximum_sftp_transfers = int(raw.get("maximum_sftp_transfers", 3))
+        sftp_chunk_size = int(raw.get("sftp_chunk_size", 262144))
     except (TypeError, ValueError) as exc:
         raise ProfileError("Scrollback and timeout must be whole numbers.") from exc
-    if not 100 <= scrollback <= 100000 or not 1 <= timeout <= 120:
+    if not 100 <= scrollback <= 100000 or not 1 <= timeout <= 120 or not 1 <= maximum_sftp_transfers <= 8:
         raise ProfileError("Settings values are outside the supported range.")
     result = {key: value for key, value in raw.items() if key not in _SETTINGS_ALLOWED}
     result.update(
@@ -292,6 +301,8 @@ def validate_settings(raw: dict[str, Any]) -> dict[str, Any]:
             "confirm_multiline_paste": bool(raw.get("confirm_multiline_paste", True)),
             "confirm_delete": bool(raw.get("confirm_delete", True)),
             "confirm_overwrite": bool(raw.get("confirm_overwrite", True)),
+            "maximum_sftp_transfers": maximum_sftp_transfers,
+            "sftp_chunk_size": max(16384, min(sftp_chunk_size, 1048576)),
             "theme": AppearanceState.normalize_theme(raw.get("theme", "system")),
             "application_font_size": AppearanceState.clamp_application_font(raw.get("application_font_size", 10)),
             "terminal_font_size": AppearanceState.clamp_terminal_font(raw.get("terminal_font_size", 10)),
@@ -1157,14 +1168,451 @@ class TransferItem:
     target: str
     direction: str
     total: int | None = None
-    status: str = "Queued"
+    status: str = "Pending"
     transferred: int = 0
     error: str = ""
     generation: int = 0
     item_id: str = field(default_factory=lambda: uuid4().hex)
+    started_at: float | None = None
+    updated_at: float | None = None
+    speed: float = 0.0
+    average_speed: float = 0.0
+    resume_offset: int = 0
+    restart_required: bool = False
+    parent_id: str | None = None
 
     def progress(self) -> float | None:
         return None if not self.total or self.total < 0 else min(100.0, self.transferred * 100.0 / self.total)
+
+    def remaining_seconds(self) -> float | None:
+        if self.total is None or self.speed <= 0:
+            return None
+        return max(0.0, (self.total - self.transferred) / self.speed)
+
+
+@dataclass
+class TransferBatch:
+    """A visible folder-transfer parent with independently visible children."""
+
+    name: str
+    direction: str
+    source: str
+    target: str
+    children: list[str] = field(default_factory=list)
+    batch_id: str = field(default_factory=lambda: uuid4().hex)
+
+
+@dataclass(frozen=True)
+class TransferProgress:
+    item_id: str
+    transferred: int
+    total: int | None
+    speed: float
+    average_speed: float
+    elapsed: float
+    remaining: float | None
+
+
+class TransferState:
+    PENDING = "Pending"
+    PREPARING = "Preparing"
+    TRANSFERRING = "Transferring"
+    PAUSED = "Paused"
+    VERIFYING = "Verifying"
+    COMPLETED = "Completed"
+    FAILED = "Failed"
+    CANCELLED = "Cancelled"
+    TERMINAL = {COMPLETED, FAILED, CANCELLED}
+
+
+TransferOperation = Callable[[TransferItem, Any, "TransferWorker"], None]
+
+
+class TransferWorker:
+    """One worker and exactly one SFTP client at a time.
+
+    The operation calls :meth:`checkpoint` between chunks.  It deliberately
+    releases its scheduler slot while paused, permitting pending work to run.
+    """
+
+    def __init__(self, scheduler: "TransferScheduler", item_id: str, client: Any) -> None:
+        self.scheduler, self.item_id, self.client = scheduler, item_id, client
+
+    def checkpoint(self, transferred: int | None = None, total: int | None = None) -> None:
+        self.scheduler._checkpoint(self.item_id, transferred, total)
+
+    @property
+    def cancelled(self) -> bool:
+        return self.scheduler._cancelled(self.item_id)
+
+
+class TransferScheduler:
+    """Thread-safe FIFO scheduler with bounded SFTP-client ownership.
+
+    ``client_factory`` is called once for each active worker; a Paramiko SFTP
+    client is never shared across threads.  Callbacks are intentionally plain
+    functions so Tk can marshal them with ``after`` itself.
+    """
+
+    def __init__(
+        self,
+        client_factory: Callable[[], Any] | None = None,
+        concurrency: int = 3,
+        clock: Callable[[], float] = time.monotonic,
+        on_change: Callable[[], None] | None = None,
+    ) -> None:
+        self.client_factory = client_factory
+        self.concurrency = max(1, min(8, int(concurrency)))
+        self.clock, self.on_change = clock, on_change
+        self.items: list[TransferItem] = []
+        self.batches: list[TransferBatch] = []
+        self.generation = 0
+        self.closed = False
+        self._operations: dict[str, TransferOperation] = {}
+        self._active: set[str] = set()
+        self._threads: dict[str, threading.Thread] = {}
+        self._paused: set[str] = set()
+        self._cancelled_ids: set[str] = set()
+        self._condition = threading.Condition(threading.RLock())
+
+    @property
+    def active(self) -> TransferItem | None:
+        with self._condition:
+            return next((x for x in self.items if x.item_id in self._active), None)
+
+    @property
+    def active_count(self) -> int:
+        with self._condition:
+            return len(self._active)
+
+    def set_concurrency(self, value: int) -> None:
+        with self._condition:
+            self.concurrency = max(1, min(8, int(value)))
+            self._schedule_locked()
+
+    def enqueue(self, item: TransferItem, operation: TransferOperation | None = None) -> TransferItem:
+        with self._condition:
+            if self.closed:
+                raise ProfileError("Transfer queue is closed.")
+            item.generation = self.generation
+            item.status = TransferState.PENDING
+            self.items.append(item)
+            if operation:
+                self._operations[item.item_id] = operation
+            self._schedule_locked()
+        self._changed()
+        return item
+
+    def add_batch(self, batch: TransferBatch, children: list[tuple[TransferItem, TransferOperation]]) -> TransferBatch:
+        with self._condition:
+            self.batches.append(batch)
+        for item, operation in children:
+            item.parent_id = batch.batch_id
+            batch.children.append(self.enqueue(item, operation).item_id)
+        return batch
+
+    def batch_progress(self, batch_id: str) -> TransferProgress | None:
+        batch = next((x for x in self.batches if x.batch_id == batch_id), None)
+        if batch is None:
+            return None
+        children = [self.get(item_id) for item_id in batch.children]
+        rows = [x for x in children if x is not None]
+        if not rows:
+            return TransferProgress(batch_id, 0, 0, 0.0, 0.0, 0.0, 0.0)
+        known = [x.total for x in rows if x.total is not None]
+        total = sum(known) if len(known) == len(rows) else None
+        transferred = sum(x.transferred for x in rows)
+        speed = sum(x.speed for x in rows)
+        return TransferProgress(
+            batch_id,
+            transferred,
+            total,
+            speed,
+            speed,
+            0.0,
+            ((total - transferred) / speed if total is not None and speed else None),
+        )
+
+    def cancel_batch(self, batch_id: str) -> bool:
+        batch = next((x for x in self.batches if x.batch_id == batch_id), None)
+        if batch is None:
+            return False
+        for item_id in batch.children:
+            self.cancel(item_id)
+        return True
+
+    def retry_batch(self, batch_id: str) -> bool:
+        batch = next((x for x in self.batches if x.batch_id == batch_id), None)
+        if batch is None:
+            return False
+        for item_id in batch.children:
+            item = self.get(item_id)
+            if item and item.status in {TransferState.FAILED, TransferState.CANCELLED}:
+                self.retry(item_id)
+        return True
+
+    def _schedule_locked(self) -> None:
+        # The compatibility queue deliberately has no client factory.  Keep its
+        # historical manual lifecycle without spawning a worker.
+        if self.client_factory is None:
+            if not self._active:
+                item = next(
+                    (x for x in self.items if x.status == TransferState.PENDING and x.item_id not in self._paused), None
+                )
+                if item:
+                    item.status = TransferState.PREPARING
+                    self._active.add(item.item_id)
+            return
+        while not self.closed and len(self._active) < self.concurrency:
+            item = next(
+                (x for x in self.items if x.status == TransferState.PENDING and x.item_id not in self._paused), None
+            )
+            if item is None:
+                return
+            item.status = TransferState.PREPARING
+            self._active.add(item.item_id)
+            thread = threading.Thread(
+                target=self._run, args=(item.item_id, self.generation), daemon=True, name="sshvault-sftp-transfer"
+            )
+            self._threads[item.item_id] = thread
+            thread.start()
+
+    def _run(self, item_id: str, generation: int) -> None:
+        client = None
+        try:
+            if self.client_factory is None:
+                raise RuntimeError("No SFTP client factory is available.")
+            client = self.client_factory()
+            with self._condition:
+                item = self.get(item_id)
+                if item is None or generation != self.generation or item_id in self._cancelled_ids:
+                    return
+                item.status, item.started_at, item.updated_at = TransferState.TRANSFERRING, self.clock(), self.clock()
+            self._changed()
+            operation = self._operations.get(item_id)
+            if operation is None:
+                raise RuntimeError("No transfer operation is available.")
+            operation(item, client, TransferWorker(self, item_id, client))
+            with self._condition:
+                item = self.get(item_id)
+                if item and generation == self.generation and item_id not in self._cancelled_ids:
+                    item.status = TransferState.COMPLETED
+        except InterruptedError:
+            with self._condition:
+                item = self.get(item_id)
+                if item and generation == self.generation:
+                    item.status = TransferState.CANCELLED
+        except Exception as exc:
+            with self._condition:
+                item = self.get(item_id)
+                if item and generation == self.generation and item_id not in self._cancelled_ids:
+                    item.status, item.error = TransferState.FAILED, str(redact_secrets(str(exc)))
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            with self._condition:
+                self._active.discard(item_id)
+                self._threads.pop(item_id, None)
+                self._schedule_locked()
+                self._condition.notify_all()
+            self._changed()
+
+    def _checkpoint(self, item_id: str, transferred: int | None, total: int | None) -> None:
+        with self._condition:
+            item = self.get(item_id)
+            if item is None or item.generation != self.generation or item_id in self._cancelled_ids or self.closed:
+                raise InterruptedError("Transfer cancelled")
+            now = self.clock()
+            if transferred is not None:
+                previous, previous_at = item.transferred, item.updated_at or now
+                item.transferred = max(item.transferred, transferred)
+                delta = max(0, item.transferred - previous)
+                elapsed = max(0.001, now - previous_at)
+                item.speed = delta / elapsed
+                if item.started_at is not None:
+                    item.average_speed = item.transferred / max(0.001, now - item.started_at)
+            if total is not None:
+                item.total = total
+            item.updated_at = now
+            while item_id in self._paused and item_id not in self._cancelled_ids and not self.closed:
+                item.status = TransferState.PAUSED
+                self._active.discard(item_id)
+                self._schedule_locked()
+                self._changed()
+                self._condition.wait()
+            if item_id in self._cancelled_ids or self.closed:
+                raise InterruptedError("Transfer cancelled")
+            while len(self._active) >= self.concurrency and not self.closed:
+                self._condition.wait()
+            if self.closed:
+                raise InterruptedError("Transfer cancelled")
+            item.status = TransferState.TRANSFERRING
+            self._active.add(item_id)
+        self._changed()
+
+    def _cancelled(self, item_id: str) -> bool:
+        with self._condition:
+            return self.closed or item_id in self._cancelled_ids
+
+    def pause(self, item_id: str) -> bool:
+        with self._condition:
+            item = self.get(item_id)
+            if item is None or item.status not in {
+                TransferState.PENDING,
+                TransferState.PREPARING,
+                TransferState.TRANSFERRING,
+            }:
+                return False
+            self._paused.add(item_id)
+            if item.status == TransferState.PENDING or self.client_factory is None:
+                item.status = TransferState.PAUSED
+            self._condition.notify_all()
+        self._changed()
+        return True
+
+    def resume(self, item_id: str) -> bool:
+        with self._condition:
+            item = self.get(item_id)
+            if item is None or item.status != TransferState.PAUSED:
+                return False
+            self._paused.discard(item_id)
+            # An active worker is sleeping in checkpoint and owns the client;
+            # do not launch a second worker for the same item.
+            if item_id in self._threads:
+                item.status = TransferState.PREPARING
+            else:
+                item.status = TransferState.PENDING
+                self._schedule_locked()
+            self._condition.notify_all()
+        self._changed()
+        return True
+
+    def cancel(self, item_id: str) -> bool:
+        with self._condition:
+            item = self.get(item_id)
+            if item is None or item.status in TransferState.TERMINAL:
+                return False
+            self._cancelled_ids.add(item_id)
+            self._paused.discard(item_id)
+            if item.status in {TransferState.PENDING, TransferState.PAUSED}:
+                item.status = TransferState.CANCELLED
+            self._condition.notify_all()
+        self._changed()
+        return True
+
+    def retry(self, item_id: str) -> bool:
+        with self._condition:
+            item = self.get(item_id)
+            if item is None or item.status not in {TransferState.FAILED, TransferState.CANCELLED}:
+                return False
+            item.status, item.error, item.transferred, item.speed, item.average_speed = (
+                TransferState.PENDING,
+                "",
+                0,
+                0.0,
+                0.0,
+            )
+            item.restart_required = False
+            self._cancelled_ids.discard(item_id)
+            self._schedule_locked()
+        self._changed()
+        return True
+
+    def retry_failed(self) -> None:
+        for item in list(self.items):
+            if item.status == TransferState.FAILED:
+                self.retry(item.item_id)
+
+    def remove(self, item_id: str) -> bool:
+        with self._condition:
+            item = self.get(item_id)
+            if item is None or item.status not in {
+                TransferState.PENDING,
+                TransferState.PAUSED,
+                *TransferState.TERMINAL,
+            }:
+                return False
+            self.items.remove(item)
+            self._operations.pop(item_id, None)
+        self._changed()
+        return True
+
+    def clear_completed(self) -> None:
+        for item in list(self.items):
+            if item.status == TransferState.COMPLETED:
+                self.remove(item.item_id)
+
+    def pause_all(self) -> None:
+        for item in list(self.items):
+            self.pause(item.item_id)
+
+    def resume_all(self) -> None:
+        for item in list(self.items):
+            self.resume(item.item_id)
+
+    def cancel_all(self) -> None:
+        for item in list(self.items):
+            self.cancel(item.item_id)
+
+    def move(self, item_id: str, delta: int) -> bool:
+        with self._condition:
+            index = next((i for i, x in enumerate(self.items) if x.item_id == item_id), -1)
+            if index < 0 or self.items[index].status != TransferState.PENDING:
+                return False
+            target = index + delta
+            if target < 0 or target >= len(self.items) or self.items[target].status != TransferState.PENDING:
+                return False
+            self.items[index], self.items[target] = self.items[target], self.items[index]
+        self._changed()
+        return True
+
+    def get(self, item_id: str) -> TransferItem | None:
+        return next((x for x in self.items if x.item_id == item_id), None)
+
+    def summary(self) -> dict[str, float | int]:
+        with self._condition:
+            active = [x for x in self.items if x.status in {TransferState.PREPARING, TransferState.TRANSFERRING}]
+            return {
+                "active": len(active),
+                "pending": sum(x.status == TransferState.PENDING for x in self.items),
+                "completed": sum(x.status == TransferState.COMPLETED for x in self.items),
+                "failed": sum(x.status == TransferState.FAILED for x in self.items),
+                "speed": sum(x.speed for x in active),
+                "transferred": sum(x.transferred for x in self.items),
+            }
+
+    def invalidate_session(self, fail_active: bool = False) -> None:
+        with self._condition:
+            self.generation += 1
+            for item in self.items:
+                if item.status not in TransferState.TERMINAL:
+                    item.status = TransferState.FAILED if fail_active else TransferState.PAUSED
+                    if fail_active:
+                        item.error = "SFTP session disconnected"
+            self._cancelled_ids.update(self._active)
+            self._condition.notify_all()
+        self._changed()
+
+    def shutdown(self, timeout: float = 1.0) -> None:
+        with self._condition:
+            self.closed = True
+            for item in self.items:
+                if item.status not in TransferState.TERMINAL:
+                    item.status = TransferState.CANCELLED
+            self._cancelled_ids.update(self._active)
+            threads = list(self._threads.values())
+            self._condition.notify_all()
+        for thread in threads:
+            if thread is not threading.current_thread():
+                thread.join(timeout=timeout)
+        self._changed()
+
+    def _changed(self) -> None:
+        if self.on_change:
+            self.on_change()
 
 
 def safe_transfer_plan(root: str | Path, relative_paths: list[str]) -> list[tuple[Path, str]]:
@@ -1188,101 +1636,33 @@ def safe_transfer_plan(root: str | Path, relative_paths: list[str]) -> list[tupl
     return plan
 
 
-class TransferQueueManager:
-    """FIFO, single-active transfer queue with cooperative lifecycle control."""
+class TransferQueueManager(TransferScheduler):
+    """Compatibility facade for the former queue API.
 
-    def __init__(self, generation: int = 0) -> None:
+    New code should use :class:`TransferScheduler`; this facade preserves the
+    small display-free API used by existing callers.
+    """
+
+    def __init__(self, generation: int = 0, concurrency: int = 3) -> None:
+        super().__init__(None, 1)
         self.generation = generation
-        self.items: list[TransferItem] = []
-        self.active: TransferItem | None = None
-        self.closed = False
-
-    def enqueue(self, item: TransferItem) -> TransferItem:
-        if self.closed:
-            raise ProfileError("Transfer queue is closed.")
-        item.generation = self.generation
-        self.items.append(item)
-        self._activate_next()
-        return item
-
-    def _activate_next(self) -> None:
-        if self.active is not None:
-            return
-        next_item = next((x for x in self.items if x.status == "Queued"), None)
-        if next_item:
-            self.active = next_item
-            next_item.status = "Preparing"
 
     def mark_transferring(self) -> bool:
-        if self.active is None:
+        item = self.active
+        if item is None:
             return False
-        self.active.status = "Transferring"
-        return True
-
-    def pause(self, item_id: str) -> bool:
-        item = self.get(item_id)
-        if item and item.status == "Transferring":
-            item.status = "Paused"
-            return True
-        return False
-
-    def resume(self, item_id: str) -> bool:
-        item = self.get(item_id)
-        if item and item.status == "Paused":
-            item.status = "Transferring"
-            return True
-        return False
-
-    def cancel(self, item_id: str) -> bool:
-        item = self.get(item_id)
-        if item is None or item.status in {"Completed", "Cancelled"}:
-            return False
-        item.status = "Cancelled"
-        if self.active is item:
-            self.active = None
-            self._activate_next()
+        item.status = TransferState.TRANSFERRING
         return True
 
     def complete(self, item_id: str, *, error: str = "") -> bool:
         item = self.get(item_id)
         if item is None or item.generation != self.generation:
             return False
-        item.status = "Failed" if error else "Completed"
-        item.error = error
-        if self.active is item:
-            self.active = None
-            self._activate_next()
+        item.status, item.error = (TransferState.FAILED if error else TransferState.COMPLETED), error
+        with self._condition:
+            self._active.discard(item_id)
+            self._schedule_locked()
         return True
-
-    def retry_failed(self) -> None:
-        for item in self.items:
-            if item.status == "Failed":
-                item.status = "Queued"
-                item.error = ""
-        self._activate_next()
-
-    def move(self, item_id: str, delta: int) -> bool:
-        index = next((i for i, x in enumerate(self.items) if x.item_id == item_id), -1)
-        if index < 0 or self.items[index] is self.active or self.items[index].status != "Queued":
-            return False
-        target = index + delta
-        if target < 0 or target >= len(self.items) or self.items[target] is self.active:
-            return False
-        self.items[index], self.items[target] = self.items[target], self.items[index]
-        return True
-
-    def get(self, item_id: str) -> TransferItem | None:
-        return next((x for x in self.items if x.item_id == item_id), None)
-
-    def clear_completed(self) -> None:
-        self.items = [x for x in self.items if x.status != "Completed"]
-
-    def shutdown(self) -> None:
-        self.closed = True
-        for item in self.items:
-            if item.status in {"Queued", "Preparing", "Transferring", "Paused"}:
-                item.status = "Cancelled"
-        self.active = None
 
 
 @dataclass
@@ -1507,6 +1887,7 @@ class TerminalPanelState:
     generation: int = 0
     max_scrollback_lines: int = 5000
     follow_output: bool = True
+    unseen_output: bool = False
 
     def begin(self, *, reconnecting: bool = False) -> int:
         self.generation += 1
@@ -1531,13 +1912,70 @@ class TerminalPanelState:
     def trim_scrollback(self, lines: list[str]) -> list[str]:
         return lines[-max(0, self.max_scrollback_lines) :]
 
+    def note_output(self) -> None:
+        if not self.follow_output:
+            self.unseen_output = True
+
+    def jump_to_bottom(self) -> None:
+        self.follow_output = True
+        self.unseen_output = False
+
     @staticmethod
     def requires_paste_confirmation(text: str) -> bool:
         return "\n" in text or "\r" in text
 
     @staticmethod
     def terminal_size(width: int, height: int, char_width: int, char_height: int) -> tuple[int, int]:
-        return max(20, (max(0, width) - 8) // max(1, char_width)), max(5, (max(0, height) - 4) // max(1, char_height))
+        return max(1, (max(0, width) - 8) // max(1, char_width)), max(1, (max(0, height) - 4) // max(1, char_height))
+
+
+def terminal_key_sequence(keysym: str, char: str = "", state: int = 0, *, application_cursor: bool = False) -> str:
+    """Translate a Tk key event to bytes understood by an xterm-compatible PTY.
+
+    This deliberately has no Tk dependency so recorded key events can be
+    regression-tested without a display.
+    """
+    shift, control, alt = bool(state & 0x0001), bool(state & 0x0004), bool(state & 0x0008)
+    cursor = {"Up": "A", "Down": "B", "Right": "C", "Left": "D", "Home": "H", "End": "F"}
+    if keysym in cursor:
+        if control or alt or shift:
+            modifier = 1 + shift + 4 * control + 2 * alt
+            return f"\x1b[1;{modifier}{cursor[keysym]}"
+        return f"\x1bO{cursor[keysym]}" if application_cursor else f"\x1b[{cursor[keysym]}"
+    fixed = {
+        "Delete": "\x1b[3~",
+        "Insert": "\x1b[2~",
+        "Prior": "\x1b[5~",
+        "Next": "\x1b[6~",
+        "Return": "\r",
+        "KP_Enter": "\r",
+        "Tab": "\t",
+        "ISO_Left_Tab": "\x1b[Z",
+        "Escape": "\x1b",
+        "BackSpace": "\x7f",
+    }
+    if keysym in fixed:
+        return fixed[keysym]
+    if keysym.startswith("F") and keysym[1:].isdigit():
+        return {
+            1: "\x1bOP",
+            2: "\x1bOQ",
+            3: "\x1bOR",
+            4: "\x1bOS",
+            5: "\x1b[15~",
+            6: "\x1b[17~",
+            7: "\x1b[18~",
+            8: "\x1b[19~",
+            9: "\x1b[20~",
+            10: "\x1b[21~",
+            11: "\x1b[23~",
+            12: "\x1b[24~",
+        }.get(int(keysym[1:]), "")
+    if control and len(char) == 1 and char.isalpha():
+        return chr(ord(char.upper()) - ord("@"))
+    if alt and char:
+        return "\x1b" + char
+    return char
 
 
 def redact_secrets(value: object) -> object:

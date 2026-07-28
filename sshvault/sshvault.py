@@ -53,7 +53,9 @@ from sshvault_core import (
     StartupActionCoordinator,
     DiagnosticsCollector,
     TransferItem,
-    TransferQueueManager,
+    TransferBatch,
+    TransferScheduler,
+    TransferState,
     CommandExecutionState,
     atomic_json_write,
     validate_settings,
@@ -903,6 +905,107 @@ class TerminalWidget(tk.Frame):
 
 
 # ── SFTP panel ───────────────────────────────────────────────────────────────
+class SFTPTransferManagerWindow(tk.Toplevel):
+    """Modeless transfer view. Closing it hides it; work continues."""
+
+    COLUMNS = (
+        "name",
+        "direction",
+        "source",
+        "destination",
+        "size",
+        "transferred",
+        "progress",
+        "speed",
+        "remaining",
+        "status",
+        "error",
+    )
+
+    def __init__(self, panel):
+        super().__init__(panel.winfo_toplevel())
+        self.panel = panel
+        self.title("SFTP Transfer Manager")
+        self.geometry("1180x430")
+        self.minsize(760, 240)
+        self.protocol("WM_DELETE_WINDOW", self.withdraw)
+        top = tk.Frame(self, bg=PANEL)
+        top.pack(fill="x", padx=6, pady=4)
+        self.summary = tk.StringVar()
+        tk.Label(top, textvariable=self.summary, bg=PANEL, fg=TEXT, font=FONT).pack(side="left")
+        actions = (
+            ("Pause Selected", panel._pause_selected_transfer),
+            ("Resume Selected", panel._resume_selected_transfer),
+            ("Cancel Selected", panel._cancel_selected_transfer),
+            ("Retry Selected", panel._retry_selected_transfer),
+            ("Remove Selected", panel._remove_selected_transfer),
+            ("Clear Completed", panel._clear_completed_transfers),
+            ("Pause All", panel._pause_all_transfers),
+            ("Resume All", panel._resume_all_transfers),
+            ("Cancel All", panel._cancel_all_transfers),
+            ("Move Up", lambda: panel._move_selected_transfer(-1)),
+            ("Move Down", lambda: panel._move_selected_transfer(1)),
+        )
+        bar = tk.Frame(self, bg=PANEL)
+        bar.pack(fill="x", padx=6, pady=(0, 4))
+        for label, command in actions:
+            tk.Button(bar, text=label, command=command, bg=ACCENT, fg=BG, font=FONT, relief="flat").pack(
+                side="left", padx=2
+            )
+        self.tree = ttk.Treeview(self, columns=self.COLUMNS, show="headings", selectmode="extended")
+        for col in self.COLUMNS:
+            self.tree.heading(col, text=col.title())
+            self.tree.column(col, width=110 if col not in {"source", "destination", "error"} else 180, anchor="w")
+        self.tree.pack(fill="both", expand=True, padx=6, pady=4)
+        self.tree.bind("<Double-Button-1>", self._details)
+        self.menu = tk.Menu(self, tearoff=0)
+        for label, command in actions[:5]:
+            self.menu.add_command(label=label, command=command)
+        self.tree.bind("<Button-3>", self._popup)
+
+    def _popup(self, event):
+        self.tree.selection_set(self.tree.identify_row(event.y))
+        self.menu.tk_popup(event.x_root, event.y_root)
+
+    def _details(self, _event):
+        selected = self.tree.selection()
+        if selected:
+            item = self.panel._transfer_manager.get(selected[0])
+            if item and item.status == TransferState.FAILED:
+                messagebox.showerror("Transfer failed", item.error or "Unknown transfer error", parent=self)
+
+    def refresh(self):
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        for item in self.panel._transfer_manager.items:
+            pct = "—" if item.progress() is None else f"{item.progress():.1f}%"
+            eta = "—" if item.remaining_seconds() is None else f"{item.remaining_seconds():.0f}s"
+            size = "—" if item.total is None else self.panel._fmt_size(item.total)
+            self.tree.insert(
+                "",
+                "end",
+                iid=item.item_id,
+                values=(
+                    Path(item.source).name,
+                    item.direction,
+                    item.source,
+                    item.target,
+                    size,
+                    self.panel._fmt_size(item.transferred),
+                    pct,
+                    self.panel._fmt_size(item.speed) + "/s",
+                    eta,
+                    item.status + (" (Restart required)" if item.restart_required else ""),
+                    item.error,
+                ),
+            )
+        data = self.panel._transfer_manager.summary()
+        self.summary.set(
+            "Active: {active}   Pending: {pending}   Completed: {completed}   Failed: {failed}   "
+            "Total speed: {speed} B/s   Transferred: {transferred} B".format(**data)
+        )
+
+
 class SFTPPanel(tk.Frame):
     def __init__(self, parent, sftp, default_local_directory=None, **kw):
         super().__init__(parent, bg=PANEL, **kw)
@@ -922,7 +1025,14 @@ class SFTPPanel(tk.Frame):
         self._closed = False
         self._remote_generation = 0
         self._sftp_state = SFTPPanelState()
-        self._transfer_manager = TransferQueueManager()
+        settings = getattr(self.winfo_toplevel(), "_runtime_settings", {})
+        self._transfer_transport = getattr(self._sftp.get_channel(), "transport", None)
+        self._transfer_manager = TransferScheduler(
+            self._new_transfer_client,
+            concurrency=settings.get("maximum_sftp_transfers", 3) if isinstance(settings, dict) else 3,
+            on_change=lambda: self._dispatch(self._refresh_transfer_tree),
+        )
+        self._transfer_window = None
         self._local_load_state = DirectoryLoadState()
         self._local_load_lock = threading.Lock()
         self._local_load_path = self._local_cwd
@@ -951,6 +1061,7 @@ class SFTPPanel(tk.Frame):
         top = tk.Frame(self, bg=PANEL)
         top.pack(fill="x", padx=4, pady=2)
         tk.Label(top, text="SFTP", bg=PANEL, fg=ACCENT, font=FONT_B).pack(side="left")
+        self._btn(top, "Transfers", self._show_transfer_manager).pack(side="left", padx=8)
         self._progress_var = tk.DoubleVar()
         self._progress = ttk.Progressbar(top, variable=self._progress_var, maximum=100, length=200)
         self._progress.pack(side="right", padx=8)
@@ -1078,26 +1189,70 @@ class SFTPPanel(tk.Frame):
             self._transfer_tree.insert(
                 "", "end", iid=item.item_id, values=(item.source, item.direction, progress, item.status, item.error)
             )
+        if self._transfer_window is not None and self._transfer_window.winfo_exists():
+            self._transfer_window.refresh()
+
+    def _show_transfer_manager(self):
+        if self._transfer_window is None or not self._transfer_window.winfo_exists():
+            self._transfer_window = SFTPTransferManagerWindow(self)
+        self._transfer_window.deiconify()
+        self._transfer_window.lift()
+        self._transfer_window.refresh()
+
+    def _new_transfer_client(self):
+        """Open one Paramiko SFTP channel for exactly one scheduler worker."""
+        if paramiko is None or self._transfer_transport is None or not self._transfer_transport.is_active():
+            raise RuntimeError("The verified SFTP session is no longer available.")
+        return paramiko.SFTPClient.from_transport(self._transfer_transport)
 
     def _pause_selected_transfer(self):
-        for iid in self._transfer_tree.selection():
+        for iid in self._selected_transfer_ids():
             self._transfer_manager.pause(iid)
         self._refresh_transfer_tree()
 
     def _resume_selected_transfer(self):
-        for iid in self._transfer_tree.selection():
+        for iid in self._selected_transfer_ids():
             self._transfer_manager.resume(iid)
         self._refresh_transfer_tree()
 
     def _cancel_selected_transfer(self):
-        for iid in self._transfer_tree.selection():
+        for iid in self._selected_transfer_ids():
             self._transfer_manager.cancel(iid)
-        self._transfer_cancel.set()
         self._refresh_transfer_tree()
 
     def _retry_failed_transfers(self):
         self._transfer_manager.retry_failed()
         self._refresh_transfer_tree()
+
+    def _retry_selected_transfer(self):
+        for iid in self._selected_transfer_ids():
+            self._transfer_manager.retry(iid)
+        self._refresh_transfer_tree()
+
+    def _remove_selected_transfer(self):
+        for iid in self._selected_transfer_ids():
+            self._transfer_manager.remove(iid)
+        self._refresh_transfer_tree()
+
+    def _pause_all_transfers(self):
+        self._transfer_manager.pause_all()
+
+    def _resume_all_transfers(self):
+        self._transfer_manager.resume_all()
+
+    def _cancel_all_transfers(self):
+        self._transfer_manager.cancel_all()
+
+    def _move_selected_transfer(self, delta):
+        for iid in self._selected_transfer_ids():
+            self._transfer_manager.move(iid, delta)
+        self._refresh_transfer_tree()
+
+    def _selected_transfer_ids(self):
+        selected = list(self._transfer_tree.selection())
+        if self._transfer_window is not None and self._transfer_window.winfo_exists():
+            selected.extend(self._transfer_window.tree.selection())
+        return set(selected)
 
     def _clear_completed_transfers(self):
         self._transfer_manager.clear_completed()
@@ -1188,8 +1343,7 @@ class SFTPPanel(tk.Frame):
         self._cancel_transfer_btn.configure(state="normal" if actions["cancel"] else "disabled")
 
     def _cancel_transfer(self):
-        self._transfer_cancel.set()
-        self._transfer_manager.shutdown()
+        self._transfer_manager.cancel_all()
         self._sftp_state.cancel()
         self._set_status(self._sftp_state.message)
         self._update_transfer_actions()
@@ -1839,21 +1993,15 @@ class SFTPPanel(tk.Frame):
                 self._sftp_state.start_transfer(name, now=time.monotonic())
                 self._update_transfer_actions()
                 self._set_status(f"Uploading {name}…")
-                transfer_item = self._transfer_manager.enqueue(
+                self._transfer_manager.enqueue(
                     TransferItem(
                         local, remote, "Upload", total=Path(local).stat().st_size, generation=self._remote_generation
-                    )
+                    ),
+                    lambda item, client, worker, local_path=Path(local), r=remote, replace=decision == "replace": (
+                        self._scheduled_upload(item, client, worker, local_path, r, replace)
+                    ),
                 )
                 self._refresh_transfer_tree()
-                self._transfer_queue.put(
-                    lambda local_path=local, r=remote, n=name, replace=decision == "replace": (
-                        self._transfer_manager.mark_transferring(),
-                        self._upload_with_cleanup(Path(local_path), r, replace),
-                        self._transfer_manager.complete(transfer_item.item_id),
-                        self.after(0, self._refresh_transfer_tree),
-                        self.after(0, self._refresh_remote),
-                    )
-                )
 
     def _upload_folder(self):
         sel = self._local_tree.selection()
@@ -1864,13 +2012,38 @@ class SFTPPanel(tk.Frame):
                 continue
             local = Path(self._local_cwd) / name
             if local.is_dir():
-                self._set_status(f"Uploading folder {name}…")
-                self._transfer_queue.put(
-                    lambda local_path=local, n=name: (
-                        self._upload_dir(local_path, self._remote_join(self._remote_cwd, n)),
-                        self.after(0, self._refresh_remote),
+                remote_root = self._remote_join(self._remote_cwd, name)
+                children = []
+                for file_path in sorted(path for path in local.rglob("*") if path.is_file() and not path.is_symlink()):
+                    relative = file_path.relative_to(local)
+                    remote = posixpath.join(remote_root, str(relative).replace(os.sep, "/"))
+                    item = TransferItem(str(file_path), remote, "Upload", total=file_path.stat().st_size)
+                    children.append(
+                        (
+                            item,
+                            lambda current, client, worker, p=file_path, r=remote: self._scheduled_upload_with_dirs(
+                                current, client, worker, p, r
+                            ),
+                        )
                     )
-                )
+                batch = TransferBatch(name, "Upload", str(local), remote_root)
+                self._transfer_manager.add_batch(batch, children)
+                self._set_status(f"Queued folder {name} ({len(children)} files).")
+                self._refresh_transfer_tree()
+
+    def _scheduled_upload_with_dirs(self, item, sftp, worker, local, remote):
+        directory = posixpath.dirname(remote)
+        parts = directory.strip("/").split("/")
+        current = "/" if directory.startswith("/") else ""
+        for part in parts:
+            if not part:
+                continue
+            current = posixpath.join(current, part)
+            try:
+                sftp.mkdir(current)
+            except (IOError, OSError):
+                pass
+        self._scheduled_upload(item, sftp, worker, local, remote, False)
 
     def _upload_dir(self, local: Path, remote: str):
         try:
@@ -1900,19 +2073,79 @@ class SFTPPanel(tk.Frame):
             self._sftp_state.start_transfer(name, now=time.monotonic())
             self._update_transfer_actions()
             self._set_status(f"Downloading {name}…")
-            transfer_item = self._transfer_manager.enqueue(
-                TransferItem(remote, str(local), "Download", generation=self._remote_generation)
+            self._transfer_manager.enqueue(
+                TransferItem(remote, str(local), "Download", generation=self._remote_generation),
+                lambda item, client, worker, r=remote, local_path=local, replace=decision == "replace": (
+                    self._scheduled_download(item, client, worker, r, local_path, replace)
+                ),
             )
             self._refresh_transfer_tree()
-            self._transfer_queue.put(
-                lambda r=remote, local_path=local, replace=decision == "replace": (
-                    self._transfer_manager.mark_transferring(),
-                    self._download_with_cleanup(r, local_path, replace),
-                    self._transfer_manager.complete(transfer_item.item_id),
-                    self.after(0, self._refresh_transfer_tree),
-                    self.after(0, self._refresh_local),
-                )
-            )
+
+    def _scheduled_upload(self, item, sftp, worker, local: Path, remote: str, replace: bool):
+        """Worker-owned, atomic upload; a partial is restarted unless verified."""
+        total = local.stat().st_size
+        item.total = total
+        if not replace:
+            try:
+                sftp.stat(remote)
+                raise FileExistsError("A remote file with this name already exists.")
+            except (FileNotFoundError, IOError, OSError):
+                pass
+        partial = self._partial_remote_path(remote)
+        # A size alone cannot prove a remote prefix is safe.  Restart rather
+        # than claiming resumability when an extension hash is unavailable.
+        try:
+            if sftp.stat(partial).st_size:
+                item.restart_required = True
+                sftp.remove(partial)
+        except (FileNotFoundError, IOError, OSError):
+            pass
+        try:
+            with local.open("rb") as source, sftp.open(partial, "wb") as target:
+                while chunk := source.read(262144):
+                    target.write(chunk)
+                    worker.checkpoint(source.tell(), total)
+            if sftp.stat(partial).st_size != total:
+                raise IOError("Upload size verification failed")
+            try:
+                sftp.remove(remote)
+            except (FileNotFoundError, IOError, OSError):
+                pass
+            sftp.rename(partial, remote)
+        except InterruptedError:
+            try:
+                sftp.remove(partial)
+            except Exception:
+                pass
+            raise
+
+    def _scheduled_download(self, item, sftp, worker, remote: str, local: Path, replace: bool):
+        """Worker-owned, atomic download with conservative restart semantics."""
+        total = sftp.stat(remote).st_size
+        item.total = total
+        if local.exists() and not replace:
+            raise FileExistsError("A local file with this name already exists.")
+        local.parent.mkdir(parents=True, exist_ok=True)
+        partial = self._partial_local_path(local)
+        if partial.exists() and partial.stat().st_size:
+            item.restart_required = True
+            partial.unlink()
+        try:
+            with sftp.open(remote, "rb") as source, partial.open("wb") as target:
+                transferred = 0
+                while chunk := source.read(262144):
+                    target.write(chunk)
+                    transferred += len(chunk)
+                    worker.checkpoint(transferred, total)
+            if partial.stat().st_size != total:
+                raise IOError("Download size verification failed")
+            os.replace(partial, local)
+        except InterruptedError:
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     def _collision_choice(self, direction: str, name: str) -> str:
         choice = messagebox.askyesnocancel(
@@ -2061,6 +2294,7 @@ class SFTPPanel(tk.Frame):
         with self._local_load_lock:
             self._local_load_state.close()
         self._transfer_cancel.set()
+        self._transfer_manager.shutdown()
         try:
             self._sftp.close()
         except Exception as exc:
@@ -4691,6 +4925,8 @@ class SettingsDialog(tk.Toplevel):
             "theme": "system",
             "application_font_size": 10,
             "terminal_font_size": 10,
+            "maximum_sftp_transfers": 3,
+            "sftp_chunk_size": 262144,
         }
         try:
             if SETTINGS_FILE.exists():
@@ -4699,7 +4935,7 @@ class SettingsDialog(tk.Toplevel):
             pass
         self._vars = {
             key: tk.StringVar(value=str(values[key]))
-            for key in ("scrollback_limit", "connection_timeout", "download_directory")
+            for key in ("scrollback_limit", "connection_timeout", "download_directory", "maximum_sftp_transfers")
         }
         self._bools = {
             key: tk.BooleanVar(value=bool(values[key]))
@@ -4713,6 +4949,7 @@ class SettingsDialog(tk.Toplevel):
                 ("scrollback_limit", "Terminal scrollback lines"),
                 ("connection_timeout", "Connection timeout (seconds)"),
                 ("download_directory", "Default download directory"),
+                ("maximum_sftp_transfers", "Maximum simultaneous SFTP transfers"),
             )
         ):
             tk.Label(form, text=label, bg=BG, fg=TEXT, font=FONT).grid(row=row, column=0, sticky="w", pady=3)
@@ -4720,7 +4957,7 @@ class SettingsDialog(tk.Toplevel):
                 row=row, column=1, sticky="ew", padx=8
             )
         ttk.Button(form, text="Browse", command=self._browse).grid(row=2, column=2)
-        appearance_row = 3
+        appearance_row = 4
         tk.Label(form, text="Theme", bg=BG, fg=TEXT, font=FONT).grid(row=appearance_row, column=0, sticky="w", pady=3)
         self._theme_var = tk.StringVar(value=self._appearance.theme.title())
         ttk.Combobox(
@@ -4828,6 +5065,9 @@ class SettingsDialog(tk.Toplevel):
         if hasattr(self.parent, "_apply_appearance"):
             self.parent._apply_appearance(data)
         for tab in self.parent._conn_tabs.values():
+            panel = getattr(tab, "_sftp_panel", None)
+            if panel is not None:
+                panel._transfer_manager.set_concurrency(data["maximum_sftp_transfers"])
             for terminal in tab._terminals:
                 terminal._terminal_state.max_scrollback_lines = data["scrollback_limit"]
         self.destroy()
