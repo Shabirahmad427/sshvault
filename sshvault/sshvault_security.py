@@ -9,15 +9,21 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import socket
 import tempfile
 import threading
 import queue
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 from datetime import datetime, timezone
 
 import paramiko
 
-from sshvault_core import ProfileError, connection_kwargs
+from sshvault_core import (
+    ProfileError,
+    SSHRuntimePreferences,
+    connection_kwargs,
+    ssh_runtime_preferences,
+)
 
 
 class TrustDecision(str, Enum):
@@ -330,6 +336,7 @@ class SSHConnectionManager:
 
     def __init__(self, known_hosts: KnownHostsStore, hostname: str, port: int) -> None:
         self.known_hosts, self.hostname, self.port = known_hosts, hostname, port
+        self.last_runtime_preferences: SSHRuntimePreferences | None = None
 
     def connect(
         self,
@@ -343,10 +350,32 @@ class SSHConnectionManager:
         if self.known_hosts.path.exists():
             client.load_host_keys(str(self.known_hosts.path))
         client.set_missing_host_key_policy(InteractiveHostKeyPolicy(self, profile, decide_trust))
-        kwargs = connection_kwargs(profile, password)
+        try:
+            runtime = ssh_runtime_preferences(profile)
+            kwargs = connection_kwargs(profile, password)
+        except ProfileError:
+            client.close()
+            raise
+        kwargs["compress"] = runtime.compression
+        if runtime.algorithm_preferences:
+            kwargs["transport_factory"] = preferred_transport_factory(runtime)
         if extra_kwargs:
             kwargs.update(extra_kwargs)
-        client.connect(**kwargs)
+        try:
+            client.connect(**kwargs)
+        except ProfileError:
+            client.close()
+            raise
+        transport = client.get_transport()
+        if transport is None:
+            client.close()
+            raise ProfileError("SSH transport was not established.")
+        try:
+            apply_ssh_runtime_preferences(transport, runtime)
+        except ProfileError:
+            client.close()
+            raise
+        self.last_runtime_preferences = runtime
         return client
 
     def changed_request(self, profile: dict[str, Any], error: paramiko.BadHostKeyException) -> ChangedHostKeyRequest:
@@ -359,3 +388,83 @@ class SSHConnectionManager:
             sha256_fingerprint(error.expected_key),
             sha256_fingerprint(error.key),
         )
+
+
+def _preferred_first(
+    available: Sequence[str],
+    preferred: str | None,
+    label: str,
+) -> tuple[str, ...]:
+    current = tuple(available)
+    if preferred is None:
+        return current
+    if preferred not in current:
+        raise ProfileError(f"Preferred SSH {label} is unsupported by this backend.")
+    return (preferred, *(item for item in current if item != preferred))
+
+
+def preferred_transport_factory(runtime: SSHRuntimePreferences) -> Callable[..., paramiko.Transport]:
+    """Create a Transport factory that only reorders explicitly selected algorithms."""
+
+    def factory(sock: Any, **kwargs: Any) -> paramiko.Transport:
+        transport = paramiko.Transport(sock, **kwargs)
+        options = transport.get_security_options()
+        try:
+            options.kex = _preferred_first(
+                options.kex,
+                runtime.preferred_key_exchange,
+                "key-exchange algorithm",
+            )
+            options.key_types = _preferred_first(
+                options.key_types,
+                runtime.preferred_host_key,
+                "host-key algorithm",
+            )
+            options.ciphers = _preferred_first(
+                options.ciphers,
+                runtime.preferred_cipher,
+                "cipher",
+            )
+            options.digests = _preferred_first(
+                options.digests,
+                runtime.preferred_mac,
+                "MAC",
+            )
+        except ProfileError:
+            transport.close()
+            raise
+        except (TypeError, ValueError) as exc:
+            transport.close()
+            raise ProfileError("SSH algorithm preferences could not be applied.") from exc
+        return transport
+
+    return factory
+
+
+def apply_ssh_runtime_preferences(
+    transport: Any,
+    runtime: SSHRuntimePreferences,
+) -> None:
+    """Apply transport-level keepalive policy without changing authentication."""
+    try:
+        transport.set_keepalive(runtime.keepalive_interval)
+        transport.sshvault_maximum_missed_keepalives = runtime.maximum_missed_keepalives
+        sock = getattr(transport, "sock", None)
+        if sock is not None and hasattr(sock, "setsockopt"):
+            sock.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_KEEPALIVE,
+                1 if runtime.tcp_keepalive else 0,
+            )
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        raise ProfileError("SSH keepalive preferences could not be applied.") from exc
+
+
+def request_agent_forwarding(channel: Any, profile: dict[str, Any]) -> Any | None:
+    """Request forwarding only when enabled in this channel's session snapshot."""
+    if not ssh_runtime_preferences(profile).agent_forwarding:
+        return None
+    try:
+        return paramiko.agent.AgentRequestHandler(channel)
+    except Exception as exc:
+        raise ProfileError("SSH agent forwarding request failed.") from exc

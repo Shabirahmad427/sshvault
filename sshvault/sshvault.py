@@ -32,6 +32,7 @@ from sshvault_security import (
     UnknownHostCancelled,
     ProxyConnectionContext,
     HostKeyRepository,
+    request_agent_forwarding,
 )
 from sshvault_security import SecurityRequestQueue
 from sshvault_core import (
@@ -46,6 +47,8 @@ from sshvault_core import (
     SFTPPanelState,
     TerminalPanelState,
     terminal_key_sequence,
+    VTETerminalBackend,
+    detect_vte_backend,
     TunnelFormState,
     TunnelRuntime,
     TunnelManager,
@@ -74,11 +77,81 @@ from sshvault_core import (
     confirm_delete_enabled,
     confirm_overwrite_enabled,
     SessionDashboardState,
+    SessionController,
+    SessionLifecycleState,
     ImportPreviewRow,
     ImportDecisionModel,
     build_import_preview,
+    default_profile_sections,
     friendly_connection_error,
     redact_secrets,
+    OPTIONS_GROUPS,
+    POST_LOGIN_OPTION_LABELS,
+    APPLICATION_STARTUP_OPTION_LABELS,
+    LOGOUT_OPTION_LABELS,
+    TERMINAL_GROUPS,
+    TERMINAL_BACKENDS,
+    TERMINAL_BELLS,
+    TERMINAL_CURSOR_SHAPES,
+    TERMINAL_COLOR_THEMES,
+    SERVICES_SECTIONS,
+    X11_FORWARDING_OPTION_LABELS,
+    PORT_FORWARDING_RUNTIME_COLUMNS,
+    PORT_FORWARDING_TYPES,
+    DynamicForwardingSession,
+    HTTPForwardingSession,
+    LocalForwardingSession,
+    RemoteForwardingSession,
+    X11ForwardingSession,
+    PortForwardingEditor,
+    port_forwarding_display_row,
+    start_dynamic_forwarding_listener,
+    start_http_connect_listener,
+    start_local_forwarding_listener,
+    start_remote_forwarding_listener,
+    CONTROLLER_DEFAULT_GEOMETRY,
+    CONTROLLER_MINIMUM_GEOMETRY,
+    SECTION_PADDING,
+    SFTP_GROUPS,
+    SFTP_OVERWRITE_BEHAVIORS,
+    SSH_SETTING_LABELS,
+    SSH_KEY_EXCHANGE_CHOICES,
+    SSH_HOST_KEY_CHOICES,
+    SSH_CIPHER_CHOICES,
+    SSH_MAC_CHOICES,
+    default_ssh_preferences,
+    set_working_ssh_preference,
+    ssh_preferences_from_profile,
+    SFTPBrowserClient,
+    SFTPBrowserRegistry,
+    SFTPDragDropRouter,
+    SFTPTransferRouter,
+    SFTPViewNavigationState,
+    browser_entry_properties,
+    confirmed_sftp_delete_entries,
+    create_local_browser_folder,
+    create_remote_browser_folder,
+    delete_local_browser_entries,
+    delete_remote_browser_entries,
+    initial_local_browser_path,
+    list_local_browser_entries,
+    list_remote_browser_entries,
+    normalize_local_path,
+    normalize_remote_path,
+    rename_local_browser_entry,
+    rename_remote_browser_entry,
+    selected_browser_entries,
+    selected_browser_path,
+    selected_directory_target,
+    selected_file_entries,
+    sftp_file_action_states,
+    sftp_mutation_action_states,
+    sftp_transfer_control_states,
+    sftp_transfer_queue_rows,
+    sort_browser_entries,
+    update_browser_sort,
+    validate_sftp_item_name,
+    ssh_runtime_preferences,
 )
 
 try:
@@ -117,6 +190,96 @@ MUTED = "#6c7086"
 MONO = ("MesloLGS Nerd Font Mono", 10)
 FONT = ("Sans", 10)
 FONT_B = ("Sans", 10, "bold")
+CONTROLLER_PROFILE_ACTIONS = ("Load profile", "Save profile as", "New profile", "Reset profile")
+CONTROLLER_CONFIG_TABS = ("Login", "Options", "Terminal", "SFTP", "Services", "SSH")
+CONTROLLER_BOTTOM_ACTIONS = ("Log in / Log out", "Exit")
+OPENING_BG = "#ececec"
+OPENING_PANEL = "#f7f7f7"
+PROFILE_RAIL_WIDTH = 152
+
+
+class _ProfileSelectionModel:
+    """Display-free compatibility model for UUID-based profile selection."""
+
+    def __init__(self) -> None:
+        self._items: list[str] = []
+        self._selection: str | None = None
+        self._focus: str | None = None
+
+    def get_children(self) -> tuple[str, ...]:
+        return tuple(self._items)
+
+    def delete(self, *items: str) -> None:
+        removed = set(items)
+        self._items = [item for item in self._items if item not in removed]
+        if self._selection in removed:
+            self._selection = None
+        if self._focus in removed:
+            self._focus = None
+
+    def insert(self, _parent: str, _position: str, *, iid: str, **_kwargs: object) -> None:
+        if iid not in self._items:
+            self._items.append(iid)
+
+    def exists(self, item: str) -> bool:
+        return item in self._items
+
+    def selection(self) -> tuple[str, ...]:
+        return (self._selection,) if self._selection is not None else ()
+
+    def selection_set(self, item: str) -> None:
+        self._selection = item if self.exists(item) else None
+
+    def focus(self, item: str | None = None) -> str:
+        if item is not None:
+            self._focus = item if self.exists(item) else None
+        return self._focus or ""
+
+
+class _ConnectionViewRegistry:
+    """Notebook-compatible registry without a visible controller tab strip."""
+
+    def __init__(self) -> None:
+        self._widgets: dict[str, tk.Misc] = {}
+        self._labels: dict[str, str] = {}
+        self._order: list[str] = []
+        self._selected: str = ""
+
+    def add(self, widget: tk.Misc, *, text: str) -> None:
+        widget_id = str(widget)
+        self._widgets[widget_id] = widget
+        self._labels[widget_id] = text
+        if widget_id not in self._order:
+            self._order.append(widget_id)
+        self._selected = widget_id
+
+    def select(self, widget: tk.Misc | str | None = None) -> str:
+        if widget is not None:
+            widget_id = str(widget)
+            if widget_id in self._widgets:
+                self._selected = widget_id
+        return self._selected
+
+    def nametowidget(self, widget_id: str) -> tk.Misc:
+        if widget_id not in self._widgets:
+            raise KeyError(widget_id)
+        return self._widgets[widget_id]
+
+    def tabs(self) -> tuple[str, ...]:
+        return tuple(self._order)
+
+    def tab(self, widget: tk.Misc | str, option: str) -> str:
+        if option != "text":
+            raise KeyError(option)
+        return self._labels.get(str(widget), "")
+
+    def forget(self, widget: tk.Misc | str) -> None:
+        widget_id = str(widget)
+        self._widgets.pop(widget_id, None)
+        self._labels.pop(widget_id, None)
+        self._order = [item for item in self._order if item != widget_id]
+        if self._selected == widget_id:
+            self._selected = self._order[-1] if self._order else ""
 
 
 def log(msg: str):
@@ -175,6 +338,35 @@ _NAME_COLORS = {
 _TAG_COLOR_CODES = {"err": "31", "info": "36", "ok": "32", "warn": "33", "hdr": "35"}
 _URL_RE = re.compile(r"https?://[^\s<>()\"']+")
 _URL_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~:/?#[]@!$&'()*+,;=%")
+
+
+def _xterm_256_color(index: int) -> str:
+    """Return an xterm palette colour without depending on a Tk colour name."""
+    if index < 16:
+        names = tuple(_NAME_COLORS)
+        return _NAME_COLORS[names[index]]
+    if index < 232:
+        index -= 16
+        levels = (0, 95, 135, 175, 215, 255)
+        return "#%02x%02x%02x" % (levels[index // 36], levels[(index // 6) % 6], levels[index % 6])
+    gray = 8 + (index - 232) * 10
+    return f"#{gray:02x}{gray:02x}{gray:02x}"
+
+
+def _terminal_color(value, default: str) -> str:
+    """Map pyte named, indexed, and RGB colours onto Tk colour strings."""
+    if value in (None, "default"):
+        return default
+    value = str(value)
+    if value in _NAME_COLORS:
+        return _NAME_COLORS[value]
+    if re.fullmatch(r"[0-9a-fA-F]{6}", value):
+        return "#" + value
+    match = re.fullmatch(r"color(\d{1,3})", value)
+    if match:
+        return _xterm_256_color(min(255, int(match.group(1))))
+    return default
+
 
 # xterm-style key -> escape sequence translation for raw (non-echoing) input
 _KEY_SEQS = {
@@ -252,10 +444,32 @@ class TerminalWidget(tk.Frame):
             pady=2,
             state="disabled",
         )
-        sb = ttk.Scrollbar(self, command=self._text.yview)
-        self._text.configure(yscrollcommand=sb.set)
+        # Keep the scrollbar as a real part of every terminal tab.  In
+        # particular, route its command through us so clicking its trough or
+        # dragging its thumb updates follow/unseen state as well as yview.
+        self._scrollbar = tk.Scrollbar(
+            self,
+            command=self._on_scrollbar,
+            bg=PANEL,
+            activebackground=ACCENT,
+            troughcolor=_TERM_BG,
+            highlightthickness=0,
+            relief="flat",
+        )
+        self._text.configure(yscrollcommand=self._on_yview)
         self._text.grid(row=0, column=0, sticky="nsew")
-        sb.grid(row=0, column=1, sticky="ns")
+        self._scrollbar.grid(row=0, column=1, sticky="ns")
+        self._unseen_button = tk.Button(
+            self,
+            text="New output ↓",
+            command=self.jump_to_bottom,
+            bg=PANEL,
+            fg=ACCENT,
+            activebackground=PANEL,
+            activeforeground=ACCENT,
+            relief="flat",
+            takefocus=False,
+        )
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
 
@@ -276,7 +490,11 @@ class TerminalWidget(tk.Frame):
         self._writer_thread = None
         self._bracketed_paste = False
         self._application_cursor_mode = False
-        self._mouse_tracking = False
+        self._application_keypad_mode = False
+        self._mouse_tracking = 0
+        self._mouse_sgr = False
+        self._cursor_shape = "block"
+        self._cursor_blink = True
         self._input_mode_tail = ""
         self._find_matches: list[str] = []
         self._find_index = -1
@@ -311,11 +529,16 @@ class TerminalWidget(tk.Frame):
         self._text.bind("<Control-v>", self._on_paste)
         self._text.bind("<Control-V>", self._on_paste)
         self._text.bind("<Control-Shift-V>", self._on_paste)
+        self._text.bind("<Control-Shift-C>", self._on_copy_shortcut)
+        self._text.bind("<Control-Insert>", self._on_copy_shortcut)
+        self._text.bind("<Control-Shift-F>", self._open_search)
         self._text.bind("<Shift-Insert>", self._on_paste)
         self._text.bind("<Button-2>", self._on_paste)
         self._text.bind("<Button-3>", self._show_context_menu)
         self._text.bind("<Configure>", self._on_configure)
         self._text.bind("<Button-1>", self._on_click)
+        self._text.bind("<ButtonPress-1>", self._on_mouse_press, add="+")
+        self._text.bind("<ButtonRelease-1>", self._on_mouse_release, add="+")
         self._text.bind("<Motion>", self._on_motion)
         self._text.bind("<MouseWheel>", self._on_scroll)
         self._text.bind("<Button-4>", self._on_scroll)
@@ -458,7 +681,11 @@ class TerminalWidget(tk.Frame):
                 channel.sendall(data.encode("utf-8"))
             except queue.Empty:
                 continue
-            except Exception:
+            except Exception as exc:
+                # Do not silently lose editor keystrokes.  The reader will
+                # normally report the closed channel too, while this log
+                # leaves a diagnostic trail for send failures.
+                log(f"Terminal channel write failed: {exc}")
                 break
 
     def _send(self, data: str):
@@ -472,9 +699,19 @@ class TerminalWidget(tk.Frame):
             self._bracketed_paste = enabled == "h"
         for enabled in re.findall(r"\x1b\[\?1([hl])", scan):
             self._application_cursor_mode = enabled == "h"
-        for enabled in re.findall(r"\x1b\[\?(?:1000|1002|1003|1006)([hl])", scan):
-            self._mouse_tracking = enabled == "h"
-        self._input_mode_tail = scan[-16:]
+        for enabled in re.findall(r"\x1b\[\?66([hl])", scan):
+            self._application_keypad_mode = enabled == "h"
+        for mode, enabled in re.findall(r"\x1b\[\?(1000|1002|1003|1006)([hl])", scan):
+            if mode == "1006":
+                self._mouse_sgr = enabled == "h"
+            elif enabled == "h":
+                self._mouse_tracking = int(mode)
+            elif self._mouse_tracking == int(mode):
+                self._mouse_tracking = 0
+        for shape in re.findall(r"\x1b\[([0-6]) q", scan):
+            self._cursor_shape = {"3": "underline", "4": "underline", "5": "bar", "6": "bar"}.get(shape, "block")
+            self._cursor_blink = shape not in {"2", "4", "6"}
+        self._input_mode_tail = scan[-32:]
 
     # ── redraw ───────────────────────────────────────────────────────────
     def _queue_scrollback(self, line: dict):
@@ -494,19 +731,28 @@ class TerminalWidget(tk.Frame):
             pass
 
     def _style_tag(self, ch):
-        fg = _NAME_COLORS.get(ch.fg, TEXT) if ch.fg != "default" else TEXT
-        bg = _NAME_COLORS.get(ch.bg, _TERM_BG) if ch.bg != "default" else _TERM_BG
+        fg = _terminal_color(ch.fg, TEXT)
+        bg = _terminal_color(ch.bg, _TERM_BG)
         if ch.reverse:
             fg, bg = bg, fg
-        key = (fg, bg, ch.bold, ch.underscore)
+        if getattr(ch, "blink", False):
+            fg = MUTED
+        if getattr(ch, "conceal", False):
+            fg = bg
+        key = (fg, bg, ch.bold, getattr(ch, "italics", False), ch.underscore, getattr(ch, "strikethrough", False))
         tagname = self._tag_cache.get(key)
         if tagname is None:
             tagname = f"style{len(self._tag_cache)}"
             opts = {"foreground": fg, "background": bg}
-            if ch.bold:
-                opts["font"] = (MONO[0], MONO[1], "bold")
+            if ch.bold or getattr(ch, "italics", False):
+                style = (
+                    "bold italic" if ch.bold and getattr(ch, "italics", False) else ("bold" if ch.bold else "italic")
+                )
+                opts["font"] = (MONO[0], MONO[1], style)
             if ch.underscore:
                 opts["underline"] = True
+            if getattr(ch, "strikethrough", False):
+                opts["overstrike"] = True
             self._text.tag_configure(tagname, **opts)
             self._tag_cache[key] = tagname
         return tagname
@@ -551,7 +797,12 @@ class TerminalWidget(tk.Frame):
             cur = self._screen.cursor
             cursor_y, cursor_x, cursor_hidden = cur.y, cur.x, cur.hidden
 
-        at_bottom = self._text.yview()[1] >= 0.999
+        at_bottom = self._at_bottom()
+        # A scrollbar trough click/drag can change yview just before its
+        # idle callback updates the state.  Read yview here too so output in
+        # that small window never snaps a user back to the bottom.
+        if not at_bottom:
+            self._terminal_state.follow_output = False
         self._text.configure(state="normal")
         touched_lines = set()
 
@@ -581,17 +832,24 @@ class TerminalWidget(tk.Frame):
             cpos = self._text.index(f"live_start +{cursor_y}l linestart +{cursor_x}c")
             cend = self._text.index(f"{cpos}+1c")
             self._text.tag_add("cursor", cpos, cend)
-            self._text.tag_configure("cursor", background=ACCENT, foreground=BG)
+            cursor_opts = {"background": ACCENT, "foreground": BG}
+            if self._cursor_shape == "underline":
+                cursor_opts = {"underline": True, "foreground": ACCENT}
+            elif self._cursor_shape == "bar":
+                cursor_opts = {"underline": True, "foreground": ACCENT}
+            self._text.tag_configure("cursor", **cursor_opts)
             self._cursor_range = (cpos, cend)
 
         if touched_lines:
             self._refresh_links(touched_lines)
-        if scrollback and at_bottom:
+        output_arrived = bool(scrollback or dirty)
+        if output_arrived and at_bottom:
             self._terminal_state.follow_output = True
-        if scrollback and self._terminal_state.follow_output:
+        if output_arrived and self._terminal_state.follow_output:
             self._text.see("end")
-        elif scrollback:
+        elif output_arrived:
             self._terminal_state.note_output()
+        self._update_unseen_indicator()
         self._text.configure(state="disabled")
 
     def _trim_scrollback(self):
@@ -607,11 +865,35 @@ class TerminalWidget(tk.Frame):
         ks = event.keysym
         if ks in ("Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Super_L", "Super_R", "Caps_Lock"):
             return "break"
-        seq = terminal_key_sequence(ks, event.char, event.state, application_cursor=self._application_cursor_mode)
+        # Shift+PageUp/PageDown is the conventional local scrollback escape
+        # hatch even while a full-screen remote program owns navigation keys.
+        if ks in {"Prior", "Next"} and event.state & 0x0001:
+            self._text.yview_scroll(-1 if ks == "Prior" else 1, "pages")
+            self._sync_viewport_state()
+            return "break"
+        seq = terminal_key_sequence(
+            ks,
+            event.char,
+            event.state,
+            application_cursor=self._application_cursor_mode,
+            application_keypad=self._application_keypad_mode,
+        )
         if ks == "space" and event.state & 0x0004:
             seq = "\x00"
         if seq:
             self._send(seq)
+        return "break"
+
+    def _on_copy_shortcut(self, _event):
+        """Copy only an existing Tk selection; Ctrl-C remains remote SIGINT."""
+        self._copy_selection()
+        return "break"
+
+    def _open_search(self, _event=None):
+        query = simpledialog_ask("Find in terminal", "Search text:")
+        if query:
+            self.find(query)
+        self._text.focus_set()
         return "break"
 
     def _on_paste(self, _e):
@@ -630,17 +912,67 @@ class TerminalWidget(tk.Frame):
         return "break"
 
     def _on_scroll(self, event):
-        if self._mouse_tracking and self._channel:
+        if self._mouse_tracking and self._channel and not (getattr(event, "state", 0) & 0x0001):
             direction = 64 if getattr(event, "delta", 0) > 0 or getattr(event, "num", 0) == 4 else 65
-            self._send(f"\x1b[<{direction};1;1M")
+            self._send_mouse(direction, event, release=False)
             return "break"
-        self._terminal_state.follow_output = self._text.yview()[1] >= 0.999
         self._text.yview_scroll(-1 if getattr(event, "delta", 0) > 0 or getattr(event, "num", 0) == 4 else 1, "units")
+        self._sync_viewport_state()
         return "break"
+
+    def _send_mouse(self, button: int, event, *, release: bool):
+        """Encode xterm mouse input only after the remote enabled it."""
+        if not self._channel or not self._mouse_tracking:
+            return
+        font = tkfont.Font(font=MONO)
+        x = max(1, event.x // max(1, font.measure("M")) + 1)
+        y = max(1, event.y // max(1, font.metrics("linespace")) + 1)
+        if self._mouse_sgr:
+            self._send(f"\x1b[<{button};{x};{y}{'m' if release else 'M'}")
+        elif x < 224 and y < 224:
+            self._send("\x1b[M" + chr(32 + button) + chr(32 + x) + chr(32 + y))
+
+    def _on_mouse_press(self, event):
+        if self._mouse_tracking and not (event.state & 0x0001):
+            self._send_mouse(0, event, release=False)
+            return "break"
+        return None
+
+    def _on_mouse_release(self, event):
+        if self._mouse_tracking and not (event.state & 0x0001):
+            self._send_mouse(3, event, release=True)
+            return "break"
+        return None
+
+    def _on_scrollbar(self, *args):
+        """Support thumb drag and page clicks through the native scrollbar."""
+        self._text.yview(*args)
+        self.after_idle(self._sync_viewport_state)
+
+    def _on_yview(self, first, last):
+        self._scrollbar.set(first, last)
+        self.after_idle(self._sync_viewport_state)
+
+    def _at_bottom(self):
+        return self._text.yview()[1] >= 0.999
+
+    def _sync_viewport_state(self):
+        if self._at_bottom():
+            self._terminal_state.jump_to_bottom()
+        else:
+            self._terminal_state.follow_output = False
+        self._update_unseen_indicator()
+
+    def _update_unseen_indicator(self):
+        if self._terminal_state.unseen_output and not self._at_bottom():
+            self._unseen_button.place(relx=1.0, rely=1.0, anchor="se", x=-18, y=-6)
+        else:
+            self._unseen_button.place_forget()
 
     def jump_to_bottom(self):
         self._terminal_state.jump_to_bottom()
         self._text.see("end")
+        self._update_unseen_indicator()
 
     def find(self, query: str, *, previous: bool = False) -> tuple[int, int]:
         """Highlight case-insensitive matches without changing terminal data."""
@@ -674,9 +1006,9 @@ class TerminalWidget(tk.Frame):
             state="normal" if has_selection else "disabled",
         )
         self._context_menu.add_command(label="Paste", command=lambda: self._on_paste(None))
-        self._context_menu.add_command(label="Select all", command=self._select_all)
-        self._context_menu.add_separator()
-        self._context_menu.add_command(label="Clear terminal", command=self.clear)
+        self._context_menu.add_command(label="Select All", command=self._select_all)
+        self._context_menu.add_command(label="Clear Selection", command=self._clear_selection)
+        self._context_menu.add_command(label="Search", command=self._open_search)
         self._text.focus_set()
         try:
             self._context_menu.tk_popup(event.x_root, event.y_root)
@@ -692,10 +1024,11 @@ class TerminalWidget(tk.Frame):
         self.clipboard_clear()
         self.clipboard_append(selected)
 
+    def _clear_selection(self):
+        self._text.tag_remove("sel", "1.0", "end")
+
     def _select_all(self):
         self._text.tag_add("sel", "1.0", "end-1c")
-        self._text.mark_set("insert", "end-1c")
-        self._text.see("insert")
 
     def _on_click(self, event):
         url = self._url_at_index(f"@{event.x},{event.y}")
@@ -4111,9 +4444,25 @@ class TrustDecisionBroker:
 
 
 class ConnectionTab(tk.Frame):
-    def __init__(self, parent, entry: dict, vault_entries: list | None = None, **kw):
+    def __init__(
+        self,
+        parent,
+        entry: dict,
+        vault_entries: list | None = None,
+        *,
+        session_controller=None,
+        session_id: str | None = None,
+        **kw,
+    ):
         super().__init__(parent, bg=BG, **kw)
         self._entry = entry
+        self._session_controller = session_controller
+        self.session_id = session_id
+        self._vte_availability = detect_vte_backend()
+        self._native_terminal_backend = VTETerminalBackend(self._vte_availability)
+        # Capability detection is cheap and display-free.  The persistent GTK
+        # helper starts only for the first explicit native terminal request.
+        self._native_vte_ready = False
         self._vault_entries = vault_entries or []
         self._client: "paramiko.SSHClient | None" = None
         self._sftp = None
@@ -4122,6 +4471,12 @@ class ConnectionTab(tk.Frame):
         self._sftp_panel = None
         self._ftp_bridge_panel = None
         self._tunnels_panel = None
+        self._local_forwarding_service = None
+        self._remote_forwarding_service = None
+        self._dynamic_forwarding_service = None
+        self._http_forwarding_service = None
+        self._x11_forwarding_service = None
+        self._agent_forwarding_handlers = []
         self._exec_panel = None
         self._info_panel = None
         self._key_passphrase = None  # Deliberately never saved in the vault.
@@ -4153,7 +4508,18 @@ class ConnectionTab(tk.Frame):
         self._sftp_open_thread = None
         self._trust_broker = TrustDecisionBroker(self)
         self._build()
+
+    def start_connection(self) -> None:
+        """Explicit network entry point; construction is intentionally passive."""
         self._connect()
+
+    def _session_transition(self, state, message: str = "") -> None:
+        if self._session_controller is None or self.session_id is None:
+            return
+        try:
+            self._session_controller.transition(self.session_id, state, message)
+        except (KeyError, ValueError):
+            log(f"Session lifecycle transition rejected: {message}")
 
     def _schedule_reconnect(self, delay, callback):
         generation = self._session_generation
@@ -4179,6 +4545,9 @@ class ConnectionTab(tk.Frame):
         self._reconnect_controller.cancel()
 
     def _reconnect_now(self):
+        # An explicit user reconnect starts a fresh generation even after a
+        # prior manual logout cancelled automatic reconnect scheduling.
+        self._reconnect_controller.new_session()
         self._reconnect_controller.reconnect_now()
 
     def _select_or_create(self, attr, factory, text):
@@ -4208,6 +4577,20 @@ class ConnectionTab(tk.Frame):
         if self._entry.get("port", 22) != 22:
             host_label += f":{self._entry.get('port')}"
         tk.Label(identity, text=host_label, bg=PANEL, fg=MUTED, font=FONT).pack(anchor="w")
+        initial_backend_status = (
+            "Native VTE available — starts on first terminal"
+            if self._vte_availability.available
+            else self._native_terminal_backend.status
+        )
+        self._terminal_backend_status = tk.StringVar(value=initial_backend_status)
+        self._terminal_backend_label = tk.Label(
+            identity,
+            textvariable=self._terminal_backend_status,
+            bg=PANEL,
+            fg=GREEN if self._vte_availability.available else YELLOW,
+            font=FONT,
+        )
+        self._terminal_backend_label.pack(anchor="w")
 
         connection = tk.Frame(toolbar, bg=PANEL)
         connection.pack(side="right", padx=12, pady=8)
@@ -4370,12 +4753,36 @@ class ConnectionTab(tk.Frame):
     def _connect(self, reconnecting: bool = False):
         if self._workspace_state.status in {"connecting", "disconnecting", "connected"}:
             return
+        if self._session_controller is not None and self.session_id is not None:
+            if reconnecting:
+                record = self._session_controller.get(self.session_id)
+                if record is None:
+                    return
+                if record.state in {SessionLifecycleState.CONNECTED, SessionLifecycleState.FAILED}:
+                    if not self._session_controller.reconnect(self.session_id):
+                        return
+                elif not self._session_controller.begin_connection(self.session_id):
+                    return
+            elif not self._session_controller.begin_connection(self.session_id):
+                return
+            self._session_transition(SessionLifecycleState.RESOLVING, "Resolving host.")
+            self._session_transition(
+                SessionLifecycleState.CONNECTING_PROXY
+                if self._entry.get("proxy_jump")
+                else SessionLifecycleState.CONNECTING_HOST,
+                "Connecting to proxy." if self._entry.get("proxy_jump") else "Connecting to host.",
+            )
+            if self._entry.get("proxy_jump"):
+                self._session_transition(SessionLifecycleState.CONNECTING_HOST, "Connecting to destination host.")
+            self._session_transition(SessionLifecycleState.VERIFYING_HOST_KEY, "Verifying host key.")
+            self._session_transition(SessionLifecycleState.AUTHENTICATING, "Authenticating session.")
         if not paramiko:
             self._set_workspace_status("failed", "SSH support is unavailable in this installation.")
             self._terminal.write("[error] paramiko not installed\n", "err")
             return
         self._session_generation += 1
         generation = self._session_generation
+        self._is_reconnect_attempt = reconnecting
         self._reconnect_controller.new_session()
         self._set_workspace_status("connecting", "Reconnecting…" if reconnecting else "Connecting…")
         self._terminal.write(
@@ -4402,19 +4809,23 @@ class ConnectionTab(tk.Frame):
                 pass
 
         try:
-            secure_profile = dict(self._entry)
+            session_snapshot = self._session_profile_snapshot()
+            secure_profile = dict(session_snapshot)
             secure_profile["auth_method"] = (
-                "key" if self._entry.get("key_path") else "password" if self._entry.get("password") else "agent"
+                "key" if session_snapshot.get("key_path") else "password" if self._entry.get("password") else "agent"
             )
             secure_profile.setdefault("timeout", 15)
             secure_profile.setdefault("compression", False)
             secure_profile["host_role"] = "Destination host"
             extra = {}
             # ProxyJump
-            proxy_alias = self._entry.get("proxy_jump", "").strip()
+            proxy_alias = session_snapshot.get("proxy_jump", "").strip()
             if proxy_alias:
                 extra["sock"] = self._make_proxy_sock(
-                    proxy_alias, self._entry["host"], int(self._entry.get("port", 22)), generation
+                    proxy_alias,
+                    session_snapshot["host"],
+                    int(session_snapshot.get("port", 22)),
+                    generation,
                 )
             if secure_profile["auth_method"] == "agent":
                 # no explicit credential — collect all default keys from ~/.ssh/
@@ -4425,7 +4836,7 @@ class ConnectionTab(tk.Frame):
                 if cfg_path.exists():
                     with open(cfg_path) as f:
                         ssh_cfg.parse(f)
-                cfg_info = ssh_cfg.lookup(self._entry.get("name", self._entry["host"]))
+                cfg_info = ssh_cfg.lookup(session_snapshot.get("name", session_snapshot["host"]))
                 for raw in cfg_info.get("identityfile", []):
                     p = Path(str(raw).replace("%d", str(Path.home()))).expanduser()
                     if p.exists():
@@ -4440,7 +4851,10 @@ class ConnectionTab(tk.Frame):
                 KnownHostsStore(KNOWN_HOSTS_FILE), secure_profile["host"], secure_profile["port"]
             )
             client = manager.connect(
-                secure_profile, self._trust_broker.request, self._entry.get("password") or None, extra
+                secure_profile,
+                self._trust_broker.request,
+                self._entry.get("password") or None,
+                extra,
             )
             if generation != self._session_generation:
                 client.close()
@@ -4533,7 +4947,9 @@ class ConnectionTab(tk.Frame):
             "auth_method": "key" if proxy_key else "password" if proxy_pass else "agent",
             "key_path": proxy_key or "",
             "timeout": 15,
-            "compression": False,
+            "compression": bool(proxy_entry.get("compression", False)) if proxy_entry else False,
+            "connection_options": dict(proxy_entry.get("connection_options", {})) if proxy_entry else {},
+            "terminal_options": dict(proxy_entry.get("terminal_options", {})) if proxy_entry else {},
             "host_role": "Jump host",
         }
         manager = SSHConnectionManager(KnownHostsStore(KNOWN_HOSTS_FILE), proxy_host, proxy_port)
@@ -4564,31 +4980,284 @@ class ConnectionTab(tk.Frame):
         if generation is not None and generation != self._session_generation:
             return
         self._set_workspace_status("connected", "Connected securely.")
+        self._session_transition(SessionLifecycleState.CONNECTED, "Session established.")
+        app = self.winfo_toplevel()
+        if hasattr(app, "_refresh_sessions"):
+            self.after(0, app._refresh_sessions)
         self._terminal.write("[connected]\n", "ok")
+        self._start_enabled_local_forwarding()
+        self._start_enabled_remote_forwarding()
+        self._start_enabled_dynamic_forwarding()
+        self._start_enabled_http_forwarding()
+        self._start_x11_forwarding()
+        # Post-login actions are sourced from this ConnectionTab's immutable
+        # profile snapshot.  They never run merely from selecting or editing
+        # a profile, and reconnects deliberately do not replay them.
+        if self._is_reconnect_attempt:
+            return
         prefs = dict(self._entry.get("launch_preferences", {}))
-        prefs.update({"restart_tunnels": self._entry.get("connection_options", {}).get("restart_tunnels", False)})
+        prefs["start_enabled_tunnels"] = bool(prefs.get("start_enabled_services", False))
+        prefs["startup_command"] = str(self._entry.get("startup_command", prefs.get("startup_command", "")))
         self._startup_actions.handlers = {
             "tunnels": self._start_saved_tunnels,
             "terminal": lambda: self._attach_shell(self._terminal),
-            "sftp": self._open_sftp,
+            "sftp": self._open_phase_one_sftp_view,
             "command": lambda data: self._run_startup_command(
                 str(data.get("startup_command", "")), self._session_generation
             ),
         }
         self._startup_actions.run(prefs, self._session_generation)
-        options = self._entry.get("connection_options", {})
-        if self._reconnect_controller.state == "reconnected":
-            if options.get("reopen_sftp"):
-                self._open_sftp()
-            if options.get("restart_tunnels"):
-                self._open_tunnels()
-                if self._tunnels_panel is not None and hasattr(self._tunnels_panel, "_start_all_saved"):
-                    self._tunnels_panel._start_all_saved()
+
+    def _open_phase_one_sftp_view(self) -> None:
+        """Open one session-owned Phase 1 SFTP shell after CONNECTED only."""
+        if self._session_controller is None or not self.session_id:
+            return
+        record = self._session_controller.get(self.session_id)
+        app = self.winfo_toplevel()
+        if record is not None and hasattr(app, "_open_sftp_placeholder"):
+            app._open_sftp_placeholder(record)
 
     def _start_saved_tunnels(self):
-        self._open_tunnels()
-        if self._tunnels_panel is not None and hasattr(self._tunnels_panel, "_start_all_saved"):
-            self._tunnels_panel._start_all_saved()
+        self._start_enabled_local_forwarding()
+        self._start_enabled_remote_forwarding()
+        self._start_enabled_dynamic_forwarding()
+        self._start_enabled_http_forwarding()
+
+    def _start_enabled_local_forwarding(self):
+        if not self._client or self._session_controller is None or not self.session_id:
+            return
+        if self._local_forwarding_service is not None and not self._local_forwarding_service.closed:
+            self._local_forwarding_service.start_enabled()
+            return
+        transport = self._client.get_transport()
+        if transport is None:
+            return
+        rules = self._entry.get("tunnel_options", {}).get("rules", [])
+        service = LocalForwardingSession(
+            self.session_id,
+            transport,
+            rules,
+            starter=lambda running: start_local_forwarding_listener(running, transport),
+        )
+        service.start_enabled()
+        self._local_forwarding_service = service
+        for rule_id in service.active_rule_ids():
+            self._session_controller.register_tunnel(self.session_id, rule_id)
+        app = self.winfo_toplevel()
+        if hasattr(app, "_local_forwarding_services"):
+            app._local_forwarding_services[self.session_id] = service
+        if hasattr(app, "_refresh_services_tab"):
+            self.after(0, app._refresh_services_tab)
+        for record in service.records.values():
+            if record.status == "Failed":
+                log(f"Local forwarding failed: {record.error}")
+
+    def _stop_local_forwarding(self):
+        service = self._local_forwarding_service
+        if service is None:
+            return
+        active_ids = service.active_rule_ids()
+        service.stop_all()
+        if self._session_controller is not None and self.session_id is not None:
+            for rule_id in active_ids:
+                self._session_controller.unregister_tunnel(self.session_id, rule_id)
+        app = self.winfo_toplevel()
+        if hasattr(app, "_local_forwarding_services") and self.session_id:
+            if app._local_forwarding_services.get(self.session_id) is service:
+                app._local_forwarding_services.pop(self.session_id, None)
+        if hasattr(app, "_refresh_services_tab"):
+            try:
+                self.after(0, app._refresh_services_tab)
+            except (RuntimeError, tk.TclError):
+                pass
+        self._local_forwarding_service = None
+
+    def _start_enabled_remote_forwarding(self):
+        if not self._client or self._session_controller is None or not self.session_id:
+            return
+        if self._remote_forwarding_service is not None and not self._remote_forwarding_service.closed:
+            self._remote_forwarding_service.start_enabled()
+            return
+        transport = self._client.get_transport()
+        if transport is None:
+            return
+        rules = self._entry.get("tunnel_options", {}).get("rules", [])
+        service = RemoteForwardingSession(
+            self.session_id,
+            transport,
+            rules,
+            starter=lambda running: start_remote_forwarding_listener(running, transport),
+        )
+        service.start_enabled()
+        self._remote_forwarding_service = service
+        for rule_id in service.active_rule_ids():
+            self._session_controller.register_tunnel(self.session_id, rule_id)
+        app = self.winfo_toplevel()
+        if hasattr(app, "_remote_forwarding_services"):
+            app._remote_forwarding_services[self.session_id] = service
+        if hasattr(app, "_refresh_services_tab"):
+            self.after(0, app._refresh_services_tab)
+        for record in service.records.values():
+            if record.status == "Failed":
+                log(f"Remote forwarding failed: {record.error}")
+
+    def _stop_remote_forwarding(self):
+        service = self._remote_forwarding_service
+        if service is None:
+            return
+        active_ids = service.active_rule_ids()
+        service.stop_all()
+        if self._session_controller is not None and self.session_id is not None:
+            for rule_id in active_ids:
+                self._session_controller.unregister_tunnel(self.session_id, rule_id)
+        app = self.winfo_toplevel()
+        if hasattr(app, "_remote_forwarding_services") and self.session_id:
+            if app._remote_forwarding_services.get(self.session_id) is service:
+                app._remote_forwarding_services.pop(self.session_id, None)
+        if hasattr(app, "_refresh_services_tab"):
+            try:
+                self.after(0, app._refresh_services_tab)
+            except (RuntimeError, tk.TclError):
+                pass
+        self._remote_forwarding_service = None
+
+    def _start_enabled_dynamic_forwarding(self):
+        if not self._client or self._session_controller is None or not self.session_id:
+            return
+        if self._dynamic_forwarding_service is not None and not self._dynamic_forwarding_service.closed:
+            self._dynamic_forwarding_service.start_enabled()
+            return
+        transport = self._client.get_transport()
+        if transport is None:
+            return
+        rules = self._entry.get("tunnel_options", {}).get("rules", [])
+        service = DynamicForwardingSession(
+            self.session_id,
+            transport,
+            rules,
+            starter=lambda running: start_dynamic_forwarding_listener(running, transport),
+        )
+        service.start_enabled()
+        self._dynamic_forwarding_service = service
+        for rule_id in service.active_rule_ids():
+            self._session_controller.register_tunnel(self.session_id, rule_id)
+        app = self.winfo_toplevel()
+        if hasattr(app, "_dynamic_forwarding_services"):
+            app._dynamic_forwarding_services[self.session_id] = service
+        if hasattr(app, "_refresh_services_tab"):
+            self.after(0, app._refresh_services_tab)
+        for record in service.records.values():
+            if record.status == "Failed":
+                log(f"Dynamic forwarding failed: {record.error}")
+
+    def _stop_dynamic_forwarding(self):
+        service = self._dynamic_forwarding_service
+        if service is None:
+            return
+        active_ids = service.active_rule_ids()
+        service.stop_all()
+        if self._session_controller is not None and self.session_id is not None:
+            for rule_id in active_ids:
+                self._session_controller.unregister_tunnel(self.session_id, rule_id)
+        app = self.winfo_toplevel()
+        if hasattr(app, "_dynamic_forwarding_services") and self.session_id:
+            if app._dynamic_forwarding_services.get(self.session_id) is service:
+                app._dynamic_forwarding_services.pop(self.session_id, None)
+        if hasattr(app, "_refresh_services_tab"):
+            try:
+                self.after(0, app._refresh_services_tab)
+            except (RuntimeError, tk.TclError):
+                pass
+        self._dynamic_forwarding_service = None
+
+    def _start_enabled_http_forwarding(self):
+        if not self._client or self._session_controller is None or not self.session_id:
+            return
+        if self._http_forwarding_service is not None and not self._http_forwarding_service.closed:
+            self._http_forwarding_service.start_enabled()
+            return
+        transport = self._client.get_transport()
+        if transport is None:
+            return
+        rules = self._session_profile_snapshot().get("tunnel_options", {}).get("rules", [])
+        service = HTTPForwardingSession(
+            self.session_id,
+            transport,
+            rules,
+            starter=lambda running: start_http_connect_listener(running, transport),
+        )
+        service.start_enabled()
+        self._http_forwarding_service = service
+        for rule_id in service.active_rule_ids():
+            self._session_controller.register_tunnel(self.session_id, rule_id)
+        app = self.winfo_toplevel()
+        if hasattr(app, "_http_forwarding_services"):
+            app._http_forwarding_services[self.session_id] = service
+        if hasattr(app, "_refresh_services_tab"):
+            self.after(0, app._refresh_services_tab)
+        for record in service.records.values():
+            if record.status == "Failed":
+                log(f"HTTP CONNECT proxy failed: {record.error}")
+
+    def _stop_http_forwarding(self):
+        service = self._http_forwarding_service
+        if service is None:
+            return
+        active_ids = service.active_rule_ids()
+        service.stop_all()
+        if self._session_controller is not None and self.session_id is not None:
+            for rule_id in active_ids:
+                self._session_controller.unregister_tunnel(self.session_id, rule_id)
+        app = self.winfo_toplevel()
+        if hasattr(app, "_http_forwarding_services") and self.session_id:
+            if app._http_forwarding_services.get(self.session_id) is service:
+                app._http_forwarding_services.pop(self.session_id, None)
+        if hasattr(app, "_refresh_services_tab"):
+            try:
+                self.after(0, app._refresh_services_tab)
+            except (RuntimeError, tk.TclError):
+                pass
+        self._http_forwarding_service = None
+
+    def _session_profile_snapshot(self) -> dict:
+        if self._session_controller is not None and self.session_id:
+            record = self._session_controller.get(self.session_id)
+            if record is not None:
+                return record.profile_snapshot
+        return self._entry
+
+    def _start_x11_forwarding(self) -> None:
+        """Capture X11 policy once, after authentication, for this session."""
+        if not self.session_id:
+            return
+        if self._x11_forwarding_service is not None and not self._x11_forwarding_service.closed:
+            return
+        snapshot = self._session_profile_snapshot()
+        self._x11_forwarding_service = X11ForwardingSession(
+            self.session_id,
+            snapshot.get("terminal_options", {}),
+        )
+        app = self.winfo_toplevel()
+        if hasattr(app, "_x11_forwarding_services"):
+            app._x11_forwarding_services[self.session_id] = self._x11_forwarding_service
+        if hasattr(app, "_refresh_services_tab"):
+            self.after(0, app._refresh_services_tab)
+
+    def _stop_x11_forwarding(self) -> None:
+        service = self._x11_forwarding_service
+        if service is None:
+            return
+        service.close()
+        app = self.winfo_toplevel()
+        if hasattr(app, "_x11_forwarding_services") and self.session_id:
+            if app._x11_forwarding_services.get(self.session_id) is service:
+                app._x11_forwarding_services.pop(self.session_id, None)
+        if hasattr(app, "_refresh_services_tab"):
+            try:
+                self.after(0, app._refresh_services_tab)
+            except (RuntimeError, tk.TclError):
+                pass
+        self._x11_forwarding_service = None
 
     def _run_startup_command(self, command, generation):
         if not command.strip() or generation != self._session_generation or not self._client:
@@ -4605,12 +5274,79 @@ class ConnectionTab(tk.Frame):
         threading.Thread(target=worker, daemon=True, name="sshvault-startup-command").start()
 
     def _attach_shell(self, terminal: TerminalWidget):
+        snapshot = self._session_profile_snapshot()
+        if self._vte_availability.available and self._native_terminal_backend.open_terminal_tab(snapshot):
+            if (
+                self._session_controller is not None
+                and self.session_id
+                and self._native_terminal_backend.last_terminal_id
+            ):
+                self._session_controller.register_terminal(
+                    self.session_id, self._native_terminal_backend.last_terminal_id
+                )
+            self._native_vte_ready = True
+            self._terminal_backend_status.set(self._native_terminal_backend.status)
+            terminal.write("[Native VTE terminal opened in its own window]\n", "info")
+            return
         if not self._client:
             return
-        channel = self._client.invoke_shell(term="xterm-256color", width=terminal._cols, height=terminal._rows)
+        x11 = self._x11_forwarding_service
+        runtime = ssh_runtime_preferences(snapshot)
+        if (x11 is None or not x11.enabled) and not runtime.agent_forwarding:
+            channel = self._client.invoke_shell(
+                term="xterm-256color",
+                width=terminal._cols,
+                height=terminal._rows,
+            )
+            terminal.attach_channel(channel)
+            return
+        transport = self._client.get_transport()
+        if transport is None:
+            terminal.write("[x11] X11 forwarding request failed.\n", "err")
+            return
+        channel = transport.open_session()
+        if x11 is not None and x11.enabled and not x11.request_for_channel(channel):
+            terminal.write(f"[x11] {x11.error}\n", "err")
+            log(x11.error)
+        if runtime.agent_forwarding:
+            try:
+                handler = request_agent_forwarding(channel, snapshot)
+            except ProfileError as exc:
+                terminal.write(f"[agent] {exc}\n", "err")
+                log(str(exc))
+            else:
+                if handler is not None:
+                    self._agent_forwarding_handlers.append(handler)
+        terminal_options = snapshot.get("terminal_options", {})
+        terminal_type = str(terminal_options.get("terminal_type", "xterm-256color"))
+        channel.get_pty(term=terminal_type, width=terminal._cols, height=terminal._rows)
+        channel.invoke_shell()
         terminal.attach_channel(channel)
 
     def _open_terminal(self):
+        # Native sessions are separate GTK windows: terminal bytes never pass
+        # through Tk, Paramiko, or the legacy pyte renderer.
+        if self._vte_availability.available:
+            if self._entry.get("auth_method") == "password":
+                messagebox.showinfo(
+                    "Native VTE terminal", "OpenSSH will request the password interactively in the terminal."
+                )
+            if self._native_terminal_backend.open_terminal_tab(self._session_profile_snapshot()):
+                if (
+                    self._session_controller is not None
+                    and self.session_id
+                    and self._native_terminal_backend.last_terminal_id
+                ):
+                    self._session_controller.register_terminal(
+                        self.session_id, self._native_terminal_backend.last_terminal_id
+                    )
+                self._native_vte_ready = True
+                self._terminal_backend_status.set(self._native_terminal_backend.status)
+                return
+            self._native_vte_ready = False
+            self._terminal_backend_status.set(self._native_terminal_backend.status)
+            self._terminal_backend_label.configure(fg=YELLOW)
+            messagebox.showwarning("Native VTE terminal", self._native_terminal_backend.status)
         if not self._client:
             messagebox.showerror("Terminal", "Not connected.")
             return
@@ -4656,8 +5392,12 @@ class ConnectionTab(tk.Frame):
 
     def _on_error(self, err):
         message = friendly_connection_error(err)
+        self._session_transition(SessionLifecycleState.FAILED, message)
         self._set_workspace_status("failed", message)
         self._terminal.write(f"[error] {message}\n", "err")
+        app = self.winfo_toplevel()
+        if hasattr(app, "_refresh_sessions"):
+            self.after(0, app._refresh_sessions)
         log(f"Error: {err}")
 
     def _disconnect(self, manual: bool = True):
@@ -4666,7 +5406,13 @@ class ConnectionTab(tk.Frame):
         if manual:
             self._reconnect_controller.cancel()
         self._set_workspace_status("disconnecting")
+        self._session_transition(SessionLifecycleState.DISCONNECTING, "Disconnecting session.")
         self._session_generation += 1
+        self._stop_local_forwarding()
+        self._stop_remote_forwarding()
+        self._stop_dynamic_forwarding()
+        self._stop_http_forwarding()
+        self._stop_x11_forwarding()
         self._sftp_opening = False
         sftp_thread = self._sftp_open_thread
         if sftp_thread is not None and sftp_thread is not threading.current_thread() and sftp_thread.is_alive():
@@ -4675,6 +5421,8 @@ class ConnectionTab(tk.Frame):
         self._cleanup_connection_panels()
         for terminal in list(self._terminals):
             terminal.detach()
+        self._native_terminal_backend.close()
+        self._agent_forwarding_handlers.clear()
         # A proxied destination belongs to its context; that context closes
         # destination, channel, and jump client exactly once in order.
         if self._client and not self._proxy_context:
@@ -4688,7 +5436,17 @@ class ConnectionTab(tk.Frame):
                 log(f"Proxy cleanup failed: {error}")
             self._proxy_context = None
         self._set_workspace_status("disconnected")
+        if self._session_controller is not None and self.session_id is not None:
+            try:
+                self._session_controller.disconnect(
+                    self.session_id, "Manual disconnect" if manual else "Reconnect cleanup"
+                )
+            except ValueError:
+                pass
         self._terminal.write("\n[disconnected]\n", "info")
+        app = self.winfo_toplevel()
+        if hasattr(app, "_refresh_sessions"):
+            self.after(0, app._refresh_sessions)
 
     def _cleanup_connection_panels(self):
         """Release every session-bound panel; one cleanup error never stops others."""
@@ -5549,6 +6307,7 @@ class SettingsDialog(tk.Toplevel):
             "maximum_sftp_transfers": 3,
             "sftp_chunk_size": 1048576,
             "show_transfer_manager_on_start": True,
+            "restore_previous_sessions_on_start": False,
         }
         try:
             if SETTINGS_FILE.exists():
@@ -5572,6 +6331,7 @@ class SettingsDialog(tk.Toplevel):
                 "confirm_delete",
                 "confirm_overwrite",
                 "show_transfer_manager_on_start",
+                "restore_previous_sessions_on_start",
             )
         }
         self._appearance = AppearanceState.from_settings(values)
@@ -5626,6 +6386,7 @@ class SettingsDialog(tk.Toplevel):
                 ("confirm_delete", "Confirm delete"),
                 ("confirm_overwrite", "Confirm overwrite"),
                 ("show_transfer_manager_on_start", "Show Transfer Manager when a transfer starts"),
+                ("restore_previous_sessions_on_start", "Restore previous sessions on startup"),
             ),
             start=appearance_row + 3,
         ):
@@ -5759,20 +6520,42 @@ class SSHVaultApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SSHVault")
-        self.configure(bg=BG)
-        self.geometry("1200x750")
-        self.minsize(900, 550)
+        self.configure(bg=OPENING_BG)
+        self.geometry(f"{CONTROLLER_DEFAULT_GEOMETRY[0]}x{CONTROLLER_DEFAULT_GEOMETRY[1]}")
+        self.minsize(*CONTROLLER_MINIMUM_GEOMETRY)
         self._apply_style()
         self._runtime_settings = self._load_settings()
         self._apply_appearance(self._runtime_settings)
         self._vault = Vault()
+        # This helper is deliberately application-scoped: one process can own
+        # many VTE windows/tabs, none of which is tied to a Paramiko session.
+        self._native_terminal_backend = VTETerminalBackend(detect_vte_backend())
+        self._session_controller = SessionController()
+        self.selected_profile_id: str | None = None
+        self.loaded_profile_snapshot: dict | None = None
+        self.working_profile: dict | None = None
+        self.profile_dirty = False
+        self.profile_validation_errors: list[str] = []
+        # Transitional UI lookup only.  SessionController owns identity/state.
         self._conn_tabs: dict[str, ConnectionTab] = {}
         self._session_serial = 0
+        self._sftp_views: dict[str, tk.Toplevel] = {}
+        self._sftp_browser_clients = SFTPBrowserRegistry()
+        self._sftp_view_state_callbacks = {}
+        self._sftp_transfer_schedulers = {}
+        self._sftp_transfer_status_callbacks = {}
+        self._sftp_transfer_queue_callbacks = {}
+        self._local_forwarding_services = {}
+        self._remote_forwarding_services = {}
+        self._dynamic_forwarding_services = {}
+        self._http_forwarding_services = {}
+        self._x11_forwarding_services = {}
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_menu()
         self._build_ui()
         self._build_statusbar()
         self._restore_session()
+        self.after_idle(self._apply_configured_startup)
 
     def _load_settings(self):
         try:
@@ -5783,6 +6566,27 @@ class SSHVaultApp(tk.Tk):
             )
         except (OSError, json.JSONDecodeError, ProfileError):
             return validate_settings({})
+
+    def _save_runtime_settings(self) -> None:
+        """Persist application-only choices without ever touching profiles."""
+        try:
+            self._runtime_settings = validate_settings(self._runtime_settings)
+            atomic_json_write(SETTINGS_FILE, self._runtime_settings)
+        except (OSError, ProfileError):
+            return
+
+    def _apply_configured_startup(self) -> None:
+        """Apply explicit startup choices after the passive shell is ready."""
+        last_profile_id = str(self._runtime_settings.get("last_selected_profile_id", ""))
+        if self._runtime_settings.get("load_last_selected_profile", True) and self._tree.exists(last_profile_id):
+            self._tree.selection_set(last_profile_id)
+            self._tree.focus(last_profile_id)
+            self._on_profile_selection()
+        if self._runtime_settings.get("restore_previous_sessions_on_start", False):
+            self._restore_previous_sessions(startup=True)
+            return
+        if self._runtime_settings.get("login_automatically_on_start", False):
+            self._connect()
 
     def _apply_appearance(self, settings):
         appearance = AppearanceState.from_settings(settings)
@@ -5804,6 +6608,7 @@ class SSHVaultApp(tk.Tk):
         file_menu.add_command(label="Import from ~/.ssh/config", command=self._import_ssh_config)
         file_menu.add_command(label="Create Profile Backup", command=self._create_profile_backup)
         file_menu.add_command(label="Restore Profile Backup", command=self._restore_profile_backup)
+        file_menu.add_command(label="Restore Previous Sessions", command=self._restore_previous_sessions)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_close)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -5841,17 +6646,11 @@ class SSHVaultApp(tk.Tk):
         )
 
     def _build_statusbar(self):
-        bar = tk.Frame(self, bg=PANEL, height=24)
-        bar.pack(fill="x", side="bottom")
-        bar.pack_propagate(False)
+        # The controller strip is the sole visible status location.  Keep
+        # these variables for existing non-visual status callbacks.
+        self._application_statusbar = None
         self._status_var = tk.StringVar(value="Ready")
-        tk.Label(bar, textvariable=self._status_var, bg=PANEL, fg=MUTED, font=FONT, anchor="w").pack(
-            side="left", padx=8
-        )
         self._profile_count_var = tk.StringVar()
-        tk.Label(bar, textvariable=self._profile_count_var, bg=PANEL, fg=MUTED, font=FONT, anchor="e").pack(
-            side="right", padx=8
-        )
         self._update_statusbar()
 
     def _update_statusbar(self):
@@ -5894,132 +6693,1279 @@ class SSHVaultApp(tk.Tk):
             foreground=[("selected", "#ffffff"), ("!selected", TEXT)],
         )
         s.configure("TProgressbar", troughcolor=PANEL, background=ACCENT)
+        s.configure("Controller.TFrame", background=BG)
+        s.configure("Toolbar.TFrame", background=PANEL)
+        s.configure("Compact.TButton", padding=(7, 2))
+        s.configure("Primary.TButton", padding=(9, 2))
+        s.configure("Rail.TButton", padding=(7, 5), anchor="w")
+        s.configure("Opening.TNotebook", background=OPENING_BG, borderwidth=1)
+        s.configure(
+            "Opening.TNotebook.Tab",
+            background="#dedede",
+            foreground="#202020",
+            padding=(10, 3),
+            font=FONT,
+        )
+        s.map(
+            "Opening.TNotebook.Tab",
+            background=[("selected", OPENING_PANEL)],
+            foreground=[("selected", "#101010")],
+        )
+        s.configure("Status.TLabel", background=PANEL, foreground=TEXT)
+        s.configure("Muted.TLabel", background=BG, foreground=MUTED)
+        s.configure("Section.TLabelframe", padding=SECTION_PADDING)
+        s.configure("Section.TLabelframe.Label", font=FONT_B)
+        s.configure("ConnectionLog.TFrame", background=OPENING_PANEL)
 
     def _build_ui(self):
-        pane = ttk.PanedWindow(self, orient="horizontal")
-        pane.pack(fill="both", expand=True, padx=8, pady=(8, 0))
-
-        sidebar = tk.Frame(pane, bg=PANEL, width=390)
-        sidebar.pack_propagate(False)
-        header = tk.Frame(sidebar, bg=PANEL)
-        header.pack(fill="x", padx=16, pady=(16, 8))
-        tk.Label(header, text="SSHVault", bg=PANEL, fg=TEXT, font=("TkDefaultFont", 15, "bold")).pack(anchor="w")
-        tk.Label(header, text="Saved SSH connections", bg=PANEL, fg=MUTED, font=FONT).pack(anchor="w", pady=(2, 0))
-        self._session_count_var = tk.StringVar(value="0 saved")
-        tk.Label(header, textvariable=self._session_count_var, bg=PANEL, fg=MUTED, font=("TkDefaultFont", 9)).pack(
-            anchor="w", pady=(3, 0)
-        )
-        self._profile_selection_note = tk.StringVar()
-        tk.Label(
-            header,
-            textvariable=self._profile_selection_note,
-            bg=PANEL,
-            fg=YELLOW,
-            font=("TkDefaultFont", 8),
-            anchor="w",
-            wraplength=345,
-        ).pack(anchor="w", pady=(4, 0))
-
-        search_row = tk.Frame(sidebar, bg=PANEL)
-        search_row.pack(fill="x", padx=16, pady=(4, 8))
+        self._tree = _ProfileSelectionModel()
         self._search_var = tk.StringVar()
-        self._search_var.trace_add("write", lambda *_: self._refresh_list())
-        self._search_entry = ttk.Entry(search_row, textvariable=self._search_var)
-        self._search_entry.pack(side="left", fill="x", expand=True)
-        ttk.Button(search_row, text="Clear", width=6, command=self._clear_search).pack(side="left", padx=(6, 0))
-        sort_row = tk.Frame(sidebar, bg=PANEL)
-        sort_row.pack(fill="x", padx=16, pady=(0, 10))
-        tk.Label(sort_row, text="Sort", bg=PANEL, fg=MUTED, font=FONT).pack(side="left")
         self._sort_var = tk.StringVar(value="Name")
-        self._sort_var.trace_add("write", lambda *_: self._refresh_list())
-        ttk.Combobox(
-            sort_row, textvariable=self._sort_var, values=("Name", "Hostname", "Username"), state="readonly", width=15
-        ).pack(side="right")
+        self._profile_selection_note = tk.StringVar()
+        self._profile_choice_ids: dict[str, str] = {}
+        self._profile_choice = tk.StringVar()
+        self._profile_heading = tk.StringVar(value="Profile: New profile")
+        self._conn_notebook = _ConnectionViewRegistry()
+        self._connection_view_host: tk.Frame | None = None
 
-        tree_frame = tk.Frame(sidebar, bg=PANEL)
-        tree_frame.pack(fill="both", expand=True, padx=16)
-        columns = ("profile", "details", "auth", "tags")
-        self._tree = ttk.Treeview(
-            tree_frame, columns=columns, show="headings", selectmode="browse", style="Profile.Treeview"
-        )
-        for column, label, width in (
-            ("profile", "Profile", 145),
-            ("details", "User / host", 170),
-            ("auth", "Auth", 78),
-            ("tags", "Tags", 120),
-        ):
-            self._tree.heading(column, text=label)
-            self._tree.column(column, width=width, minwidth=65, stretch=column in {"profile", "details", "tags"})
-        scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self._tree.yview)
-        self._tree.configure(yscrollcommand=scroll.set)
-        self._tree.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-        self._tree.bind("<<TreeviewSelect>>", self._on_profile_selection)
-        self._tree.bind("<Double-Button-1>", lambda _event: self._connect())
-        self._tree.bind("<Return>", lambda _event: self._connect())
-        self._tree.bind("<Button-3>", self._show_profile_context_menu)
-        self._empty_profiles = tk.Frame(tree_frame, bg=PANEL)
-        self._empty_message = tk.StringVar()
+        heading = tk.Frame(self, bg=OPENING_PANEL, height=34, bd=1, relief="groove")
+        self._profile_heading_frame = heading
+        heading.pack(fill="x", side="top", padx=5, pady=(5, 0))
+        heading.pack_propagate(False)
         tk.Label(
-            self._empty_profiles,
-            textvariable=self._empty_message,
-            bg=PANEL,
-            fg=MUTED,
+            heading,
+            textvariable=self._profile_heading,
+            bg=OPENING_PANEL,
+            fg="#202020",
+            font=("Sans", 11, "bold"),
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True, padx=8)
+
+        bottom = tk.Frame(self, bg=OPENING_PANEL, height=42, bd=1, relief="groove")
+        self._controller_bottom_bar = bottom
+        bottom.pack(side="bottom", fill="x", padx=5, pady=(3, 5))
+        bottom.pack_propagate(False)
+        self._controller_status = tk.StringVar(value="Disconnected")
+        self._connection_action_button = ttk.Button(
+            bottom, text="Log in", command=self._toggle_connection_action, style="Primary.TButton"
+        )
+        self._connection_action_button.pack(side="left", padx=(PROFILE_RAIL_WIDTH + 10, 4), pady=6)
+        self._exit_button = ttk.Button(bottom, text="Exit", command=self._on_close, style="Compact.TButton")
+        self._exit_button.pack(side="right", padx=8, pady=6)
+        self._controller_status_label = tk.Label(
+            bottom,
+            textvariable=self._controller_status,
+            bg=OPENING_PANEL,
+            fg="#404040",
             font=FONT,
-            justify="center",
-            wraplength=310,
-        ).pack(pady=(38, 10), padx=20)
-        ttk.Button(self._empty_profiles, text="Add Profile", command=self._add_entry).pack()
+            anchor="e",
+        )
+        self._controller_status_label.pack(side="right", padx=8)
 
-        actions = tk.Frame(sidebar, bg=PANEL)
-        actions.pack(fill="x", padx=16, pady=(12, 16))
-        self._add_btn = ttk.Button(actions, text="Add", command=self._add_entry)
-        self._add_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=2)
-        self._edit_btn = ttk.Button(actions, text="Edit", command=self._edit_entry)
-        self._edit_btn.grid(row=0, column=1, sticky="ew", padx=4, pady=2)
-        self._duplicate_btn = ttk.Button(actions, text="Duplicate", command=self._duplicate_entry)
-        self._duplicate_btn.grid(row=0, column=2, sticky="ew", padx=(4, 0), pady=2)
-        self._delete_btn = ttk.Button(actions, text="Delete", command=self._delete_entry)
-        self._delete_btn.grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=2)
-        self._import_btn = ttk.Button(actions, text="Import", command=self._import_profiles_preview)
-        self._import_btn.grid(row=1, column=1, sticky="ew", padx=4, pady=2)
-        self._export_btn = ttk.Button(actions, text="Export Selected", command=self._export_selected)
-        self._export_btn.grid(row=1, column=2, sticky="ew", padx=(4, 0), pady=2)
-        self._export_all_btn = ttk.Button(actions, text="Export All", command=self._export_all)
-        self._export_all_btn.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-        self._backup_btn = ttk.Button(actions, text="Create Backup", command=self._create_profile_backup)
-        self._backup_btn.grid(row=3, column=0, sticky="ew", padx=(0, 4), pady=(6, 0))
-        self._restore_btn = ttk.Button(actions, text="Restore Backup", command=self._restore_profile_backup)
-        self._restore_btn.grid(row=3, column=1, columnspan=2, sticky="ew", padx=(4, 0), pady=(6, 0))
-        self._connect_btn = ttk.Button(actions, text="Connect", command=self._connect)
-        self._connect_btn.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        for column in range(3):
-            actions.columnconfigure(column, weight=1)
-        pane.add(sidebar, weight=0)
+        body = tk.Frame(self, bg=OPENING_BG)
+        self._opening_body = body
+        body.pack(fill="both", expand=True, padx=5, pady=(3, 0))
 
-        # right notebook
-        right = tk.Frame(pane, bg=BG)
-        self._conn_notebook = ttk.Notebook(right)
-        self._conn_notebook.pack(fill="both", expand=True)
-        self._conn_notebook.bind("<Button-3>", self._show_connection_tab_menu)
-        self._conn_notebook.bind("<Button-1>", self._start_connection_tab_drag)
-        self._conn_notebook.bind("<B1-Motion>", self._drag_connection_tab)
-        self._conn_notebook.bind("<ButtonRelease-1>", self._finish_connection_tab_drag)
-        self._dragged_connection_tab = None
-        self._connection_tab_menu = tk.Menu(self, tearoff=0)
-        pane.add(right, weight=1)
+        rail = tk.Frame(body, bg=OPENING_PANEL, width=PROFILE_RAIL_WIDTH, bd=1, relief="groove")
+        self._profile_rail = rail
+        rail.pack(side="left", fill="y", padx=(0, 5))
+        rail.pack_propagate(False)
+        tk.Label(
+            rail,
+            text="Profile",
+            bg=OPENING_PANEL,
+            fg="#303030",
+            font=FONT_B,
+            anchor="w",
+        ).pack(fill="x", padx=8, pady=(9, 5))
 
-        self._profile_context_menu = tk.Menu(self, tearoff=0)
-        for label, command in (
-            ("Connect", self._connect),
-            ("Edit", self._edit_entry),
-            ("Duplicate", self._duplicate_entry),
-            ("Delete", self._delete_entry),
-            ("Export selected profile", self._export_selected),
-        ):
-            self._profile_context_menu.add_command(label=label, command=command)
+        rail_commands = {
+            "Load profile": ("↥", self._show_load_profile_menu),
+            "Save profile as": ("▣", self._save_as_working_profile),
+            "New profile": ("＋", self._new_profile_from_rail),
+            "Reset profile": ("↶", self._reset_profile_from_rail),
+        }
+        self._toolbar_buttons = {}
+        for label in CONTROLLER_PROFILE_ACTIONS:
+            icon, command = rail_commands[label]
+            button = ttk.Button(rail, text=f"{icon}  {label}", command=command, style="Rail.TButton")
+            button.pack(fill="x", padx=7, pady=3)
+            self._toolbar_buttons[label] = button
+
+        right = tk.Frame(body, bg=OPENING_BG)
+        self._controller_workspace = right
+        right.pack(side="left", fill="both", expand=True)
+        self._control_notebook = ttk.Notebook(right, style="Opening.TNotebook")
+        self._control_pages = {}
+        for name in CONTROLLER_CONFIG_TABS:
+            page = tk.Frame(self._control_notebook, bg=OPENING_BG)
+            self._control_notebook.add(page, text=name)
+            self._control_pages[name] = page
+        self._build_login_tab(self._control_pages["Login"])
+        self._build_options_tab(self._control_pages["Options"])
+        self._build_terminal_tab(self._control_pages["Terminal"])
+        self._build_sftp_tab(self._control_pages["SFTP"])
+        self._build_services_tab(self._control_pages["Services"])
+        self._build_ssh_tab(self._control_pages["SSH"])
+
+        controller_log = ttk.Frame(right, style="ConnectionLog.TFrame")
+        self._controller_log_frame = controller_log
+        tk.Label(controller_log, text="Connection log", bg=OPENING_PANEL, fg="#202020", font=FONT_B).pack(
+            anchor="w", padx=8, pady=(4, 0)
+        )
+        log_body = tk.Frame(controller_log, bg=OPENING_PANEL)
+        log_body.pack(fill="x", padx=8, pady=4)
+        self._controller_log = tk.Text(
+            log_body,
+            height=9,
+            bg="#ffffff",
+            fg="#202020",
+            insertbackground="#202020",
+            font=MONO,
+            state="disabled",
+            relief="sunken",
+            bd=1,
+        )
+        log_scroll = ttk.Scrollbar(log_body, orient="vertical", command=self._controller_log.yview)
+        self._controller_log.configure(yscrollcommand=log_scroll.set)
+        self._controller_log.pack(side="left", fill="both", expand=True)
+        log_scroll.pack(side="right", fill="y")
+        controller_log.pack(side="bottom", fill="x", padx=3, pady=(3, 0))
+        self._control_notebook.pack(side="top", fill="both", expand=True, padx=3)
+
         self._bind_profile_shortcuts()
         self._refresh_list()
+        self._refresh_sessions()
+
+    def _refresh_profile_heading(self) -> None:
+        profile = self.working_profile or {}
+        name = str(profile.get("name") or profile.get("host") or "New profile")
+        changed = " (changed)" if self.profile_dirty else ""
+        if hasattr(self, "_profile_heading"):
+            self._profile_heading.set(f"Profile: {name}{changed}")
+        self.title(f"SSHVault — {name}")
+
+    def _select_profile_from_rail(self, profile_id: str) -> bool:
+        def select() -> bool:
+            if not self._tree.exists(profile_id):
+                return False
+            self._tree.selection_set(profile_id)
+            self._tree.focus(profile_id)
+            self._on_profile_selection()
+            return True
+
+        return self.resolve_unsaved_profile_changes(select)
+
+    def _show_load_profile_menu(self) -> None:
+        menu = tk.Menu(self, tearoff=0)
+        items = self._profile_dropdown_items(self._vault.entries)
+        if not items:
+            menu.add_command(label="No saved profiles", state="disabled")
+        for label, profile_id in items:
+            menu.add_command(
+                label=label,
+                command=lambda selected_id=profile_id: self._select_profile_from_rail(selected_id),
+            )
+        button = self._toolbar_buttons["Load profile"]
+        try:
+            menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def _reset_profile_from_rail(self) -> bool:
+        profile_id = self.selected_profile_id
+        if not profile_id:
+            self.clear_working_profile()
+            self._refresh_profile_heading()
+            return True
+
+        def reset() -> bool:
+            loaded = self.load_profile_working_copy(profile_id)
+            self._refresh_login_tab()
+            self._refresh_profile_heading()
+            self._refresh_action_states()
+            return loaded
+
+        return self.resolve_unsaved_profile_changes(reset)
+
+    def _new_profile_from_rail(self) -> bool:
+        def create() -> bool:
+            profile = {
+                "name": "",
+                "host": "",
+                "port": 22,
+                "user": "",
+                "auth_method": "agent",
+                "key_path": "",
+                "proxy_jump": "",
+                "tags": [],
+                "notes": "",
+            }
+            profile.update(default_profile_sections(profile))
+            self._tree.selection_set("")
+            self.selected_profile_id = None
+            self.loaded_profile_snapshot = None
+            self.working_profile = profile
+            self.profile_dirty = True
+            self.profile_validation_errors = []
+            self._refresh_login_tab()
+            self._refresh_options_tab()
+            self._refresh_terminal_tab()
+            self._refresh_sftp_tab()
+            self._refresh_services_tab()
+            self._refresh_ssh_tab()
+            self._refresh_profile_heading()
+            self._refresh_action_states()
+            return True
+
+        return self.resolve_unsaved_profile_changes(create)
+
+    def _toggle_connection_action(self) -> None:
+        record = self._selected_session_record()
+        if record and record.state not in {
+            SessionLifecycleState.DISCONNECTED,
+            SessionLifecycleState.FAILED,
+            SessionLifecycleState.CANCELLED,
+        }:
+            self._logout_selected_session()
+        else:
+            self._connect()
+
+    def _ensure_connection_view_host(self) -> tk.Frame:
+        if self._connection_view_host is None or not self._connection_view_host.winfo_exists():
+            self._connection_view_host = tk.Frame(self)
+        return self._connection_view_host
+
+    def _select_profile_from_dropdown(self, _event=None):
+        profile_id = self._profile_choice_ids.get(self._profile_choice.get(), "")
+        if self._tree.exists(profile_id):
+            self._tree.selection_set(profile_id)
+            self._tree.focus(profile_id)
+            self._on_profile_selection()
+
+    def _build_login_tab(self, page):
+        for child in page.winfo_children():
+            child.destroy()
+        self._login_vars = {
+            key: tk.StringVar()
+            for key in (
+                "host",
+                "port",
+                "user",
+                "auth_method",
+                "key_path",
+                "proxy_type",
+                "proxy_host",
+                "proxy_port",
+                "proxy_user",
+            )
+        }
+        groups = []
+        for title in ("Server", "Authentication", "Host Key", "Proxy"):
+            group = ttk.LabelFrame(page, text=title, padding=6)
+            groups.append(group)
+        groups[0].grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        groups[3].grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        groups[2].grid(row=2, column=0, sticky="nsew", padx=4, pady=4)
+        groups[1].grid(row=0, column=1, rowspan=3, sticky="nsew", padx=4, pady=4)
+        page.columnconfigure((0, 1), weight=1)
+        page.rowconfigure(2, weight=1)
+        for row, (label, key) in enumerate((("Host", "host"), ("Port", "port"))):
+            ttk.Label(groups[0], text=label).grid(row=row, column=0, sticky="w")
+            entry = ttk.Entry(groups[0], textvariable=self._login_vars[key], width=36)
+            entry.grid(row=row, column=1, sticky="ew")
+            self._login_vars[key].trace_add("write", lambda *_args, name=key: self._login_field_changed(name))
+        ttk.Label(groups[1], text="Username").grid(row=0, column=0, sticky="w")
+        username = ttk.Entry(groups[1], textvariable=self._login_vars["user"], width=36)
+        username.grid(row=0, column=1, sticky="ew")
+        self._login_vars["user"].trace_add("write", lambda *_args: self._login_field_changed("user"))
+        ttk.Label(groups[1], text="Initial method").grid(row=1, column=0, sticky="w")
+        auth = ttk.Combobox(
+            groups[1],
+            textvariable=self._login_vars["auth_method"],
+            state="readonly",
+            values=("Automatic", "SSH Agent", "Private Key", "Password", "Keyboard Interactive", "OpenSSH Config"),
+        )
+        auth.grid(row=1, column=1, sticky="ew")
+        self._auth_summary = ttk.Label(groups[1], text="Automatic authentication uses existing safe defaults.")
+        self._auth_summary.grid(row=2, column=1, sticky="w")
+        self._password_label = ttk.Label(groups[1], text="Passphrase / password")
+        self._password_label.grid(row=2, column=0, sticky="w")
+        self._password_entry = ttk.Entry(groups[1], show="•")
+        self._password_entry.grid(row=2, column=1, sticky="ew")
+        self._key_label = ttk.Label(groups[1], text="SSH key / Agent")
+        self._key_label.grid(row=3, column=0, sticky="w")
+        self._key_entry = ttk.Entry(groups[1], textvariable=self._login_vars["key_path"])
+        self._key_entry.grid(row=3, column=1, sticky="ew")
+        self._manage_keys_button = ttk.Button(groups[1], text="Manage Keys", command=self._keygen)
+        self._manage_keys_button.grid(row=3, column=2)
+        for row, label in enumerate(("Host-key policy", "Known-hosts source", "Fingerprint")):
+            ttk.Label(groups[2], text=label).grid(row=row, column=0, sticky="w")
+            ttk.Label(groups[2], text="Not checked" if label == "Fingerprint" else "System defaults").grid(
+                row=row, column=1, sticky="w"
+            )
+        ttk.Button(groups[2], text="Manage Host Keys", command=self._open_host_keys).grid(row=3, column=1, sticky="w")
+        for row, (label, key) in enumerate(
+            (
+                ("Proxy type", "proxy_type"),
+                ("Proxy host", "proxy_host"),
+                ("Proxy port", "proxy_port"),
+                ("Proxy username", "proxy_user"),
+            )
+        ):
+            ttk.Label(groups[3], text=label).grid(row=row, column=0, sticky="w")
+            widget = (
+                ttk.Combobox(
+                    groups[3], textvariable=self._login_vars[key], values=("None", "SSH ProxyJump"), state="readonly"
+                )
+                if key == "proxy_type"
+                else ttk.Entry(groups[3], textvariable=self._login_vars[key])
+            )
+            widget.grid(row=row, column=1, sticky="ew")
+        self._login_vars["proxy_type"].trace_add("write", lambda *_: self._login_field_changed("proxy_jump"))
+        self._login_vars["auth_method"].trace_add("write", lambda *_: self._sync_login_visibility())
+        self._proxy_widgets = [groups[3].grid_slaves(row=row, column=1)[0] for row in (1, 2, 3)]
+        self._sync_login_visibility()
+
+    def _build_options_tab(self, page):
+        """Build the compact, working-copy backed Options tab.
+
+        The checkboxes deliberately only edit configuration state.  Runtime
+        actions are consumed from the immutable session snapshot after an SSH
+        connection reaches CONNECTED.
+        """
+        for child in page.winfo_children():
+            child.destroy()
+        self._profile_option_vars = {
+            "open_terminal": tk.BooleanVar(value=False),
+            "open_sftp": tk.BooleanVar(value=False),
+            "start_enabled_services": tk.BooleanVar(value=False),
+            "run_startup_commands": tk.BooleanVar(value=False),
+            "close_terminal_windows": tk.BooleanVar(value=False),
+            "close_sftp_windows": tk.BooleanVar(value=False),
+            "stop_enabled_services": tk.BooleanVar(value=True),
+            "ask_before_cancelling_active_transfers": tk.BooleanVar(value=True),
+        }
+        self._application_option_vars = {
+            "load_last_selected_profile": tk.BooleanVar(
+                value=bool(self._runtime_settings.get("load_last_selected_profile", True))
+            ),
+            "login_automatically_on_start": tk.BooleanVar(
+                value=bool(self._runtime_settings.get("login_automatically_on_start", False))
+            ),
+            "restore_previous_sessions_on_start": tk.BooleanVar(
+                value=bool(self._runtime_settings.get("restore_previous_sessions_on_start", False))
+            ),
+            "restore_window_position": tk.BooleanVar(
+                value=bool(self._runtime_settings.get("restore_window_position", True))
+            ),
+        }
+        groups = []
+        for column, title in enumerate(OPTIONS_GROUPS):
+            group = ttk.LabelFrame(page, text=title, padding=6)
+            group.grid(row=0, column=column, sticky="nsew", padx=4, pady=4)
+            groups.append(group)
+            page.columnconfigure(column, weight=1)
+        for row, (label, key) in enumerate(
+            (
+                (POST_LOGIN_OPTION_LABELS[0], "open_terminal"),
+                (POST_LOGIN_OPTION_LABELS[1], "open_sftp"),
+                (POST_LOGIN_OPTION_LABELS[2], "start_enabled_services"),
+                (POST_LOGIN_OPTION_LABELS[3], "run_startup_commands"),
+            )
+        ):
+            ttk.Checkbutton(groups[0], text=label, variable=self._profile_option_vars[key]).grid(
+                row=row, column=0, sticky="w"
+            )
+            self._profile_option_vars[key].trace_add(
+                "write", lambda *_args, name=key: self._profile_option_changed(name)
+            )
+        ttk.Label(page, text="Changes to connection options apply to the next login.", style="Muted.TLabel").grid(
+            row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 4)
+        )
+        for row, (label, key) in enumerate(
+            (
+                (APPLICATION_STARTUP_OPTION_LABELS[0], "load_last_selected_profile"),
+                (APPLICATION_STARTUP_OPTION_LABELS[1], "login_automatically_on_start"),
+                (APPLICATION_STARTUP_OPTION_LABELS[2], "restore_previous_sessions_on_start"),
+                (APPLICATION_STARTUP_OPTION_LABELS[3], "restore_window_position"),
+            )
+        ):
+            ttk.Checkbutton(groups[1], text=label, variable=self._application_option_vars[key]).grid(
+                row=row, column=0, sticky="w"
+            )
+            self._application_option_vars[key].trace_add(
+                "write", lambda *_args, name=key: self._application_option_changed(name)
+            )
+        for row, (label, key) in enumerate(
+            (
+                (LOGOUT_OPTION_LABELS[0], "close_terminal_windows"),
+                (LOGOUT_OPTION_LABELS[1], "close_sftp_windows"),
+                (LOGOUT_OPTION_LABELS[2], "stop_enabled_services"),
+                (LOGOUT_OPTION_LABELS[3], "ask_before_cancelling_active_transfers"),
+            )
+        ):
+            ttk.Checkbutton(groups[2], text=label, variable=self._profile_option_vars[key]).grid(
+                row=row, column=0, sticky="w"
+            )
+            self._profile_option_vars[key].trace_add(
+                "write", lambda *_args, name=key: self._profile_option_changed(name)
+            )
+
+    def _profile_option_changed(self, key: str) -> None:
+        if getattr(self, "_options_refreshing", False) or self.working_profile is None:
+            return
+        if key in {"open_terminal", "open_sftp", "start_enabled_services", "run_startup_commands"}:
+            section = dict(self.working_profile.get("launch_preferences", {}))
+            section[key] = bool(self._profile_option_vars[key].get())
+            self.working_profile["launch_preferences"] = section
+        else:
+            section = dict(self.working_profile.get("connection_options", {}))
+            section[key] = bool(self._profile_option_vars[key].get())
+            self.working_profile["connection_options"] = section
+        self.recalculate_profile_dirty()
+        self._validate_working_profile()
+        self._refresh_action_states()
+
+    def _application_option_changed(self, key: str) -> None:
+        if not hasattr(self, "_application_option_vars"):
+            return
+        self._runtime_settings[key] = bool(self._application_option_vars[key].get())
+        self._save_runtime_settings()
+
+    def _refresh_options_tab(self) -> None:
+        if not hasattr(self, "_profile_option_vars"):
+            return
+        self._options_refreshing = True
+        try:
+            profile = self.working_profile or {}
+            launch = profile.get("launch_preferences", {})
+            logout = profile.get("connection_options", {})
+            for key in ("open_terminal", "open_sftp", "start_enabled_services", "run_startup_commands"):
+                self._profile_option_vars[key].set(bool(launch.get(key, False)))
+            for key, default in (
+                ("close_terminal_windows", False),
+                ("close_sftp_windows", False),
+                ("stop_enabled_services", True),
+                ("ask_before_cancelling_active_transfers", True),
+            ):
+                self._profile_option_vars[key].set(bool(logout.get(key, default)))
+        finally:
+            self._options_refreshing = False
+
+    def _build_terminal_tab(self, page):
+        for child in page.winfo_children():
+            child.destroy()
+        self._terminal_option_vars = {
+            "backend": tk.StringVar(value="Automatic"),
+            "terminal_type": tk.StringVar(value="xterm-256color"),
+            "scrollback": tk.StringVar(value="10000"),
+            "bell": tk.StringVar(value="System bell"),
+            "startup_command": tk.StringVar(),
+            "font": tk.StringVar(value="Monospace"),
+            "font_size": tk.StringVar(value="10"),
+            "cursor_shape": tk.StringVar(value="Block"),
+            "cursor_blink": tk.BooleanVar(value=True),
+            "color_theme": tk.StringVar(value="System"),
+            "agent_forwarding": tk.BooleanVar(value=False),
+            "x11_forwarding": tk.BooleanVar(value=False),
+            "close_on_logout": tk.BooleanVar(value=False),
+            "scroll_on_output": tk.BooleanVar(value=False),
+            "scroll_on_keystroke": tk.BooleanVar(value=True),
+        }
+        groups = []
+        for position, title in enumerate(TERMINAL_GROUPS):
+            group = ttk.LabelFrame(page, text=title, padding=6)
+            if position < 2:
+                group.grid(row=0, column=position, sticky="nsew", padx=4, pady=4)
+            else:
+                group.grid(row=position - 1, column=0, columnspan=2, sticky="nsew", padx=4, pady=4)
+            groups.append(group)
+        page.columnconfigure((0, 1), weight=1)
+        page.rowconfigure(1, weight=1)
+        emulation = (
+            ("Backend", "backend", TERMINAL_BACKENDS),
+            ("Terminal type", "terminal_type", None),
+            ("Scrollback lines", "scrollback", None),
+            ("Bell", "bell", TERMINAL_BELLS),
+            ("Initial command", "startup_command", None),
+        )
+        for row, (label, key, values) in enumerate(emulation):
+            ttk.Label(groups[0], text=label).grid(row=row, column=0, sticky="w")
+            widget = (
+                ttk.Combobox(groups[0], textvariable=self._terminal_option_vars[key], values=values, state="readonly")
+                if values
+                else ttk.Entry(groups[0], textvariable=self._terminal_option_vars[key], width=36)
+            )
+            widget.grid(row=row, column=1, sticky="ew")
+        self._terminal_backend_status = tk.StringVar(value="Native VTE unavailable")
+        ttk.Label(groups[0], textvariable=self._terminal_backend_status).grid(row=5, column=1, sticky="w", pady=(4, 0))
+        appearance = (
+            ("Font", "font", None),
+            ("Font size", "font_size", None),
+            ("Cursor shape", "cursor_shape", TERMINAL_CURSOR_SHAPES),
+            ("Cursor blink", "cursor_blink", "check"),
+            ("Color theme", "color_theme", TERMINAL_COLOR_THEMES),
+        )
+        for row, (label, key, values) in enumerate(appearance):
+            ttk.Label(groups[1], text=label).grid(row=row, column=0, sticky="w")
+            if values == "check":
+                widget = ttk.Checkbutton(groups[1], variable=self._terminal_option_vars[key])
+            elif values:
+                widget = ttk.Combobox(
+                    groups[1], textvariable=self._terminal_option_vars[key], values=values, state="readonly"
+                )
+            else:
+                widget = ttk.Entry(groups[1], textvariable=self._terminal_option_vars[key], width=36)
+            widget.grid(row=row, column=1, sticky="w" if values == "check" else "ew")
+        behavior = (
+            ("Agent forwarding", "agent_forwarding"),
+            ("X11 forwarding", "x11_forwarding"),
+            ("Close terminal windows on logout", "close_on_logout"),
+            ("Scroll on output", "scroll_on_output"),
+            ("Scroll on keystroke", "scroll_on_keystroke"),
+        )
+        for row, (label, key) in enumerate(behavior):
+            ttk.Checkbutton(groups[2], text=label, variable=self._terminal_option_vars[key]).grid(
+                row=row, column=0, sticky="w"
+            )
+        ttk.Label(groups[2], text="Changes apply to newly opened terminals.").grid(
+            row=5, column=0, sticky="w", pady=(4, 0)
+        )
+        self._terminal_action_buttons = []
+        for column, label in enumerate(("Open Terminal", "Open Another Terminal")):
+            button = ttk.Button(groups[3], text=label, command=self._open_selected_session_terminal)
+            button.grid(row=0, column=column, sticky="w", padx=(0, 6))
+            self._terminal_action_buttons.append(button)
+        for key, variable in self._terminal_option_vars.items():
+            variable.trace_add("write", lambda *_args, name=key: self._terminal_option_changed(name))
+        self._refresh_terminal_tab()
+        self._refresh_sftp_tab()
+
+    def _terminal_option_changed(self, key: str) -> None:
+        if getattr(self, "_terminal_options_refreshing", False) or self.working_profile is None:
+            return
+        options = dict(self.working_profile.get("terminal_options", {}))
+        value = self._terminal_option_vars[key].get()
+        if key == "font_size":
+            try:
+                size = int(value)
+            except (TypeError, ValueError):
+                self.profile_validation_errors = ["Font size must be an integer between 6 and 72."]
+                self._refresh_action_states()
+                return
+            if not 6 <= size <= 72:
+                self.profile_validation_errors = ["Font size must be between 6 and 72."]
+                self._refresh_action_states()
+                return
+            value = size
+        elif key == "scrollback":
+            try:
+                value = max(0, int(value))
+            except (TypeError, ValueError):
+                self.profile_validation_errors = ["Scrollback lines must be a whole number."]
+                self._refresh_action_states()
+                return
+        elif isinstance(value, bool):
+            value = bool(value)
+        options[key] = value
+        self.working_profile["terminal_options"] = options
+        self.recalculate_profile_dirty()
+        self._validate_working_profile()
+        self._refresh_action_states()
+        self._refresh_services_tab()
+
+    def _refresh_terminal_tab(self) -> None:
+        if not hasattr(self, "_terminal_option_vars"):
+            return
+        self._terminal_options_refreshing = True
+        try:
+            options = (self.working_profile or {}).get("terminal_options", {})
+            defaults = {
+                "backend": "Automatic",
+                "terminal_type": "xterm-256color",
+                "scrollback": 10000,
+                "bell": "System bell",
+                "startup_command": "",
+                "font": "Monospace",
+                "font_size": 10,
+                "cursor_shape": "Block",
+                "cursor_blink": True,
+                "color_theme": "System",
+                "agent_forwarding": False,
+                "x11_forwarding": False,
+                "close_on_logout": False,
+                "scroll_on_output": False,
+                "scroll_on_keystroke": True,
+            }
+            for key, default in defaults.items():
+                self._terminal_option_vars[key].set(options.get(key, default))
+            availability = self._native_terminal_backend.availability
+            self._terminal_backend_status.set(
+                "Native VTE available"
+                if availability.available
+                else f"Native VTE unavailable: {availability.reason or 'unavailable'}"
+            )
+        finally:
+            self._terminal_options_refreshing = False
+        self._refresh_terminal_action_states()
+
+    def _refresh_terminal_action_states(self) -> None:
+        if not hasattr(self, "_terminal_action_buttons"):
+            return
+        record = self._selected_session_record()
+        enabled = bool(record and record.state is SessionLifecycleState.CONNECTED)
+        for button in self._terminal_action_buttons:
+            button.configure(state="normal" if enabled else "disabled")
+
+    def _build_sftp_tab(self, page):
+        for child in page.winfo_children():
+            child.destroy()
+        self._sftp_option_vars = {
+            "initial_local_directory": tk.StringVar(value=str(Path.home())),
+            "initial_remote_directory": tk.StringVar(),
+            "show_hidden": tk.BooleanVar(value=False),
+            "collision_behavior": tk.StringVar(value="Ask"),
+            "resume_partial": tk.BooleanVar(value=True),
+            "preserve_timestamps": tk.BooleanVar(value=True),
+            "concurrent_transfers": tk.StringVar(value="3"),
+            "verify_transfers": tk.BooleanVar(value=False),
+            "follow_symlinks": tk.BooleanVar(value=False),
+        }
+        groups = []
+        for pos, title in enumerate(SFTP_GROUPS):
+            group = ttk.LabelFrame(page, text=title, padding=6)
+            group.grid(
+                row=0 if pos < 2 else 1,
+                column=pos if pos < 2 else 0,
+                columnspan=1 if pos < 2 else 2,
+                sticky="nsew",
+                padx=4,
+                pady=4,
+            )
+            groups.append(group)
+        page.columnconfigure((0, 1), weight=1)
+        for row, (label, key) in enumerate(
+            (
+                ("Initial local directory", "initial_local_directory"),
+                ("Initial remote directory", "initial_remote_directory"),
+            )
+        ):
+            ttk.Label(groups[0], text=label).grid(row=row, column=0, sticky="w")
+            ttk.Entry(groups[0], textvariable=self._sftp_option_vars[key]).grid(row=row, column=1, sticky="ew")
+        ttk.Checkbutton(groups[0], text="Show hidden files", variable=self._sftp_option_vars["show_hidden"]).grid(
+            row=2, column=0, columnspan=2, sticky="w"
+        )
+        for row, (label, key) in enumerate(
+            (("Overwrite behavior", "collision_behavior"), ("Concurrent transfers", "concurrent_transfers"))
+        ):
+            ttk.Label(groups[1], text=label).grid(row=row, column=0, sticky="w")
+            widget = (
+                ttk.Combobox(
+                    groups[1],
+                    textvariable=self._sftp_option_vars[key],
+                    values=SFTP_OVERWRITE_BEHAVIORS,
+                    state="readonly",
+                )
+                if key == "collision_behavior"
+                else ttk.Entry(groups[1], textvariable=self._sftp_option_vars[key], width=6)
+            )
+            widget.grid(row=row, column=1, sticky="ew")
+        for row, (label, key) in enumerate(
+            (
+                ("Resume partial transfers", "resume_partial"),
+                ("Preserve timestamps", "preserve_timestamps"),
+                ("Verify completed transfers", "verify_transfers"),
+                ("Follow symbolic links", "follow_symlinks"),
+            ),
+            start=2,
+        ):
+            ttk.Checkbutton(groups[1], text=label, variable=self._sftp_option_vars[key]).grid(
+                row=row, column=0, columnspan=2, sticky="w"
+            )
+        self._sftp_action_buttons = []
+        for col, (label, command) in enumerate(
+            (
+                ("Open SFTP", self._open_selected_session_sftp),
+                ("Open Another SFTP", self._open_selected_session_sftp),
+                ("Transfer Manager", self._open_transfer_manager),
+            )
+        ):
+            button = ttk.Button(groups[2], text=label, command=command)
+            button.grid(row=0, column=col, padx=3, sticky="w")
+            self._sftp_action_buttons.append(button)
+        self._refresh_sftp_action_states()
+        for key, variable in self._sftp_option_vars.items():
+            variable.trace_add("write", lambda *_args, name=key: self._sftp_option_changed(name))
+
+    def _sftp_option_changed(self, key: str) -> None:
+        if getattr(self, "_sftp_options_refreshing", False) or self.working_profile is None:
+            return
+        options = dict(self.working_profile.get("sftp_options", {}))
+        value = self._sftp_option_vars[key].get()
+        if key == "concurrent_transfers":
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                self.profile_validation_errors = ["Concurrent transfers must be an integer between 1 and 16."]
+                self._refresh_action_states()
+                return
+            if not 1 <= value <= 16:
+                self.profile_validation_errors = ["Concurrent transfers must be between 1 and 16."]
+                self._refresh_action_states()
+                return
+        elif key == "collision_behavior":
+            value = str(value).lower()
+        options[key] = value
+        self.working_profile["sftp_options"] = options
+        self.recalculate_profile_dirty()
+        self._validate_working_profile()
+        self._refresh_action_states()
+
+    def _refresh_sftp_tab(self) -> None:
+        if not hasattr(self, "_sftp_option_vars"):
+            return
+        self._sftp_options_refreshing = True
+        try:
+            options = (self.working_profile or {}).get("sftp_options", {})
+            defaults = {
+                "initial_local_directory": str(Path.home()),
+                "initial_remote_directory": "",
+                "show_hidden": False,
+                "collision_behavior": "Ask",
+                "resume_partial": True,
+                "preserve_timestamps": True,
+                "concurrent_transfers": self._runtime_settings.get("maximum_sftp_transfers", 3),
+                "verify_transfers": False,
+                "follow_symlinks": False,
+            }
+            for key, default in defaults.items():
+                value = options.get(key, default)
+                if key == "collision_behavior":
+                    value = str(value).title()
+                self._sftp_option_vars[key].set(value)
+        finally:
+            self._sftp_options_refreshing = False
+        self._refresh_sftp_action_states()
+
+    def _refresh_sftp_action_states(self):
+        if not hasattr(self, "_sftp_action_buttons"):
+            return
+        connected = bool(
+            (record := self._selected_session_record()) and record.state is SessionLifecycleState.CONNECTED
+        )
+        for button in self._sftp_action_buttons[:2]:
+            button.configure(state="normal" if connected else "disabled")
+
+    def _build_services_tab(self, page):
+        for child in page.winfo_children():
+            child.destroy()
+        groups = []
+        for position, title in enumerate(SERVICES_SECTIONS):
+            group = ttk.LabelFrame(page, text=title, padding=6)
+            if position == 0:
+                group.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=4, pady=4)
+            else:
+                group.grid(row=1, column=position - 1, sticky="nsew", padx=4, pady=4)
+            groups.append(group)
+        page.columnconfigure((0, 1), weight=1)
+        page.rowconfigure(0, weight=1)
+
+        columns = tuple(f"column_{index}" for index in range(len(PORT_FORWARDING_RUNTIME_COLUMNS)))
+        self._services_rules_tree = ttk.Treeview(
+            groups[0],
+            columns=columns,
+            show="headings",
+            selectmode="browse",
+            height=8,
+        )
+        for column, label in zip(columns, PORT_FORWARDING_RUNTIME_COLUMNS, strict=True):
+            self._services_rules_tree.heading(column, text=label)
+            self._services_rules_tree.column(
+                column,
+                width=105,
+                stretch=label in {"Listen Host", "Destination Host"},
+            )
+        self._services_rules_tree.pack(fill="both", expand=True)
+        actions = ttk.Frame(groups[0])
+        actions.pack(fill="x", pady=(6, 0))
+        for label, command in (
+            ("Add", self._add_service_rule),
+            ("Edit", self._edit_service_rule),
+            ("Remove", self._remove_service_rule),
+            ("Duplicate", self._duplicate_service_rule),
+        ):
+            ttk.Button(actions, text=label, command=command).pack(side="left", padx=(0, 4))
+        self._services_rules_tree.bind("<Double-Button-1>", lambda _event: self._edit_service_rule())
+        self._services_rules_tree.bind("<Return>", lambda _event: self._edit_service_rule())
+
+        ttk.Label(
+            groups[1],
+            text="Dynamic rules provide a per-session SOCKS proxy. Runtime activation follows in a later phase.",
+            wraplength=420,
+            justify="left",
+        ).pack(anchor="w")
+        self._services_x11_refreshing = False
+        self._services_x11_vars = {
+            "x11_forwarding": tk.BooleanVar(value=False),
+            "x11_trusted": tk.BooleanVar(value=False),
+            "x11_display": tk.StringVar(),
+        }
+        ttk.Checkbutton(
+            groups[2],
+            text=X11_FORWARDING_OPTION_LABELS[0],
+            variable=self._services_x11_vars["x11_forwarding"],
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(
+            groups[2],
+            text=X11_FORWARDING_OPTION_LABELS[1],
+            variable=self._services_x11_vars["x11_trusted"],
+        ).grid(row=1, column=0, columnspan=2, sticky="w")
+        ttk.Label(groups[2], text=X11_FORWARDING_OPTION_LABELS[2]).grid(row=2, column=0, sticky="w", padx=(0, 6))
+        self._services_x11_display = ttk.Entry(
+            groups[2],
+            textvariable=self._services_x11_vars["x11_display"],
+            width=24,
+        )
+        self._services_x11_display.grid(row=2, column=1, sticky="ew")
+        groups[2].columnconfigure(1, weight=1)
+        self._services_x11_summary = tk.StringVar(value="Stopped")
+        ttk.Label(
+            groups[2],
+            textvariable=self._services_x11_summary,
+            wraplength=420,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        for key, variable in self._services_x11_vars.items():
+            variable.trace_add("write", lambda *_args, name=key: self._service_x11_changed(name))
+        self._refresh_services_tab()
+
+    def _service_x11_changed(self, key: str) -> None:
+        if self._services_x11_refreshing or self.working_profile is None:
+            return
+        terminal_options = dict(self.working_profile.get("terminal_options", {}))
+        value = self._services_x11_vars[key].get()
+        terminal_options[key] = bool(value) if key != "x11_display" else str(value).strip()
+        self.working_profile["terminal_options"] = terminal_options
+        enabled = bool(self._services_x11_vars["x11_forwarding"].get())
+        self._services_x11_display.configure(state="normal" if enabled else "disabled")
+        self.recalculate_profile_dirty()
+        self._validate_working_profile()
+        self._refresh_action_states()
+        self._refresh_terminal_tab()
+
+    def _selected_service_rule_id(self) -> str | None:
+        if not hasattr(self, "_services_rules_tree"):
+            return None
+        selection = self._services_rules_tree.selection()
+        return selection[0] if len(selection) == 1 else None
+
+    def _service_rule_dialog(self, existing=None):
+        dialog = tk.Toplevel(self)
+        dialog.title("Edit Port Forwarding" if existing else "Add Port Forwarding")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        frame = ttk.Frame(dialog, padding=10)
+        frame.pack(fill="both", expand=True)
+        existing = existing or {}
+        kind = "Dynamic" if existing.get("type") == "SOCKS" else str(existing.get("type", "Local"))
+        values = {
+            "enabled": tk.BooleanVar(value=bool(existing.get("enabled", True))),
+            "type": tk.StringVar(value=kind),
+            "bind_address": tk.StringVar(value=str(existing.get("bind_address", "127.0.0.1"))),
+            "bind_port": tk.StringVar(value=str(existing.get("bind_port", ""))),
+            "destination_host": tk.StringVar(value=str(existing.get("destination_host", ""))),
+            "destination_port": tk.StringVar(
+                value="" if kind == "Dynamic" else str(existing.get("destination_port", ""))
+            ),
+        }
+        ttk.Checkbutton(frame, text="Enabled", variable=values["enabled"]).grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="w",
+        )
+        labels = (
+            ("Type", "type"),
+            ("Listen Host", "bind_address"),
+            ("Listen Port", "bind_port"),
+            ("Destination Host", "destination_host"),
+            ("Destination Port", "destination_port"),
+        )
+        widgets = {}
+        for row, (label, key) in enumerate(labels, start=1):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+            widget = (
+                ttk.Combobox(
+                    frame,
+                    textvariable=values[key],
+                    values=PORT_FORWARDING_TYPES,
+                    state="readonly",
+                    width=24,
+                )
+                if key == "type"
+                else ttk.Entry(frame, textvariable=values[key], width=28)
+            )
+            widget.grid(row=row, column=1, sticky="ew", pady=2)
+            widgets[key] = widget
+        error_var = tk.StringVar()
+        ttk.Label(frame, textvariable=error_var, foreground="#c33").grid(
+            row=6,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(4, 0),
+        )
+        result = {}
+
+        def sync_destination(*_args) -> None:
+            state = "disabled" if values["type"].get() in {"Dynamic", "HTTP"} else "normal"
+            widgets["destination_host"].configure(state=state)
+            widgets["destination_port"].configure(state=state)
+
+        def submit() -> None:
+            rule = {
+                "rule_id": str(existing.get("rule_id", "")),
+                "enabled": bool(values["enabled"].get()),
+                "type": values["type"].get(),
+                "bind_address": values["bind_address"].get(),
+                "bind_port": values["bind_port"].get(),
+                "destination_host": values["destination_host"].get(),
+                "destination_port": values["destination_port"].get(),
+            }
+            try:
+                PortForwardingEditor([]).add(rule)
+            except ProfileError as exc:
+                error_var.set(str(exc))
+                return
+            result["rule"] = rule
+            dialog.destroy()
+
+        values["type"].trace_add("write", sync_destination)
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=7, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right")
+        ttk.Button(buttons, text="OK", command=submit).pack(side="right", padx=(0, 6))
+        sync_destination()
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.grab_set()
+        self.wait_window(dialog)
+        return result.get("rule")
+
+    def _services_editor(self) -> PortForwardingEditor | None:
+        if self.working_profile is None:
+            return None
+        try:
+            return PortForwardingEditor.from_profile(self.working_profile)
+        except ProfileError as exc:
+            self.profile_validation_errors = [str(exc)]
+            self._refresh_action_states()
+            return None
+
+    def _commit_service_editor(self, editor: PortForwardingEditor) -> None:
+        if self.working_profile is None:
+            return
+        editor.apply_to_working_profile(self.working_profile)
+        self.recalculate_profile_dirty()
+        self._validate_working_profile()
+        self._refresh_services_tab()
+        self._refresh_action_states()
+
+    def _add_service_rule(self) -> None:
+        editor = self._services_editor()
+        rule = self._service_rule_dialog() if editor is not None else None
+        if editor is None or rule is None:
+            return
+        try:
+            editor.add(rule)
+        except ProfileError as exc:
+            messagebox.showerror("Port Forwarding", str(exc), parent=self)
+            return
+        self._commit_service_editor(editor)
+
+    def _edit_service_rule(self) -> None:
+        editor = self._services_editor()
+        rule_id = self._selected_service_rule_id()
+        if editor is None or rule_id is None:
+            return
+        existing = next((rule for rule in editor.rules if rule.get("rule_id") == rule_id), None)
+        if existing is None:
+            return
+        updates = self._service_rule_dialog(existing)
+        if updates is None:
+            return
+        try:
+            editor.edit(rule_id, updates)
+        except ProfileError as exc:
+            messagebox.showerror("Port Forwarding", str(exc), parent=self)
+            return
+        self._commit_service_editor(editor)
+
+    def _remove_service_rule(self) -> None:
+        editor = self._services_editor()
+        rule_id = self._selected_service_rule_id()
+        if editor is None or rule_id is None:
+            return
+        if not messagebox.askyesno("Port Forwarding", "Remove the selected forwarding rule?", parent=self):
+            return
+        if editor.remove(rule_id):
+            self._commit_service_editor(editor)
+
+    def _duplicate_service_rule(self) -> None:
+        editor = self._services_editor()
+        rule_id = self._selected_service_rule_id()
+        if editor is None or rule_id is None:
+            return
+        try:
+            duplicate = editor.duplicate(rule_id)
+        except ProfileError as exc:
+            messagebox.showerror("Port Forwarding", str(exc), parent=self)
+            return
+        self._commit_service_editor(editor)
+        if self._services_rules_tree.exists(str(duplicate["rule_id"])):
+            self._services_rules_tree.selection_set(str(duplicate["rule_id"]))
+
+    def _refresh_services_tab(self) -> None:
+        if not hasattr(self, "_services_rules_tree"):
+            return
+        selected = self._selected_service_rule_id()
+        self._services_rules_tree.delete(*self._services_rules_tree.get_children())
+        editor = self._services_editor()
+        if editor is not None:
+            for rule in editor.rules:
+                rule_id = str(rule["rule_id"])
+                record = self._selected_session_record()
+                local_service = self._local_forwarding_services.get(record.session_id) if record is not None else None
+                remote_service = self._remote_forwarding_services.get(record.session_id) if record is not None else None
+                dynamic_service = (
+                    self._dynamic_forwarding_services.get(record.session_id) if record is not None else None
+                )
+                http_service = self._http_forwarding_services.get(record.session_id) if record is not None else None
+                statuses = [
+                    service.status(rule_id)
+                    for service in (local_service, remote_service, dynamic_service, http_service)
+                    if service is not None
+                ]
+                status = next((value for value in statuses if value != "Stopped"), "Stopped")
+                self._services_rules_tree.insert(
+                    "",
+                    "end",
+                    iid=rule_id,
+                    values=port_forwarding_display_row(rule) + (status,),
+                )
+        if selected and self._services_rules_tree.exists(selected):
+            self._services_rules_tree.selection_set(selected)
+        terminal_options = (self.working_profile or {}).get("terminal_options", {})
+        self._services_x11_refreshing = True
+        try:
+            self._services_x11_vars["x11_forwarding"].set(bool(terminal_options.get("x11_forwarding", False)))
+            self._services_x11_vars["x11_trusted"].set(bool(terminal_options.get("x11_trusted", False)))
+            self._services_x11_vars["x11_display"].set(str(terminal_options.get("x11_display", "")))
+        finally:
+            self._services_x11_refreshing = False
+        enabled = bool(self._services_x11_vars["x11_forwarding"].get())
+        self._services_x11_display.configure(state="normal" if enabled else "disabled")
+        record = self._selected_session_record()
+        service = self._x11_forwarding_services.get(record.session_id) if record is not None else None
+        if service is not None and service.error:
+            summary = service.error
+        elif service is not None:
+            summary = service.status
+        else:
+            summary = "Enabled for newly opened terminals." if enabled else "Disabled"
+        self._services_x11_summary.set(summary)
+
+    def _build_ssh_tab(self, page) -> None:
+        for child in page.winfo_children():
+            child.destroy()
+        section = ttk.LabelFrame(page, text="SSH Preferences", padding=8)
+        section.grid(row=0, column=0, sticky="new", padx=8, pady=8)
+        page.columnconfigure(0, weight=1)
+        section.columnconfigure(1, weight=1)
+        defaults = default_ssh_preferences()
+        self._ssh_option_vars = {
+            "compression": tk.BooleanVar(value=defaults["compression"]),
+            "tcp_keepalive": tk.BooleanVar(value=defaults["tcp_keepalive"]),
+            "keepalive_interval": tk.StringVar(value=str(defaults["keepalive_interval"])),
+            "maximum_missed_keepalives": tk.StringVar(value=str(defaults["maximum_missed_keepalives"])),
+            "agent_forwarding": tk.BooleanVar(value=defaults["agent_forwarding"]),
+            "preferred_key_exchange": tk.StringVar(value="Automatic"),
+            "preferred_host_key": tk.StringVar(value="Automatic"),
+            "preferred_cipher": tk.StringVar(value="Automatic"),
+            "preferred_mac": tk.StringVar(value="Automatic"),
+        }
+        rows = (
+            ("compression", SSH_SETTING_LABELS[0], "check", None),
+            ("tcp_keepalive", SSH_SETTING_LABELS[1], "check", None),
+            ("keepalive_interval", SSH_SETTING_LABELS[2], "entry", None),
+            (
+                "maximum_missed_keepalives",
+                SSH_SETTING_LABELS[3],
+                "entry",
+                None,
+            ),
+            ("agent_forwarding", SSH_SETTING_LABELS[4], "check", None),
+            (
+                "preferred_key_exchange",
+                SSH_SETTING_LABELS[5],
+                "combo",
+                SSH_KEY_EXCHANGE_CHOICES,
+            ),
+            (
+                "preferred_host_key",
+                SSH_SETTING_LABELS[6],
+                "combo",
+                SSH_HOST_KEY_CHOICES,
+            ),
+            (
+                "preferred_cipher",
+                SSH_SETTING_LABELS[7],
+                "combo",
+                SSH_CIPHER_CHOICES,
+            ),
+            ("preferred_mac", SSH_SETTING_LABELS[8], "combo", SSH_MAC_CHOICES),
+        )
+        for row, (key, label, kind, values) in enumerate(rows):
+            if kind == "check":
+                widget = ttk.Checkbutton(
+                    section,
+                    text=label,
+                    variable=self._ssh_option_vars[key],
+                )
+                widget.grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
+            else:
+                ttk.Label(section, text=label).grid(
+                    row=row,
+                    column=0,
+                    sticky="w",
+                    padx=(0, 8),
+                    pady=2,
+                )
+                if kind == "combo":
+                    widget = ttk.Combobox(
+                        section,
+                        textvariable=self._ssh_option_vars[key],
+                        values=values,
+                        state="readonly",
+                        width=42,
+                    )
+                else:
+                    widget = ttk.Entry(
+                        section,
+                        textvariable=self._ssh_option_vars[key],
+                        width=10,
+                    )
+                widget.grid(row=row, column=1, sticky="ew", pady=2)
+        self._ssh_validation_message = tk.StringVar()
+        ttk.Label(
+            section,
+            textvariable=self._ssh_validation_message,
+            foreground="#c33",
+        ).grid(row=len(rows), column=0, columnspan=2, sticky="w", pady=(6, 0))
+        for key, variable in self._ssh_option_vars.items():
+            variable.trace_add(
+                "write",
+                lambda *_args, name=key: self._ssh_option_changed(name),
+            )
+        self._refresh_ssh_tab()
+
+    def _ssh_option_changed(self, key: str) -> None:
+        if getattr(self, "_ssh_options_refreshing", False) or self.working_profile is None:
+            return
+        value = self._ssh_option_vars[key].get()
+        set_working_ssh_preference(self.working_profile, key, value)
+        self.recalculate_profile_dirty()
+        valid = self._validate_working_profile()
+        self._ssh_validation_message.set("" if valid else self.profile_validation_errors[0])
+        self._refresh_action_states()
+
+    def _refresh_ssh_tab(self) -> None:
+        if not hasattr(self, "_ssh_option_vars"):
+            return
+        profile = self.working_profile or {}
+        try:
+            preferences = ssh_preferences_from_profile(profile)
+            error = ""
+        except ProfileError as exc:
+            preferences = default_ssh_preferences()
+            connection_options = profile.get("connection_options", {})
+            if isinstance(connection_options, dict):
+                raw = connection_options.get("ssh_preferences", {})
+                if isinstance(raw, dict):
+                    preferences.update(raw)
+            error = str(exc)
+        self._ssh_options_refreshing = True
+        try:
+            for key, variable in self._ssh_option_vars.items():
+                variable.set(preferences[key])
+        finally:
+            self._ssh_options_refreshing = False
+        self._ssh_validation_message.set(error)
+
+    def _sync_login_visibility(self):
+        method = self._login_vars["auth_method"].get()
+        password = method in {"Password", "Keyboard Interactive"}
+        key = method == "Private Key"
+        (self._password_label.grid if password else self._password_label.grid_remove)()
+        (self._password_entry.grid if password else self._password_entry.grid_remove)()
+        (self._key_label.grid if key else self._key_label.grid_remove)()
+        (self._key_entry.grid if key else self._key_entry.grid_remove)()
+        (self._manage_keys_button.grid if key else self._manage_keys_button.grid_remove)()
+        (self._auth_summary.grid if method == "Automatic" else self._auth_summary.grid_remove)()
+        proxy_enabled = self._login_vars["proxy_type"].get() == "SSH ProxyJump"
+        for widget in self._proxy_widgets:
+            widget.configure(state="normal" if proxy_enabled else "disabled")
+
+    def _login_field_changed(self, field):
+        if not hasattr(self, "_login_vars") or self.working_profile is None:
+            return
+        mapping = {"user": "user", "host": "host", "port": "port", "key_path": "key_path"}
+        if field in mapping:
+            self.update_working_profile_field(mapping[field], self._login_vars[field].get())
+        elif field == "proxy_jump":
+            if self._login_vars["proxy_type"].get() == "SSH ProxyJump":
+                self.update_working_profile_field("proxy_jump", self.working_profile.get("proxy_jump", ""))
+            else:
+                self.update_working_profile_field("proxy_jump", "")
+
+    def _refresh_login_tab(self):
+        if not hasattr(self, "_login_vars") or self.working_profile is None:
+            return
+        for key in ("host", "port", "user", "key_path"):
+            self._login_vars[key].set(str(self.working_profile.get(key, "")))
+        self._login_vars["auth_method"].set(
+            {"agent": "SSH Agent", "key": "Private Key", "password": "Password"}.get(
+                self.working_profile.get("auth_method"), "Automatic"
+            )
+        )
+        self._login_vars["proxy_type"].set("SSH ProxyJump" if self.working_profile.get("proxy_jump") else "None")
+        proxy = str(self.working_profile.get("proxy_jump", ""))
+        user, _, host = proxy.partition("@")
+        self._login_vars["proxy_host"].set(host if host else proxy)
+        self._login_vars["proxy_user"].set(user if host else "")
+        self._login_vars["proxy_port"].set("22" if proxy else "")
+        self._sync_login_visibility()
+
+    @staticmethod
+    def _profile_dropdown_items(entries) -> list[tuple[str, str]]:
+        """Return unique display labels mapped to stable profile UUIDs."""
+        name_counts: dict[str, int] = {}
+        for entry in entries:
+            name = str(entry.get("name") or entry.get("host") or "Profile")
+            name_counts[name] = name_counts.get(name, 0) + 1
+        used: dict[str, int] = {}
+        items: list[tuple[str, str]] = []
+        for entry in entries:
+            name = str(entry.get("name") or entry.get("host") or "Profile")
+            label = name
+            if name_counts[name] > 1:
+                target = f"{entry.get('user', '')}@{entry.get('host', '')}".strip("@")
+                label = f"{name} — {target}" if target else name
+            used[label] = used.get(label, 0) + 1
+            if used[label] > 1:
+                label = f"{label} ({used[label]})"
+            items.append((label, str(entry.get("id", ""))))
+        return items
 
     def _refresh_list(self):
         selected = self._selected_idx()
@@ -6028,7 +7974,6 @@ class SSHVaultApp(tk.Tk):
         self._tree.delete(*self._tree.get_children())
         visible = state.visible_profiles()
         for entry in visible:
-            index = self._vault.entries.index(entry)
             host = entry.get("host", "")
             details = f"{entry.get('user', '')}@{host}" + (
                 f":{entry.get('port')}" if entry.get("port", 22) != 22 else ""
@@ -6037,40 +7982,1121 @@ class SSHVaultApp(tk.Tk):
             self._tree.insert(
                 "",
                 "end",
-                iid=str(index),
+                iid=str(entry.get("id")),
                 values=(entry.get("name", host), details, auth, ", ".join(entry.get("tags", []))),
             )
         if selected_id:
-            for index, entry in enumerate(self._vault.entries):
-                if entry.get("id") == selected_id and self._tree.exists(str(index)):
-                    self._tree.selection_set(str(index))
-                    self._tree.focus(str(index))
+            for entry in self._vault.entries:
+                profile_id = str(entry.get("id"))
+                if entry.get("id") == selected_id and self._tree.exists(profile_id):
+                    self._tree.selection_set(profile_id)
+                    self._tree.focus(profile_id)
                     break
-        empty = state.empty_state()
-        if empty:
-            self._empty_message.set(empty)
-            self._empty_profiles.place(relx=0, rely=0, relwidth=1, relheight=1)
-        else:
-            self._empty_profiles.place_forget()
-        if hasattr(self, "_session_count_var"):
-            total = len(self._vault.entries)
-            self._session_count_var.set(
-                f"{len(visible)} of {total} saved" if self._search_var.get() else f"{total} saved"
-            )
+        items = self._profile_dropdown_items(self._vault.entries)
+        self._profile_choice_ids = dict(items)
+        if selected_id:
+            self._profile_choice.set(next((label for label, profile_id in items if profile_id == str(selected_id)), ""))
+        elif self._profile_choice.get() not in self._profile_choice_ids:
+            self._profile_choice.set("")
         self._update_profile_actions()
+
+    def _refresh_sessions(self):
+        self._sync_sftp_view_session_states()
+        selected = getattr(self, "_selected_session_id", None)
+        if selected and self._session_controller.get(selected) is None:
+            self._selected_session_id = None
+        self._refresh_action_states()
+        self._refresh_terminal_action_states()
+        self._refresh_sftp_action_states()
+        self._refresh_services_tab()
+
+    def _sync_sftp_view_session_states(self) -> None:
+        for view_id, (session_id, callback) in list(self._sftp_view_state_callbacks.items()):
+            if view_id not in self._sftp_views:
+                self._sftp_view_state_callbacks.pop(view_id, None)
+                continue
+            record = self._session_controller.get(session_id)
+            state = record.state if record is not None else SessionLifecycleState.DISCONNECTED
+            try:
+                callback(state)
+            except tk.TclError:
+                self._sftp_view_state_callbacks.pop(view_id, None)
+
+    def _on_session_selection(self, _event=None):
+        selection = self._sessions_tree.selection()
+        self._selected_session_id = selection[0] if selection else None
+        self._refresh_action_states()
+        self._refresh_controller_log()
+        self._refresh_terminal_action_states()
+        self._refresh_sftp_action_states()
+        self._refresh_services_tab()
+
+    def _refresh_controller_log(self):
+        if not hasattr(self, "_controller_log"):
+            return
+        record = self._selected_session_record()
+        lines = [] if record is None else [f"[{event.level}] {event.message}" for event in record.events]
+        self._controller_log.configure(state="normal")
+        self._controller_log.delete("1.0", "end")
+        self._controller_log.insert("end", "\n".join(lines))
+        self._controller_log.configure(state="disabled")
+        if hasattr(self, "_controller_status"):
+            self._controller_status.set(record.state.value.replace("_", " ").title() if record else "Disconnected")
 
     def _selected_idx(self) -> int | None:
         sel = self._tree.selection()
-        return int(sel[0]) if sel else None
+        if not sel:
+            return None
+        return next((index for index, entry in enumerate(self._vault.entries) if entry.get("id") == sel[0]), None)
 
     def _clear_search(self):
         self._search_var.set("")
-        self._search_entry.focus_set()
+        self._toolbar_buttons["Load profile"].focus_set()
 
     def _update_profile_actions(self):
-        selected = self._selected_idx() is not None
-        for button in (self._edit_btn, self._duplicate_btn, self._delete_btn, self._export_btn, self._connect_btn):
-            button.configure(state="normal" if selected else "disabled")
+        self._refresh_action_states()
+
+    def _refresh_action_states(self):
+        if not hasattr(self, "_toolbar_buttons"):
+            return
+        profile = self._selected_idx() is not None
+        session = self._selected_session_record()
+        state = session.state if session else None
+        rail_enabled = {
+            "Load profile": bool(self._vault.entries),
+            "Save profile as": bool(self.working_profile and not self.profile_validation_errors),
+            "New profile": True,
+            "Reset profile": bool(self.working_profile),
+        }
+        for key, button in self._toolbar_buttons.items():
+            button.configure(state="normal" if rail_enabled.get(key, False) else "disabled")
+        if not hasattr(self, "_connection_action_button"):
+            return
+        disconnecting_states = {
+            SessionLifecycleState.VALIDATING,
+            SessionLifecycleState.RESOLVING,
+            SessionLifecycleState.CONNECTING_PROXY,
+            SessionLifecycleState.CONNECTING_HOST,
+            SessionLifecycleState.VERIFYING_HOST_KEY,
+            SessionLifecycleState.AUTHENTICATING,
+            SessionLifecycleState.CONNECTED,
+            SessionLifecycleState.RECONNECTING,
+            SessionLifecycleState.DISCONNECTING,
+        }
+        if state in disconnecting_states:
+            self._connection_action_button.configure(text="Log out", state="normal")
+        else:
+            valid_profile = profile and not self.profile_validation_errors
+            self._connection_action_button.configure(text="Log in", state="normal" if valid_profile else "disabled")
+
+    def _selected_session_record(self):
+        session_id = getattr(self, "_selected_session_id", None)
+        return self._session_controller.get(session_id) if session_id else None
+
+    def resolve_unsaved_profile_changes(self, pending_action) -> bool:
+        if not self.profile_dirty:
+            return bool(pending_action())
+        choice = messagebox.askyesnocancel("Unsaved profile", "Save changes before continuing?", parent=self)
+        if choice is None:
+            return False
+        if choice:
+            self._save_working_profile()
+            if self.profile_dirty:
+                return False
+        else:
+            self.discard_working_profile_changes()
+        return bool(pending_action())
+
+    def _save_as_working_profile(self):
+        if self.working_profile is None or not self._validate_working_profile():
+            return
+        name = simpledialog_ask(
+            "Save Profile As", "New profile name:", initialvalue=self.working_profile.get("name", "")
+        )
+        if not name or not name.strip():
+            return
+        clone = {
+            key: value for key, value in self.working_profile.items() if key not in {"id", "password", "passphrase"}
+        }
+        clone["name"] = name.strip()
+        try:
+            created = self._vault.add(clone)
+        except ProfileError as exc:
+            messagebox.showerror("Save Profile As", str(exc), parent=self)
+            return
+        self.load_profile_working_copy(str(created["id"]))
+        self._refresh_list()
+        self._tree.selection_set(str(created["id"]))
+        self._update_statusbar()
+
+    def _save_working_profile(self):
+        """Milestone B placeholder: profile dialogs remain the existing safe editor."""
+        self._edit_entry()
+
+    def _logout_selected_session(self):
+        record = self._selected_session_record()
+        if record and record.profile_snapshot.get("connection_options", {}).get("close_sftp_windows", False):
+            self._close_sftp_views_for_session(record.session_id)
+        tab = self._conn_tabs.get(record.session_id) if record else None
+        if tab:
+            # Logout leaves the controller workspace reusable.  Full shutdown
+            # is reserved for destroying the tab/application.
+            tab._disconnect()
+        elif record:
+            self._stop_local_forwarding_for_session(record.session_id)
+            self._stop_remote_forwarding_for_session(record.session_id)
+            self._stop_dynamic_forwarding_for_session(record.session_id)
+            self._stop_http_forwarding_for_session(record.session_id)
+            self._stop_x11_forwarding_for_session(record.session_id)
+            self._session_controller.disconnect(record.session_id, "User requested log out.")
+        self._refresh_action_states()
+
+    def _stop_local_forwarding_for_session(self, session_id: str) -> None:
+        service = self._local_forwarding_services.pop(session_id, None)
+        if service is None:
+            return
+        active_ids = service.active_rule_ids()
+        service.stop_all()
+        for rule_id in active_ids:
+            self._session_controller.unregister_tunnel(session_id, rule_id)
+        self._refresh_services_tab()
+
+    def _stop_remote_forwarding_for_session(self, session_id: str) -> None:
+        service = self._remote_forwarding_services.pop(session_id, None)
+        if service is None:
+            return
+        active_ids = service.active_rule_ids()
+        service.stop_all()
+        for rule_id in active_ids:
+            self._session_controller.unregister_tunnel(session_id, rule_id)
+        self._refresh_services_tab()
+
+    def _stop_dynamic_forwarding_for_session(self, session_id: str) -> None:
+        service = self._dynamic_forwarding_services.pop(session_id, None)
+        if service is None:
+            return
+        active_ids = service.active_rule_ids()
+        service.stop_all()
+        for rule_id in active_ids:
+            self._session_controller.unregister_tunnel(session_id, rule_id)
+        self._refresh_services_tab()
+
+    def _stop_http_forwarding_for_session(self, session_id: str) -> None:
+        service = self._http_forwarding_services.pop(session_id, None)
+        if service is None:
+            return
+        active_ids = service.active_rule_ids()
+        service.stop_all()
+        for rule_id in active_ids:
+            self._session_controller.unregister_tunnel(session_id, rule_id)
+        self._refresh_services_tab()
+
+    def _stop_x11_forwarding_for_session(self, session_id: str) -> None:
+        service = self._x11_forwarding_services.pop(session_id, None)
+        if service is None:
+            return
+        service.close()
+        self._refresh_services_tab()
+
+    def _close_sftp_views_for_session(self, session_id: str) -> None:
+        for view_id, window in list(self._sftp_views.items()):
+            record = self._session_controller.get(session_id)
+            if record is None or view_id not in record.sftp_view_ids:
+                continue
+            self._session_controller.unregister_sftp_view(session_id, view_id)
+            self._sftp_browser_clients.close_view(session_id, view_id)
+            self._sftp_views.pop(view_id, None)
+            self._sftp_view_state_callbacks.pop(view_id, None)
+            self._sftp_transfer_status_callbacks.pop(view_id, None)
+            self._sftp_transfer_queue_callbacks.pop(view_id, None)
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+        self._refresh_sessions()
+
+    def _reconnect_selected_session(self):
+        record = self._selected_session_record()
+        tab = self._conn_tabs.get(record.session_id) if record else None
+        if tab:
+            tab._reconnect_now()
+
+    def _open_selected_session_terminal(self):
+        record = self._selected_session_record()
+        tab = self._conn_tabs.get(record.session_id) if record else None
+        if tab:
+            tab._open_terminal()
+
+    def _open_selected_session_sftp(self):
+        record = self._selected_session_record()
+        if record is not None:
+            self._open_sftp_placeholder(record)
+
+    def _sftp_transfer_router(self, record) -> SFTPTransferRouter:
+        scheduler = self._sftp_transfer_schedulers.get(record.session_id)
+        if scheduler is None:
+            tab = self._conn_tabs.get(record.session_id)
+            client = getattr(tab, "_client", None)
+            if client is None or record.state is not SessionLifecycleState.CONNECTED:
+                raise ProfileError("SFTP transfers are unavailable.")
+            options = record.profile_snapshot.get("sftp_options", {})
+            concurrency = int(options.get("concurrent_transfers", 3))
+            scheduler = TransferScheduler(
+                lambda connection=client: connection.open_sftp(),
+                concurrency=concurrency,
+                on_change=lambda session_id=record.session_id: self._sftp_transfer_changed(session_id),
+            )
+            self._sftp_transfer_schedulers[record.session_id] = scheduler
+        return SFTPTransferRouter(scheduler)
+
+    def _sftp_transfer_changed(self, session_id: str) -> None:
+        def update() -> None:
+            scheduler = self._sftp_transfer_schedulers.get(session_id)
+            if scheduler is None:
+                return
+            summary = scheduler.summary()
+            if summary["failed"]:
+                message = "Transfer failed."
+            elif summary["active"] or summary["pending"]:
+                message = f"{summary['active']} active · {summary['pending']} pending"
+            elif scheduler.items:
+                message = "Transfers complete."
+            else:
+                message = ""
+            for view_session_id, callback in list(self._sftp_transfer_status_callbacks.values()):
+                if view_session_id == session_id:
+                    callback(message)
+            for view_session_id, callback in list(self._sftp_transfer_queue_callbacks.values()):
+                if view_session_id == session_id:
+                    callback()
+
+        try:
+            self.after(0, update)
+        except (RuntimeError, tk.TclError):
+            return
+
+    def _open_sftp_placeholder(self, record) -> str | None:
+        """Create the Phase 1 isolated SFTP browser shell without a client."""
+        if record.state is not SessionLifecycleState.CONNECTED:
+            return None
+        snapshot = json.loads(json.dumps(record.profile_snapshot))
+        view_id = str(uuid4())
+        window = tk.Toplevel(self)
+        window.title(f"SFTP — {snapshot.get('user', '')}@{snapshot.get('host', '')}")
+        window.geometry("900x540")
+        body = ttk.Frame(window, padding=8)
+        body.pack(fill="both", expand=True)
+        local = ttk.LabelFrame(body, text="Local", padding=8)
+        local.grid(row=0, column=0, sticky="nsew", padx=4)
+        remote = ttk.LabelFrame(body, text="Remote", padding=8)
+        remote.grid(row=0, column=1, sticky="nsew", padx=4)
+        body.columnconfigure((0, 1), weight=1)
+        options = snapshot.get("sftp_options", {})
+        initial = initial_local_browser_path(str(options.get("initial_local_directory", Path.home())))
+        state = SFTPViewNavigationState(local_current_path=initial)
+        local_entries = []
+        path_var, status_var = tk.StringVar(value=state.local_current_path), tk.StringVar()
+        columns = ("name", "size", "modified", "type", "permissions")
+        tree = ttk.Treeview(local, columns=columns, show="headings", selectmode="extended")
+        for column, label in zip(columns, ("Name", "Size", "Modified", "Type", "Permissions"), strict=True):
+            tree.heading(column, text=label)
+            tree.column(column, width=90, stretch=column == "name")
+
+        def load(path=None):
+            target = normalize_local_path(path or state.local_current_path)
+            state.local_loading = True
+            update_mutation_actions()
+            try:
+                entries = list_local_browser_entries(target, bool(options.get("show_hidden", False)))
+            except Exception:
+                state.local_loading = False
+                status_var.set("Local directory not found")
+                update_mutation_actions()
+                return
+            entries = sort_browser_entries(entries, state.local_sort_column, state.local_sort_descending)
+            local_entries[:] = entries
+            if target != state.local_current_path:
+                state.navigate_new(target, False)
+            path_var.set(state.local_current_path)
+            tree.delete(*tree.get_children())
+            for entry in entries:
+                tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        entry.name,
+                        entry.size if entry.size is not None else "—",
+                        entry.modified_time or "—",
+                        entry.type_label,
+                        entry.permissions,
+                    ),
+                    tags=(entry.full_path, "dir" if entry.is_directory else "file"),
+                )
+            status_var.set(f"{len(entries)} items")
+            state.local_loading = False
+            update_mutation_actions()
+
+        def sort(column):
+            update_browser_sort(state, column)
+            load()
+
+        for column in columns:
+            tree.heading(column, command=lambda name=column: sort(name))
+
+        bar = ttk.Frame(local)
+        bar.pack(fill="x")
+        local_action_bar = ttk.Frame(local)
+        local_action_bar.pack(fill="x")
+        local_buttons = {}
+        for label, command in (
+            ("Back", lambda: state.navigate_back(False) and load()),
+            ("Forward", lambda: state.navigate_forward(False) and load()),
+            ("Up", lambda: state.navigate_up(False) and load()),
+            ("Home", lambda: state.navigate_home(str(Path.home()), False) and load()),
+            ("Refresh", load),
+            ("New Folder", None),
+            ("Rename", None),
+            ("Delete", None),
+            ("Properties", None),
+            ("Copy Path", None),
+        ):
+            parent = bar if label in {"Back", "Forward", "Up", "Home", "Refresh"} else local_action_bar
+            button = ttk.Button(parent, text=label, command=command)
+            button.pack(side="left", padx=2)
+            local_buttons[label] = button
+        entry = ttk.Entry(local, textvariable=path_var)
+        entry.pack(fill="x", pady=3)
+        entry.bind("<Return>", lambda _e: load(path_var.get()))
+
+        def open_selected(_event=None):
+            selection = tree.selection()
+            if len(selection) != 1:
+                return
+            tags = tree.item(selection[0], "tags")
+            if len(tags) >= 2 and tags[1] == "dir":
+                load(str(tags[0]))
+
+        tree.bind("<Double-Button-1>", open_selected)
+        tree.bind("<Return>", open_selected)
+        tree.pack(fill="both", expand=True)
+        ttk.Label(local, textvariable=status_var).pack(anchor="w")
+        remote_path_var = tk.StringVar(value=str(options.get("initial_remote_directory", "")))
+        remote_status_var = tk.StringVar(value="Loading…")
+        remote_bar = ttk.Frame(remote)
+        remote_bar.pack(fill="x")
+        remote_action_bar = ttk.Frame(remote)
+        remote_action_bar.pack(fill="x")
+        remote_buttons = {}
+        for label in (
+            "Back",
+            "Forward",
+            "Up",
+            "Home",
+            "Refresh",
+            "New Folder",
+            "Rename",
+            "Delete",
+            "Properties",
+            "Copy Path",
+        ):
+            parent = remote_bar if label in {"Back", "Forward", "Up", "Home", "Refresh"} else remote_action_bar
+            button = ttk.Button(parent, text=label)
+            button.pack(side="left", padx=2)
+            remote_buttons[label] = button
+        remote_entry = ttk.Entry(remote, textvariable=remote_path_var)
+        remote_entry.pack(fill="x", pady=3)
+        remote_columns = ("name", "size", "modified", "type", "permissions", "owner")
+        remote_table = ttk.Frame(remote)
+        remote_table.pack(fill="both", expand=True)
+        remote_tree = ttk.Treeview(
+            remote_table,
+            columns=remote_columns,
+            show="headings",
+            selectmode="extended",
+        )
+        remote_scrollbar = ttk.Scrollbar(remote_table, orient="vertical", command=remote_tree.yview)
+        remote_tree.configure(yscrollcommand=remote_scrollbar.set)
+        for column, label in zip(
+            remote_columns,
+            ("Name", "Size", "Modified", "Type", "Permissions", "Owner"),
+            strict=True,
+        ):
+            remote_tree.heading(column, text=label)
+            remote_tree.column(column, width=90, stretch=column == "name")
+        remote_tree.pack(side="left", fill="both", expand=True)
+        remote_scrollbar.pack(side="right", fill="y")
+        ttk.Label(remote, textvariable=remote_status_var).pack(anchor="w")
+        queue_frame = ttk.LabelFrame(body, text="Transfer queue", padding=4)
+        queue_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=4, pady=(6, 0))
+        queue_columns = ("file", "direction", "progress", "speed", "eta", "status")
+        queue_tree = ttk.Treeview(
+            queue_frame,
+            columns=queue_columns,
+            show="headings",
+            selectmode="browse",
+            height=5,
+        )
+        for column, label in zip(
+            queue_columns,
+            ("File", "Direction", "Progress", "Speed", "ETA", "Status"),
+            strict=True,
+        ):
+            queue_tree.heading(column, text=label)
+            queue_tree.column(column, width=105, stretch=column in {"file", "status"})
+        queue_tree.pack(fill="both", expand=True)
+        queue_actions = ttk.Frame(queue_frame)
+        queue_actions.pack(fill="x", pady=(4, 0))
+        queue_buttons = {}
+        for label in ("Pause", "Resume", "Cancel", "Retry", "Remove Completed"):
+            button = ttk.Button(queue_actions, text=label, state="disabled")
+            button.pack(side="left", padx=(0, 4))
+            queue_buttons[label] = button
+        transfer_bar = ttk.Frame(body)
+        transfer_bar.grid(row=2, column=0, columnspan=2, sticky="ew", padx=4, pady=(6, 0))
+        upload_button = ttk.Button(transfer_bar, text="Upload", state="disabled")
+        upload_button.pack(side="left", padx=(0, 4))
+        download_button = ttk.Button(transfer_bar, text="Download", state="disabled")
+        download_button.pack(side="left")
+        transfer_status_var = tk.StringVar()
+        ttk.Label(transfer_bar, textvariable=transfer_status_var).pack(side="left", padx=8)
+        body.rowconfigure(0, weight=1)
+        tab = self._conn_tabs.get(record.session_id)
+        client = getattr(tab, "_client", None)
+        try:
+            browser_client = SFTPBrowserClient(client.open_sftp()) if client is not None else None
+        except Exception:
+            browser_client = None
+        if browser_client is None:
+            window.destroy()
+            messagebox.showerror("SFTP", "SFTP is unavailable for this connection.", parent=self)
+            return None
+        self._sftp_browser_clients.register(record.session_id, view_id, browser_client)
+        self._session_controller.register_sftp_view(record.session_id, view_id)
+        self._sftp_views[view_id] = window
+        self._sftp_transfer_status_callbacks[view_id] = (record.session_id, transfer_status_var.set)
+        remote_entries = []
+        remote_mutating = {"active": False}
+
+        def current_transfer_scheduler():
+            return self._sftp_transfer_schedulers.get(record.session_id)
+
+        def selected_transfer_item():
+            scheduler = current_transfer_scheduler()
+            selection = queue_tree.selection()
+            return scheduler.get(selection[0]) if scheduler is not None and len(selection) == 1 else None
+
+        def update_queue_actions(_event=None) -> None:
+            scheduler = current_transfer_scheduler()
+            items = list(scheduler.items) if scheduler is not None else []
+            enabled = sftp_transfer_control_states(selected_transfer_item(), items)
+            for label, key in (
+                ("Pause", "pause"),
+                ("Resume", "resume"),
+                ("Cancel", "cancel"),
+                ("Retry", "retry"),
+                ("Remove Completed", "remove_completed"),
+            ):
+                queue_buttons[label].configure(state="normal" if enabled[key] else "disabled")
+
+        def refresh_transfer_queue() -> None:
+            scheduler = current_transfer_scheduler()
+            selected = set(queue_tree.selection())
+            queue_tree.delete(*queue_tree.get_children())
+            rows = sftp_transfer_queue_rows(list(scheduler.items) if scheduler is not None else [])
+            for row in rows:
+                queue_tree.insert(
+                    "",
+                    "end",
+                    iid=row.item_id,
+                    values=(row.file, row.direction, row.progress, row.speed, row.eta, row.status),
+                )
+            queue_tree.selection_set([item_id for item_id in selected if queue_tree.exists(item_id)])
+            update_queue_actions()
+
+        def act_on_selected_transfer(action: str) -> None:
+            scheduler = current_transfer_scheduler()
+            item = selected_transfer_item()
+            if scheduler is None or item is None:
+                return
+            getattr(scheduler, action)(item.item_id)
+            refresh_transfer_queue()
+
+        queue_buttons["Pause"].configure(command=lambda: act_on_selected_transfer("pause"))
+        queue_buttons["Resume"].configure(command=lambda: act_on_selected_transfer("resume"))
+        queue_buttons["Cancel"].configure(command=lambda: act_on_selected_transfer("cancel"))
+        queue_buttons["Retry"].configure(command=lambda: act_on_selected_transfer("retry"))
+
+        def remove_completed_transfers() -> None:
+            scheduler = current_transfer_scheduler()
+            if scheduler is not None:
+                scheduler.clear_completed()
+                refresh_transfer_queue()
+
+        queue_buttons["Remove Completed"].configure(command=remove_completed_transfers)
+        queue_tree.bind("<<TreeviewSelect>>", update_queue_actions)
+        self._sftp_transfer_queue_callbacks[view_id] = (record.session_id, refresh_transfer_queue)
+
+        def selected_paths(widget) -> list[str]:
+            paths = []
+            for item_id in widget.selection():
+                tags = widget.item(item_id, "tags")
+                if tags:
+                    paths.append(str(tags[0]))
+            return paths
+
+        def selected_local_files():
+            return selected_file_entries(local_entries, selected_paths(tree))
+
+        def selected_remote_files():
+            return selected_file_entries(remote_entries, selected_paths(remote_tree))
+
+        def selected_local_items():
+            return selected_browser_entries(local_entries, selected_paths(tree))
+
+        def selected_remote_items():
+            return selected_browser_entries(remote_entries, selected_paths(remote_tree))
+
+        def update_mutation_actions(_event=None) -> None:
+            enabled = sftp_mutation_action_states(
+                local_selection_count=len(selected_local_items()),
+                remote_selection_count=len(selected_remote_items()),
+                local_loading=state.local_loading,
+                remote_loading=state.remote_loading,
+                remote_available=state.remote_available and browser_client.is_alive(),
+            )
+            local_buttons["New Folder"].configure(state="normal" if enabled["local_new_folder"] else "disabled")
+            local_buttons["Rename"].configure(state="normal" if enabled["local_rename"] else "disabled")
+            remote_buttons["New Folder"].configure(state="normal" if enabled["remote_new_folder"] else "disabled")
+            remote_buttons["Rename"].configure(state="normal" if enabled["remote_rename"] else "disabled")
+            update_file_actions()
+
+        def update_file_actions() -> None:
+            enabled = sftp_file_action_states(
+                local_selection_count=len(selected_local_items()),
+                remote_selection_count=len(selected_remote_items()),
+                local_loading=state.local_loading,
+                remote_loading=state.remote_loading,
+                remote_available=state.remote_available and browser_client.is_alive(),
+            )
+            for action, key in (
+                ("Delete", "local_delete"),
+                ("Properties", "local_properties"),
+                ("Copy Path", "local_copy_path"),
+            ):
+                local_buttons[action].configure(state="normal" if enabled[key] else "disabled")
+            for action, key in (
+                ("Delete", "remote_delete"),
+                ("Properties", "remote_properties"),
+                ("Copy Path", "remote_copy_path"),
+            ):
+                remote_buttons[action].configure(state="normal" if enabled[key] else "disabled")
+
+        def update_transfer_actions(_event=None) -> None:
+            current = self._session_controller.get(record.session_id)
+            enabled = SFTPTransferRouter.action_states(
+                local_selected=bool(selected_local_files()),
+                remote_selected=bool(selected_remote_files()),
+                connected=bool(current and current.state is SessionLifecycleState.CONNECTED),
+                client_available=state.remote_available and browser_client.is_alive(),
+            )
+            upload_button.configure(state="normal" if enabled["upload"] else "disabled")
+            download_button.configure(state="normal" if enabled["download"] else "disabled")
+
+        def queue_uploads() -> None:
+            try:
+                queued = self._sftp_transfer_router(record).queue_uploads(
+                    [entry.full_path for entry in selected_local_files()],
+                    state.remote_current_path,
+                )
+            except Exception:
+                transfer_status_var.set("Upload could not be queued.")
+                return
+            transfer_status_var.set(f"Queued {len(queued)} upload(s).")
+
+        def queue_downloads() -> None:
+            try:
+                queued = self._sftp_transfer_router(record).queue_downloads(
+                    selected_remote_files(),
+                    state.local_current_path,
+                )
+            except Exception:
+                transfer_status_var.set("Download could not be queued.")
+                return
+            transfer_status_var.set(f"Queued {len(queued)} download(s).")
+
+        upload_button.configure(command=queue_uploads)
+        download_button.configure(command=queue_downloads)
+
+        def route_drop(source_pane: str, target_pane: str) -> str:
+            current = self._session_controller.get(record.session_id)
+            try:
+                router = SFTPDragDropRouter(self._sftp_transfer_router(record))
+                queued = router.route_drop(
+                    source_pane=source_pane,
+                    target_pane=target_pane,
+                    connected=bool(current and current.state is SessionLifecycleState.CONNECTED),
+                    client_available=state.remote_available and browser_client.is_alive(),
+                    local_paths=[item.full_path for item in selected_local_files()],
+                    remote_entries=selected_remote_files(),
+                    local_directory=state.local_current_path,
+                    remote_directory=state.remote_current_path,
+                )
+            except Exception:
+                transfer_status_var.set("Transfer could not be queued.")
+                return "none"
+            if queued:
+                direction = "upload" if source_pane == "local" else "download"
+                transfer_status_var.set(f"Queued {len(queued)} {direction}(s).")
+                return "copy"
+            return "none"
+
+        def install_native_drag_drop() -> bool:
+            required_methods = (
+                "drag_source_register",
+                "drop_target_register",
+                "dnd_bind",
+            )
+            if not all(
+                callable(getattr(widget, method, None)) for widget in (tree, remote_tree) for method in required_methods
+            ):
+                transfer_status_var.set("Drag-and-drop unsupported; use Upload/Download.")
+                return False
+            local_type = "SSHVAULT_LOCAL_SELECTION"
+            remote_type = "SSHVAULT_REMOTE_SELECTION"
+            try:
+                tree.drag_source_register(1, local_type)
+                remote_tree.drop_target_register(local_type)
+                remote_tree.drag_source_register(1, remote_type)
+                tree.drop_target_register(remote_type)
+                tree.dnd_bind(
+                    "<<DragInitCmd>>",
+                    lambda _event: ("copy", local_type, view_id),
+                )
+                remote_tree.dnd_bind(
+                    "<<DragInitCmd>>",
+                    lambda _event: ("copy", remote_type, view_id),
+                )
+                remote_tree.dnd_bind(
+                    "<<Drop>>",
+                    lambda _event: route_drop("local", "remote"),
+                )
+                tree.dnd_bind(
+                    "<<Drop>>",
+                    lambda _event: route_drop("remote", "local"),
+                )
+            except (AttributeError, RuntimeError, tk.TclError):
+                transfer_status_var.set("Drag-and-drop unsupported; use Upload/Download.")
+                return False
+            transfer_status_var.set("Drag selected files between panes to transfer.")
+            return True
+
+        install_native_drag_drop()
+        tree.bind("<<TreeviewSelect>>", update_transfer_actions, add="+")
+        tree.bind("<<TreeviewSelect>>", update_mutation_actions, add="+")
+        remote_tree.bind("<<TreeviewSelect>>", update_transfer_actions, add="+")
+        remote_tree.bind("<<TreeviewSelect>>", update_mutation_actions, add="+")
+
+        def local_new_folder() -> None:
+            name = simpledialog_ask("New Folder", "Folder name:")
+            if name is None:
+                return
+            try:
+                create_local_browser_folder(state.local_current_path, name)
+            except (OSError, ProfileError):
+                status_var.set("Could not create local folder.")
+                return
+            load()
+
+        def local_rename() -> None:
+            selected = selected_local_items()
+            if len(selected) != 1:
+                return
+            name = simpledialog_ask("Rename", "New name:", selected[0].name)
+            if name is None:
+                return
+            try:
+                rename_local_browser_entry(selected[0].full_path, name)
+            except (OSError, ProfileError):
+                status_var.set("Could not rename local item.")
+                return
+            load()
+
+        def show_properties(item) -> None:
+            dialog = tk.Toplevel(window)
+            dialog.title(f"Properties — {item.name}")
+            dialog.transient(window)
+            dialog.resizable(False, False)
+            frame = ttk.Frame(dialog, padding=10)
+            frame.pack(fill="both", expand=True)
+            for row, (label, value) in enumerate(browser_entry_properties(item).items()):
+                ttk.Label(frame, text=label).grid(row=row, column=0, sticky="nw", padx=(0, 10), pady=2)
+                ttk.Label(frame, text=value).grid(row=row, column=1, sticky="nw", pady=2)
+            ttk.Button(frame, text="Close", command=dialog.destroy).grid(
+                row=len(browser_entry_properties(item)),
+                column=1,
+                sticky="e",
+                pady=(8, 0),
+            )
+
+        def copy_path(path: str, status) -> None:
+            try:
+                window.clipboard_clear()
+                window.clipboard_append(path)
+                status.set("Path copied.")
+            except tk.TclError:
+                status.set("Could not copy path.")
+
+        def local_delete() -> None:
+            selected = selected_local_items()
+            if not selected:
+                return
+            selected = confirmed_sftp_delete_entries(
+                selected,
+                messagebox.askyesno(
+                    "Delete",
+                    f"Delete {len(selected)} selected local item(s)?",
+                    parent=window,
+                ),
+            )
+            if not selected:
+                return
+            try:
+                delete_local_browser_entries(selected)
+            except (OSError, ProfileError):
+                status_var.set("Could not delete selected local item(s).")
+                return
+            load()
+
+        def local_properties() -> None:
+            selected = selected_local_items()
+            if len(selected) == 1:
+                show_properties(selected[0])
+
+        def local_copy_path() -> None:
+            path = selected_browser_path(local_entries, selected_paths(tree))
+            if path is not None:
+                copy_path(path, status_var)
+
+        local_buttons["New Folder"].configure(command=local_new_folder)
+        local_buttons["Rename"].configure(command=local_rename)
+        local_buttons["Delete"].configure(command=local_delete)
+        local_buttons["Properties"].configure(command=local_properties)
+        local_buttons["Copy Path"].configure(command=local_copy_path)
+
+        def render_remote() -> None:
+            sorted_entries = sort_browser_entries(
+                remote_entries,
+                state.remote_sort_column,
+                state.remote_sort_descending,
+            )
+            remote_tree.delete(*remote_tree.get_children())
+            for item in sorted_entries:
+                remote_tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        item.name,
+                        item.size if item.size is not None else "—",
+                        item.modified_time or "—",
+                        item.type_label,
+                        item.permissions,
+                        item.owner,
+                    ),
+                    tags=(item.full_path, "dir" if item.is_directory else "file"),
+                )
+            remote_status_var.set(f"{len(sorted_entries)} items")
+            update_transfer_actions()
+            update_mutation_actions()
+
+        def load_remote(
+            requested_path: str | None = None,
+            *,
+            history_action: str = "new",
+        ) -> None:
+            if not state.remote_available:
+                remote_status_var.set("Disconnected")
+                return
+            if remote_mutating["active"]:
+                return
+            generation = state.begin_remote_listing()
+            requested = remote_path_var.get() if requested_path is None else requested_path
+            remote_status_var.set("Loading…")
+            remote_buttons["Refresh"].configure(state="disabled")
+            update_mutation_actions()
+
+            def worker() -> None:
+                try:
+                    if not browser_client.is_alive():
+                        raise ProfileError("SFTP channel unavailable")
+                    home = browser_client.home_directory()
+                    target = normalize_remote_path(requested, home)
+                    entries = list_remote_browser_entries(
+                        browser_client,
+                        target,
+                        bool(options.get("show_hidden", False)),
+                    )
+                    error = None
+                except ProfileError as exc:
+                    target = state.remote_current_path
+                    entries = []
+                    error = str(exc)
+                except Exception:
+                    target = state.remote_current_path
+                    entries = []
+                    error = "Directory listing failed"
+
+                def apply_result() -> None:
+                    view_open = view_id in self._sftp_views
+                    accepted = state.complete_remote_listing(
+                        generation,
+                        target,
+                        error=error,
+                        view_open=view_open,
+                        update_path=False,
+                    )
+                    if not view_open or not state.generation_current(generation, True):
+                        return
+                    remote_buttons["Refresh"].configure(state="normal")
+                    if not accepted:
+                        remote_path_var.set(state.remote_current_path)
+                        remote_status_var.set(error or "Directory listing failed")
+                        update_mutation_actions()
+                        return
+                    if history_action == "back":
+                        state.navigate_back(True)
+                    elif history_action == "forward":
+                        state.navigate_forward(True)
+                    elif history_action == "new":
+                        state.navigate_new(target, True)
+                    elif history_action == "initial":
+                        state.remote_current_path = target
+                    remote_entries[:] = entries
+                    remote_path_var.set(state.remote_current_path)
+                    render_remote()
+
+                try:
+                    self.after(0, apply_result)
+                except (RuntimeError, tk.TclError):
+                    return
+
+            threading.Thread(
+                target=worker,
+                daemon=True,
+                name=f"sshvault-sftp-list-{view_id[:8]}",
+            ).start()
+
+        def run_remote_mutation(operation, failure_message: str) -> None:
+            if not state.remote_available or state.remote_loading:
+                return
+            generation = state.next_generation(True)
+            state.remote_loading = True
+            remote_mutating["active"] = True
+            remote_status_var.set("Working…")
+            for label in ("Back", "Forward", "Up", "Home", "Refresh"):
+                remote_buttons[label].configure(state="disabled")
+            remote_entry.configure(state="disabled")
+            update_mutation_actions()
+
+            def worker() -> None:
+                try:
+                    operation()
+                    failed = False
+                except Exception:
+                    failed = True
+
+                def completed() -> None:
+                    if view_id not in self._sftp_views or not state.generation_current(generation, True):
+                        return
+                    state.remote_loading = False
+                    remote_mutating["active"] = False
+                    if failed:
+                        remote_status_var.set(failure_message)
+                        for label in ("Back", "Forward", "Up", "Home", "Refresh"):
+                            remote_buttons[label].configure(state="normal")
+                        remote_entry.configure(state="normal")
+                        update_mutation_actions()
+                        return
+                    for label in ("Back", "Forward", "Up", "Home", "Refresh"):
+                        remote_buttons[label].configure(state="normal")
+                    remote_entry.configure(state="normal")
+                    load_remote(state.remote_current_path, history_action="refresh")
+
+                try:
+                    self.after(0, completed)
+                except (RuntimeError, tk.TclError):
+                    return
+
+            threading.Thread(
+                target=worker,
+                daemon=True,
+                name=f"sshvault-sftp-mutate-{view_id[:8]}",
+            ).start()
+
+        def remote_new_folder() -> None:
+            name = simpledialog_ask("New Folder", "Folder name:")
+            if name is None:
+                return
+            try:
+                validated = validate_sftp_item_name(name)
+            except ProfileError:
+                remote_status_var.set("Enter a valid folder name.")
+                return
+            run_remote_mutation(
+                lambda: create_remote_browser_folder(
+                    browser_client,
+                    state.remote_current_path,
+                    validated,
+                ),
+                "Could not create remote folder.",
+            )
+
+        def remote_rename() -> None:
+            selected = selected_remote_items()
+            if len(selected) != 1:
+                return
+            name = simpledialog_ask("Rename", "New name:", selected[0].name)
+            if name is None:
+                return
+            try:
+                validated = validate_sftp_item_name(name)
+            except ProfileError:
+                remote_status_var.set("Enter a valid item name.")
+                return
+            run_remote_mutation(
+                lambda: rename_remote_browser_entry(
+                    browser_client,
+                    selected[0].full_path,
+                    validated,
+                ),
+                "Could not rename remote item.",
+            )
+
+        def remote_delete() -> None:
+            selected = list(selected_remote_items())
+            if not selected:
+                return
+            selected = confirmed_sftp_delete_entries(
+                selected,
+                messagebox.askyesno(
+                    "Delete",
+                    f"Delete {len(selected)} selected remote item(s)?",
+                    parent=window,
+                ),
+            )
+            if not selected:
+                return
+            run_remote_mutation(
+                lambda: delete_remote_browser_entries(browser_client, selected),
+                "Could not delete selected remote item(s).",
+            )
+
+        def remote_properties() -> None:
+            selected = selected_remote_items()
+            if len(selected) == 1:
+                show_properties(selected[0])
+
+        def remote_copy_path() -> None:
+            path = selected_browser_path(remote_entries, selected_paths(remote_tree))
+            if path is not None:
+                copy_path(path, remote_status_var)
+
+        def remote_back() -> None:
+            if state.remote_back_history:
+                load_remote(state.remote_back_history[-1], history_action="back")
+
+        def remote_forward() -> None:
+            if state.remote_forward_history:
+                load_remote(state.remote_forward_history[-1], history_action="forward")
+
+        def remote_up() -> None:
+            current = state.remote_current_path or "/"
+            load_remote(posixpath.dirname(current) or "/", history_action="new")
+
+        def remote_home() -> None:
+            load_remote("", history_action="new")
+
+        def remote_refresh() -> None:
+            load_remote(state.refresh(True), history_action="refresh")
+
+        def sort_remote(column: str) -> None:
+            if not state.remote_available:
+                return
+            update_browser_sort(state, column, remote=True)
+            render_remote()
+
+        def open_remote_selected(_event=None) -> None:
+            selection = remote_tree.selection()
+            if len(selection) != 1:
+                return
+            tags = remote_tree.item(selection[0], "tags")
+            target = selected_directory_target(remote_entries, [str(tags[0])] if tags else [])
+            if target is not None:
+                load_remote(target, history_action="new")
+
+        for label, command in (
+            ("Back", remote_back),
+            ("Forward", remote_forward),
+            ("Up", remote_up),
+            ("Home", remote_home),
+            ("Refresh", remote_refresh),
+        ):
+            remote_buttons[label].configure(command=command)
+        remote_buttons["New Folder"].configure(command=remote_new_folder)
+        remote_buttons["Rename"].configure(command=remote_rename)
+        remote_buttons["Delete"].configure(command=remote_delete)
+        remote_buttons["Properties"].configure(command=remote_properties)
+        remote_buttons["Copy Path"].configure(command=remote_copy_path)
+        for column in remote_columns:
+            remote_tree.heading(column, command=lambda name=column: sort_remote(name))
+        remote_entry.bind("<Return>", lambda _event: load_remote(remote_path_var.get()))
+        remote_tree.bind("<Double-Button-1>", open_remote_selected)
+        remote_tree.bind("<Return>", open_remote_selected)
+
+        def sync_remote_session(session_state: SessionLifecycleState) -> None:
+            connected = session_state is SessionLifecycleState.CONNECTED and browser_client.is_alive()
+            if connected:
+                state.mark_remote_reconnected(True)
+            else:
+                state.mark_remote_disconnected()
+                remote_mutating["active"] = False
+            widget_state = "normal" if connected else "disabled"
+            for button in remote_buttons.values():
+                button.configure(state=widget_state)
+            remote_entry.configure(state=widget_state)
+            remote_tree.state(("!disabled",) if connected else ("disabled",))
+            remote_scrollbar.state(("!disabled",) if connected else ("disabled",))
+            if not connected:
+                remote_status_var.set("Disconnected")
+            update_transfer_actions()
+            update_mutation_actions()
+
+        self._sftp_view_state_callbacks[view_id] = (record.session_id, sync_remote_session)
+        load()
+        load_remote(history_action="initial")
+        refresh_transfer_queue()
+        update_transfer_actions()
+        update_mutation_actions()
+
+        def close() -> None:
+            state.next_generation(True)
+            self._session_controller.unregister_sftp_view(record.session_id, view_id)
+            self._sftp_browser_clients.close_view(record.session_id, view_id)
+            self._sftp_views.pop(view_id, None)
+            self._sftp_view_state_callbacks.pop(view_id, None)
+            self._sftp_transfer_status_callbacks.pop(view_id, None)
+            self._sftp_transfer_queue_callbacks.pop(view_id, None)
+            window.destroy()
+            self._refresh_sessions()
+
+        window.protocol("WM_DELETE_WINDOW", close)
+        self._refresh_sessions()
+        return view_id
+
+    def _open_selected_session_tunnel(self):
+        record = self._selected_session_record()
+        tab = self._conn_tabs.get(record.session_id) if record else None
+        if tab:
+            tab._open_tunnels()
 
     def _on_profile_selection(self, _event=None):
         self._update_profile_actions()
@@ -6079,6 +9105,19 @@ class SSHVaultApp(tk.Tk):
             self._profile_selection_note.set("")
             return
         selected = self._vault.entries[idx]
+        self.selected_profile_id = str(selected.get("id"))
+        self._runtime_settings["last_selected_profile_id"] = self.selected_profile_id
+        self._save_runtime_settings()
+        self.loaded_profile_snapshot = json.loads(json.dumps(selected))
+        self.working_profile = json.loads(json.dumps(selected))
+        self.profile_dirty = False
+        self.profile_validation_errors = []
+        self._refresh_login_tab()
+        self._refresh_options_tab()
+        self._refresh_terminal_tab()
+        self._refresh_services_tab()
+        self._refresh_ssh_tab()
+        self._refresh_profile_heading()
         active = None
         try:
             active = self._conn_notebook.nametowidget(self._conn_notebook.select())
@@ -6091,13 +9130,103 @@ class SSHVaultApp(tk.Tk):
         else:
             self._profile_selection_note.set("")
 
+    def _validate_working_profile(self) -> bool:
+        if self.working_profile is None:
+            self.profile_validation_errors = ["No selected profile."]
+            return False
+        try:
+            validate_profile(self.working_profile, check_key_exists=False)
+        except ProfileError as exc:
+            self.profile_validation_errors = [str(exc)]
+            return False
+        self.profile_validation_errors = []
+        return True
+
+    # Canonical B1 working-copy API.  Widgets adapt to this model; it never
+    # writes the vault until commit_working_profile is called.
+    def load_profile_working_copy(self, profile_id: str) -> bool:
+        profile = next((item for item in self._vault.entries if item.get("id") == profile_id), None)
+        if profile is None:
+            self.clear_working_profile()
+            return False
+        self.selected_profile_id = profile_id
+        self.loaded_profile_snapshot = json.loads(json.dumps(profile))
+        self.working_profile = json.loads(json.dumps(profile))
+        self.profile_dirty = False
+        self.profile_validation_errors = []
+        self._refresh_options_tab()
+        self._refresh_terminal_tab()
+        self._refresh_sftp_tab()
+        self._refresh_services_tab()
+        self._refresh_ssh_tab()
+        self._refresh_profile_heading()
+        return True
+
+    def update_working_profile_field(self, field: str, value) -> bool:
+        if self.working_profile is None or field not in self.working_profile:
+            return False
+        self.working_profile[field] = value
+        self.recalculate_profile_dirty()
+        self._validate_working_profile()
+        self._refresh_action_states()
+        return True
+
+    def recalculate_profile_dirty(self) -> bool:
+        self.profile_dirty = bool(self.working_profile != self.loaded_profile_snapshot)
+        self._refresh_profile_heading()
+        return self.profile_dirty
+
+    def commit_working_profile(self) -> bool:
+        before = self.profile_dirty
+        self._save_working_profile()
+        return before and not self.profile_dirty
+
+    def discard_working_profile_changes(self) -> None:
+        self.working_profile = (
+            json.loads(json.dumps(self.loaded_profile_snapshot)) if self.loaded_profile_snapshot else None
+        )
+        self.profile_dirty = False
+        self.profile_validation_errors = []
+        self._refresh_options_tab()
+        self._refresh_terminal_tab()
+        self._refresh_sftp_tab()
+        self._refresh_services_tab()
+        self._refresh_ssh_tab()
+        self._refresh_profile_heading()
+
+    def clear_working_profile(self) -> None:
+        self.selected_profile_id = None
+        self.loaded_profile_snapshot = None
+        self.working_profile = None
+        self.profile_dirty = False
+        self.profile_validation_errors = []
+        self._refresh_services_tab()
+        self._refresh_ssh_tab()
+        self._refresh_profile_heading()
+
+    def _save_working_profile(self):
+        if self.working_profile is None or not self.profile_dirty or not self._validate_working_profile():
+            return
+        idx = next(
+            (i for i, item in enumerate(self._vault.entries) if item.get("id") == self.selected_profile_id), None
+        )
+        if idx is None:
+            return
+        try:
+            self._vault.update(idx, self.working_profile)
+        except ProfileError as exc:
+            self.profile_validation_errors = [str(exc)]
+            return
+        self.loaded_profile_snapshot = json.loads(json.dumps(self._vault.entries[idx]))
+        self.working_profile = json.loads(json.dumps(self._vault.entries[idx]))
+        self.profile_dirty = False
+        self._refresh_list()
+        self._refresh_profile_heading()
+
     def _show_profile_context_menu(self, event):
-        item = self._tree.identify_row(event.y)
-        if item:
-            self._tree.selection_set(item)
-            self._tree.focus(item)
-            self._update_profile_actions()
-            self._profile_context_menu.tk_popup(event.x_root, event.y_root)
+        # The retired sidebar Treeview no longer owns a context menu.  Profile
+        # actions remain available from the single toolbar.
+        return None
 
     def _is_text_input_focus(self) -> bool:
         focus = self.focus_get()
@@ -6115,7 +9244,11 @@ class SSHVaultApp(tk.Tk):
 
     def _bind_profile_shortcuts(self):
         self.bind_all("<Control-n>", lambda event: self._profile_shortcut(event, self._add_entry), add="+")
-        self.bind_all("<Control-f>", lambda event: self._profile_shortcut(event, self._search_entry.focus_set), add="+")
+        self.bind_all(
+            "<Control-f>",
+            lambda event: self._profile_shortcut(event, self._toolbar_buttons["Load profile"].focus_set),
+            add="+",
+        )
         self.bind_all("<Control-e>", lambda event: self._profile_shortcut(event, self._edit_entry), add="+")
         self.bind_all("<Control-d>", lambda event: self._profile_shortcut(event, self._duplicate_entry), add="+")
         self.bind_all("<Delete>", lambda event: self._profile_shortcut(event, self._delete_entry), add="+")
@@ -6146,22 +9279,21 @@ class SSHVaultApp(tk.Tk):
             self._refresh_list()
 
     def _duplicate_entry(self):
-        idx = self._selected_idx()
-        if idx is None:
+        source = self.working_profile
+        if source is None or not self._validate_working_profile():
             return
-        source = self._vault.entries[idx]
         state = ProfileSidebarState(self._vault.entries)
         duplicate = {key: value for key, value in source.items() if key not in {"id", "password", "passphrase"}}
         duplicate["name"] = state.duplicate_name(source)
-        dlg = EntryDialog(self, duplicate)
-        if dlg.result:
-            try:
-                self._vault.add(dlg.result, dlg.secret or "")
-            except ProfileError as exc:
-                messagebox.showerror("Could not duplicate connection", str(exc))
-                return
-            self._refresh_list()
-            self._update_statusbar()
+        try:
+            created = self._vault.add(duplicate)
+        except ProfileError as exc:
+            messagebox.showerror("Could not duplicate connection", str(exc))
+            return
+        self.load_profile_working_copy(str(created["id"]))
+        self._refresh_list()
+        self._tree.selection_set(str(created["id"]))
+        self._update_statusbar()
 
     def _delete_entry(self):
         idx = self._selected_idx()
@@ -6414,6 +9546,36 @@ class SSHVaultApp(tk.Tk):
         if idx is not None:
             self._connect_by_idx(idx)
 
+    def _selected_native_profile(self) -> dict | None:
+        idx = self._selected_idx()
+        if idx is None:
+            return None
+        profile = dict(self._vault.entries[idx])
+        profile["timeout"] = self._runtime_settings.get("connection_timeout", 15)
+        return profile
+
+    def _open_selected_terminal(self):
+        """Open an intentional native terminal without creating Paramiko/SFTP state."""
+        profile = self._selected_native_profile()
+        if profile is None:
+            return
+        if self._native_terminal_backend.open_terminal_window(profile):
+            self._status_var.set(f"Opened terminal for {profile.get('name', profile.get('host', 'profile'))}.")
+        else:
+            messagebox.showwarning("Native VTE terminal", self._native_terminal_backend.status, parent=self)
+
+    def _open_selected_terminal_tab(self):
+        profile = self._selected_native_profile()
+        if profile is None:
+            return
+        if self._native_terminal_backend.open_terminal_tab(profile):
+            self._status_var.set(f"Opened terminal tab for {profile.get('name', profile.get('host', 'profile'))}.")
+        else:
+            messagebox.showwarning("Native VTE terminal", self._native_terminal_backend.status, parent=self)
+
+    def _open_selected_terminal_window(self):
+        self._open_selected_terminal()
+
     def _connect_by_idx(self, idx: int):
         if not paramiko:
             return
@@ -6421,22 +9583,53 @@ class SSHVaultApp(tk.Tk):
         self._status_var.set(f"Connecting to {profile.get('name', profile.get('host', 'profile'))}…")
         # Profiles remain secret-free. ConnectionTab receives only a short-
         # lived in-memory copy when password authentication needs a credential.
-        entry = dict(profile)
+        entry = json.loads(json.dumps(profile))
         entry["timeout"] = self._runtime_settings.get("connection_timeout", 15)
-        entry["default_download_directory"] = self._runtime_settings.get("download_directory", "")
         if profile.get("auth_method") == "password":
-            entry["password"] = self._vault.secret_for(profile) or ""
+            try:
+                password = self._vault.secret_for(profile) or ""
+            except ProfileError:
+                password = ""
+            if not password:
+                password = simpledialog_ask(
+                    "Password required",
+                    f"Enter the password for {profile.get('user', '')}@{profile.get('host', '')}",
+                    secret=True,
+                )
+            if not password:
+                self._status_var.set("Connection cancelled: no password was provided.")
+                return
+            # This is used by this connection attempt only; it is never added
+            # to the profile data or written to a local file.
+            entry["password"] = password
         runtime_entries = []
         for candidate in self._vault.entries:
             runtime = dict(candidate)
             if candidate.get("auth_method") == "password":
-                runtime["password"] = self._vault.secret_for(candidate) or ""
+                try:
+                    runtime["password"] = self._vault.secret_for(candidate) or ""
+                except ProfileError:
+                    runtime["password"] = ""
             runtime_entries.append(runtime)
-        tab = ConnectionTab(self._conn_notebook, entry, vault_entries=runtime_entries)
-        # Each click starts an independent SSH connection, even for the same
-        # saved profile. A serial key keeps the session registry unambiguous.
+        session = self._session_controller.create_session(entry, user_initiated=True)
+        # This application-only path belongs to the ConnectionTab adapter, not
+        # the validated profile/session snapshot.
+        entry["default_download_directory"] = self._runtime_settings.get("download_directory", "")
+        connection_parent = (
+            self._ensure_connection_view_host()
+            if hasattr(self, "_ensure_connection_view_host")
+            else self._conn_notebook
+        )
+        tab = ConnectionTab(
+            connection_parent,
+            entry,
+            vault_entries=runtime_entries,
+            session_controller=self._session_controller,
+            session_id=session.session_id,
+        )
+        # Each click starts an independent session, even for the same profile.
         self._session_serial += 1
-        tab_id = f"session-{self._session_serial}"
+        tab_id = session.session_id
         self._conn_tabs[tab_id] = tab
         label = entry.get("name", entry["host"])
         duplicates = sum(
@@ -6453,6 +9646,9 @@ class SSHVaultApp(tk.Tk):
         self._conn_notebook.select(tab)
         self._status_var.set(f"Connecting to {label}...")
         self._update_statusbar()
+        tab.start_connection()
+        self._selected_session_id = session.session_id
+        self._refresh_sessions()
 
     def _show_connection_tab_menu(self, event):
         """Show actions for the outer connection workspace tabs."""
@@ -6813,9 +10009,10 @@ class SSHVaultApp(tk.Tk):
         SFTPServerSettingsDialog(self)
 
     def _open_log(self):
-        panel = LogViewerPanel(self._conn_notebook)
-        self._conn_notebook.add(panel, text="  Log  ")
-        self._conn_notebook.select(panel)
+        dialog = tk.Toplevel(self)
+        dialog.title("SSHVault — Activity Log")
+        dialog.geometry("820x480")
+        LogViewerPanel(dialog).pack(fill="both", expand=True)
 
     def _open_settings(self):
         SettingsDialog(self)
@@ -6827,29 +10024,144 @@ class SSHVaultApp(tk.Tk):
         DiagnosticsDialog(self)
 
     def _restore_session(self):
+        """Load a clean-shutdown restore list without ever connecting on startup."""
+        self._pending_restore_profile_ids: list[str] = []
+        self._pending_restore_records: list[dict] = []
+        self._pending_restore_indices: list[int] = []  # compatibility for old callers/tests
         if not SESSION_FILE.exists():
+            if hasattr(self, "_update_profile_actions"):
+                self._update_profile_actions()
             return
         try:
-            indices = json.loads(SESSION_FILE.read_text())
-        except Exception:
+            saved = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            if hasattr(self, "_update_profile_actions"):
+                self._update_profile_actions()
             return
-        for idx in indices:
-            if isinstance(idx, int) and idx < len(self._vault.entries):
+        if not isinstance(saved, dict) or not saved.get("clean_shutdown"):
+            if hasattr(self, "_update_profile_actions"):
+                self._update_profile_actions()
+            return
+        ids = None
+        legacy_profile_ids = False
+        records = saved.get("sessions")
+        if isinstance(records, list):
+            self._pending_restore_records = [
+                dict(record)
+                for record in records
+                if isinstance(record, dict)
+                and record.get("restore_eligible") is True
+                and record.get("was_connected") is True
+                and isinstance(record.get("profile_id"), str)
+                and any(entry.get("id") == record["profile_id"] for entry in self._vault.entries)
+            ]
+            self._pending_restore_profile_ids = [record["profile_id"] for record in self._pending_restore_records]
+        else:
+            ids = saved.get("profile_ids")
+            if isinstance(ids, list):
+                legacy_profile_ids = True
+                self._pending_restore_profile_ids = [
+                    profile_id
+                    for profile_id in ids
+                    if isinstance(profile_id, str) and any(e.get("id") == profile_id for e in self._vault.entries)
+                ]
+                self._pending_restore_records = [
+                    {"profile_id": profile_id, "restore_eligible": True, "was_connected": True}
+                    for profile_id in self._pending_restore_profile_ids
+                ]
+            else:
+                ids = None
+        if ids is None and not self._pending_restore_records:
+            # Legacy snapshots used unstable list positions.  Convert only the
+            # snapshot, retain a backup, and never touch the profile vault.
+            indices = saved.get("open_indices", [])
+            self._pending_restore_indices = [
+                idx for idx in indices if isinstance(idx, int) and 0 <= idx < len(self._vault.entries)
+            ]
+            self._pending_restore_profile_ids = [
+                str(self._vault.entries[idx].get("id")) for idx in self._pending_restore_indices
+            ]
+            self._pending_restore_records = [
+                {"profile_id": profile_id, "restore_eligible": True, "was_connected": True}
+                for profile_id in self._pending_restore_profile_ids
+            ]
+            if self._pending_restore_indices:
+                backup = SESSION_FILE.with_suffix(".pre-id-migration.json")
+                suffix = 2
+                while backup.exists():
+                    backup = SESSION_FILE.with_suffix(f".pre-id-migration-{suffix}.json")
+                    suffix += 1
+                try:
+                    shutil.copy2(SESSION_FILE, backup)
+                    atomic_json_write(
+                        SESSION_FILE,
+                        {"schema_version": 2, "clean_shutdown": True, "sessions": self._pending_restore_records},
+                    )
+                except OSError:
+                    pass
+        elif legacy_profile_ids:
+            backup = SESSION_FILE.with_suffix(".pre-session-schema-migration.json")
+            suffix = 2
+            while backup.exists():
+                backup = SESSION_FILE.with_suffix(f".pre-session-schema-migration-{suffix}.json")
+                suffix += 1
+            try:
+                shutil.copy2(SESSION_FILE, backup)
+                atomic_json_write(
+                    SESSION_FILE,
+                    {"schema_version": 2, "clean_shutdown": True, "sessions": self._pending_restore_records},
+                )
+            except OSError:
+                pass
+        # If this run crashes, the older snapshot must not be mistaken for
+        # the immediately preceding clean shutdown.  The in-memory list still
+        # supports the explicit Restore Previous Sessions command.
+        try:
+            atomic_json_write(
+                SESSION_FILE, {"schema_version": 2, "clean_shutdown": False, "sessions": self._pending_restore_records}
+            )
+        except OSError:
+            pass
+        if hasattr(self, "_update_profile_actions"):
+            self._update_profile_actions()
+
+    def _restore_previous_sessions(self, startup: bool = False):
+        """Explicitly restore only clean-shutdown connected sessions once."""
+        restored = 0
+        for profile_id in list(self._pending_restore_profile_ids):
+            idx = next((i for i, profile in enumerate(self._vault.entries) if profile.get("id") == profile_id), None)
+            if idx is None:  # deleted profiles are intentionally not resurrected
+                continue
+            self._connect_by_idx(idx)
+            restored += 1
+        # Legacy tests and integrations may still set the old pending indices.
+        for idx in list(self._pending_restore_indices):
+            if idx not in range(len(self._vault.entries)):
+                continue
+            if str(self._vault.entries[idx].get("id")) not in self._pending_restore_profile_ids:
                 self._connect_by_idx(idx)
+                restored += 1
+        self._pending_restore_profile_ids = []
+        self._pending_restore_indices = []
+        if hasattr(self, "_update_profile_actions"):
+            self._update_profile_actions()
+        if startup:
+            self._status_var.set(
+                f"Restoring {restored} previous session(s)…" if restored else "No sessions to restore."
+            )
+        elif restored:
+            self._status_var.set(f"Restoring {restored} previous session(s)…")
+        else:
+            self._status_var.set("No clean previous sessions to restore.")
 
     def _save_session(self):
-        open_indices = []
-        for tab_id, tab in self._conn_tabs.items():
-            e = tab._entry
-            for i, ve in enumerate(self._vault.entries):
-                if (
-                    ve.get("host") == e.get("host")
-                    and ve.get("port", 22) == e.get("port", 22)
-                    and ve.get("user", "root") == e.get("user", "root")
-                ):
-                    open_indices.append(i)
-                    break
-        SESSION_FILE.write_text(json.dumps(open_indices))
+        sessions = [
+            record.restoration_record()
+            for record in self._session_controller.sessions.values()
+            if record.state is SessionLifecycleState.CONNECTED
+            and any(item.get("id") == record.profile_id for item in self._vault.entries)
+        ]
+        atomic_json_write(SESSION_FILE, {"schema_version": 2, "clean_shutdown": True, "sessions": sessions})
 
     def _on_close(self):
         self._save_session()
@@ -6861,6 +10173,9 @@ class SSHVaultApp(tk.Tk):
                 tab.shutdown()
             except Exception:
                 pass
+        for scheduler in self._sftp_transfer_schedulers.values():
+            scheduler.shutdown()
+        self._native_terminal_backend.close()
         self.destroy()
 
 

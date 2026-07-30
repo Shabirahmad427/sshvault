@@ -167,3 +167,31 @@ class FakePTYTerminalTests(unittest.TestCase):
         pty.close()
         pty.feed_bytes(b"new")
         self.assertEqual(pty.screen.line(0), "old")
+
+    def test_nano_save_and_vim_write_bytes_are_forwarded_unchanged(self):
+        pty = FakePTY()
+        # nano: type, Ctrl-O, confirm filename, Ctrl-X.
+        nano = "changed" + terminal_key_sequence("o", "o", 0x0004) + terminal_key_sequence("Return")
+        nano += terminal_key_sequence("x", "x", 0x0004)
+        # vim: Esc, :wq, Return.  These are terminal bytes, not Tk edits.
+        vim = terminal_key_sequence("Escape") + ":wq" + terminal_key_sequence("Return")
+        pty.send(nano)
+        pty.send(vim)
+        self.assertEqual(pty.outbound, [b"changed\x0f\r\x18", b"\x1b:wq\r"])
+
+    def test_application_cursor_and_function_key_translation(self):
+        pty = FakePTY()
+        pty.send(terminal_key_sequence("Up", application_cursor=True))
+        pty.send(terminal_key_sequence("F1"))
+        pty.send(terminal_key_sequence("F12"))
+        self.assertEqual(pty.outbound, [b"\x1bOA", b"\x1bOP", b"\x1b[24~"])
+
+    def test_extended_sgr_attributes_and_unicode_do_not_become_escape_text(self):
+        pty = FakePTY(columns=12, rows=2)
+        pty.feed_text("\x1b[38;5;196;48;2;1;2;3;1;3;4;9mê界\x1b[0m")
+        self.assertIn("ê", pty.screen.line(0))
+        self.assertIn("界", pty.screen.line(0))
+        cell = pty.screen.buffer[0][0]
+        self.assertTrue(cell.bold)
+        self.assertTrue(cell.italics)
+        self.assertTrue(cell.strikethrough)

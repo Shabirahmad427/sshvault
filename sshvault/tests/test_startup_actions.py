@@ -10,7 +10,7 @@ class StartupActionTests(unittest.TestCase):
         )
         results = c.run({"restart_tunnels": True, "open_terminal": True, "open_sftp": True}, 1)
         self.assertEqual(seen, ["tunnels", "terminal", "sftp"])
-        self.assertEqual([r.status for r in results], ["completed"] * 3 + ["skipped"])
+        self.assertEqual([r.status for r in results], ["completed", "skipped", "completed", "completed"])
 
     def test_command_and_partial_failure(self):
         seen = []
@@ -27,9 +27,16 @@ class StartupActionTests(unittest.TestCase):
             }
         )
         results = c.run(
-            {"restart_tunnels": True, "open_terminal": True, "open_sftp": True, "startup_command": "echo visible"}, 1
+            {
+                "restart_tunnels": True,
+                "open_terminal": True,
+                "open_sftp": True,
+                "run_startup_commands": True,
+                "startup_command": "echo visible",
+            },
+            1,
         )
-        self.assertEqual(seen, ["terminal", "sftp", "command"])
+        self.assertEqual(seen, ["command", "terminal", "sftp"])
         self.assertEqual(results[0].status, "failed")
         self.assertNotIn("secret", results[0].error)
 

@@ -23,6 +23,7 @@ class SettingsTests(unittest.TestCase):
 
     def test_defaults_valid_booleans_unknown_and_secrets(self):
         self.assertEqual(validate_settings({})["scrollback_limit"], 5000)
+        self.assertFalse(validate_settings({})["restore_previous_sessions_on_start"])
         got = validate_settings(
             {"scrollback_limit": "6000", "connection_timeout": "20", "confirm_delete": 0, "future": 1}
         )

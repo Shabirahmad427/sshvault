@@ -8,12 +8,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 import ipaddress
 import json
 import os
 import platform
 import posixpath
+import select
 import socket
+import socketserver
+import subprocess
+import secrets
 import time
 from pathlib import Path
 import re
@@ -62,7 +67,12 @@ _SETTINGS_ALLOWED = {
     "maximum_sftp_transfers",
     "sftp_chunk_size",
     "show_transfer_manager_on_start",
+    "restore_previous_sessions_on_start",
     "transfer_manager_window",
+    "load_last_selected_profile",
+    "login_automatically_on_start",
+    "restore_window_position",
+    "last_selected_profile_id",
 }
 DEFAULT_SETTINGS = {
     "scrollback_limit": 5000,
@@ -75,7 +85,13 @@ DEFAULT_SETTINGS = {
     "maximum_sftp_transfers": 3,
     "sftp_chunk_size": 1048576,
     "show_transfer_manager_on_start": True,
+    "restore_previous_sessions_on_start": False,
     "transfer_manager_window": {},
+    # Startup stays passive unless the user explicitly opts in.
+    "load_last_selected_profile": True,
+    "login_automatically_on_start": False,
+    "restore_window_position": True,
+    "last_selected_profile_id": "",
 }
 SFTP_TRANSFER_CHUNK_SIZES = (65536, 131072, 262144, 524288, 1048576, 2097152)
 SFTP_SIDECAR_PROGRESS_BYTES = 16 * 1024 * 1024
@@ -84,6 +100,103 @@ SFTP_PROGRESS_INTERVAL = 0.25
 SFTP_PREFETCH_DEPTHS = (4, 8, 16, 32)
 SFTP_PREFETCH_WORKER_MEMORY_LIMIT = 32 * 1024 * 1024
 SFTP_PREFETCH_TOTAL_MEMORY_LIMIT = 96 * 1024 * 1024
+
+OPTIONS_GROUPS = ("On successful login", "Application startup", "On logout")
+POST_LOGIN_OPTION_LABELS = (
+    "Open Terminal",
+    "Open SFTP",
+    "Start enabled services",
+    "Run configured startup commands",
+)
+APPLICATION_STARTUP_OPTION_LABELS = (
+    "Load last selected profile",
+    "Log in automatically",
+    "Restore previous sessions",
+    "Restore window position",
+)
+LOGOUT_OPTION_LABELS = (
+    "Close terminal windows",
+    "Close SFTP windows",
+    "Stop enabled services",
+    "Ask before cancelling active transfers",
+)
+TERMINAL_GROUPS = ("Terminal Emulation", "Appearance", "Session Behavior", "Terminal Actions")
+TERMINAL_BACKENDS = ("Automatic", "Native VTE", "Legacy")
+TERMINAL_BELLS = ("System bell", "Visual bell", "Disabled")
+TERMINAL_CURSOR_SHAPES = ("Block", "I-Beam", "Underline")
+TERMINAL_COLOR_THEMES = ("System", "Light", "Dark")
+SERVICES_SECTIONS = ("Port Forwarding", "SOCKS/HTTP Proxy", "X11 Forwarding")
+X11_FORWARDING_OPTION_LABELS = (
+    "Enable X11 forwarding",
+    "Trusted forwarding",
+    "X11 display",
+)
+PORT_FORWARDING_COLUMNS = (
+    "Enabled",
+    "Type",
+    "Listen Host",
+    "Listen Port",
+    "Destination Host",
+    "Destination Port",
+)
+PORT_FORWARDING_RUNTIME_COLUMNS = PORT_FORWARDING_COLUMNS + ("Status",)
+PORT_FORWARDING_TYPES = ("Local", "Remote", "Dynamic", "HTTP")
+CONTROLLER_REGION_ORDER = (
+    "Profile heading",
+    "Profile rail / Configuration notebook",
+    "Connection log",
+    "Login/status strip",
+)
+CONTROLLER_DEFAULT_GEOMETRY = (1050, 720)
+CONTROLLER_MINIMUM_GEOMETRY = (900, 620)
+SECTION_PADDING = 6
+SFTP_GROUPS = ("Directory Defaults", "Transfer Defaults", "SFTP Actions")
+SFTP_OVERWRITE_BEHAVIORS = ("Ask", "Overwrite", "Skip", "Rename")
+SSH_SETTING_LABELS = (
+    "Enable compression",
+    "TCP keepalive",
+    "Keepalive interval",
+    "Maximum missed keepalives",
+    "Agent forwarding",
+    "Preferred key-exchange algorithm",
+    "Preferred host-key algorithm",
+    "Preferred cipher",
+    "Preferred MAC",
+)
+SSH_KEY_EXCHANGE_CHOICES = (
+    "Automatic",
+    "curve25519-sha256@libssh.org",
+    "ecdh-sha2-nistp256",
+    "ecdh-sha2-nistp384",
+    "ecdh-sha2-nistp521",
+    "diffie-hellman-group16-sha512",
+    "diffie-hellman-group-exchange-sha256",
+    "diffie-hellman-group14-sha256",
+)
+SSH_HOST_KEY_CHOICES = (
+    "Automatic",
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "rsa-sha2-512",
+    "rsa-sha2-256",
+)
+SSH_CIPHER_CHOICES = (
+    "Automatic",
+    "aes128-ctr",
+    "aes192-ctr",
+    "aes256-ctr",
+    "aes128-gcm@openssh.com",
+    "aes256-gcm@openssh.com",
+)
+SSH_MAC_CHOICES = (
+    "Automatic",
+    "hmac-sha2-256-etm@openssh.com",
+    "hmac-sha2-512-etm@openssh.com",
+    "hmac-sha2-256",
+    "hmac-sha2-512",
+)
 
 
 def bounded_prefetch_depth(chunk_size: int, requested_depth: int, workers: int = 1) -> int:
@@ -349,6 +462,13 @@ def validate_settings(raw: dict[str, Any]) -> dict[str, Any]:
             # while the UI presents the bounded supported choices for new edits.
             "sftp_chunk_size": max(SFTP_TRANSFER_CHUNK_SIZES[0], min(sftp_chunk_size, SFTP_TRANSFER_CHUNK_SIZES[-1])),
             "show_transfer_manager_on_start": bool(raw.get("show_transfer_manager_on_start", True)),
+            # Deliberately opt-in: older installations must never begin
+            # connecting merely because they have a session file.
+            "restore_previous_sessions_on_start": bool(raw.get("restore_previous_sessions_on_start", False)),
+            "load_last_selected_profile": bool(raw.get("load_last_selected_profile", True)),
+            "login_automatically_on_start": bool(raw.get("login_automatically_on_start", False)),
+            "restore_window_position": bool(raw.get("restore_window_position", True)),
+            "last_selected_profile_id": str(raw.get("last_selected_profile_id", "")).strip(),
             "transfer_manager_window": TransferManagerWindowState.from_settings(
                 raw.get("transfer_manager_window")
             ).to_settings(),
@@ -696,7 +816,9 @@ class StartupActionResult:
 class StartupActionCoordinator:
     """Deterministic, generation-aware post-login action coordinator."""
 
-    ORDER = ("tunnels", "terminal", "sftp", "command")
+    # Keep the user-visible post-login order deterministic.  The historical
+    # ``tunnels`` handler is the existing services implementation.
+    ORDER = ("tunnels", "command", "terminal", "sftp")
 
     def __init__(self, handlers: dict[str, Any] | None = None) -> None:
         self.handlers = handlers or {}
@@ -715,10 +837,15 @@ class StartupActionCoordinator:
         self.running = True
         self.results = []
         enabled = {
-            "tunnels": bool(preferences.get("start_enabled_tunnels") or preferences.get("restart_tunnels")),
-            "terminal": bool(preferences.get("open_terminal", True)),
+            "tunnels": bool(
+                preferences.get("start_enabled_services")
+                or preferences.get("start_enabled_tunnels")
+                or preferences.get("restart_tunnels")
+            ),
+            "terminal": bool(preferences.get("open_terminal", False)),
             "sftp": bool(preferences.get("open_sftp", False)),
-            "command": bool(str(preferences.get("startup_command", "")).strip()),
+            "command": bool(preferences.get("run_startup_commands", False))
+            and bool(str(preferences.get("startup_command", "")).strip()),
         }
         for name in self.ORDER:
             if self.cancelled or generation != self.generation:
@@ -862,9 +989,146 @@ class DiagnosticsCollector:
 
 @dataclass(frozen=True)
 class ProfileLaunchPreferences:
-    open_terminal: bool = True
+    open_terminal: bool = False
     open_sftp: bool = False
+    start_enabled_services: bool = False
+    run_startup_commands: bool = False
     startup_command: str = ""
+
+
+def default_ssh_preferences() -> dict[str, Any]:
+    """Return passive defaults for the not-yet-runtime-bound SSH controls."""
+    return {
+        "compression": False,
+        "tcp_keepalive": False,
+        "keepalive_interval": 0,
+        "maximum_missed_keepalives": 3,
+        "agent_forwarding": False,
+        "preferred_key_exchange": "Automatic",
+        "preferred_host_key": "Automatic",
+        "preferred_cipher": "Automatic",
+        "preferred_mac": "Automatic",
+    }
+
+
+def validate_ssh_preferences(raw: object) -> dict[str, Any]:
+    """Normalize safe SSH-tab values without applying them to a connection."""
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ProfileError("SSH preferences must be an object.")
+    result = default_ssh_preferences()
+    result.update(raw)
+    for key, label in (
+        ("compression", "Compression"),
+        ("tcp_keepalive", "TCP keepalive"),
+        ("agent_forwarding", "Agent forwarding"),
+    ):
+        if not isinstance(result[key], bool):
+            raise ProfileError(f"{label} must be enabled or disabled.")
+    for key, label, minimum, maximum in (
+        ("keepalive_interval", "Keepalive interval", 0, 3600),
+        ("maximum_missed_keepalives", "Maximum missed keepalives", 1, 20),
+    ):
+        value = result[key]
+        if isinstance(value, (bool, float)):
+            raise ProfileError(f"{label} must be a whole number from {minimum} to {maximum}.")
+        try:
+            value = int(str(value))
+        except (TypeError, ValueError) as exc:
+            raise ProfileError(f"{label} must be a whole number from {minimum} to {maximum}.") from exc
+        if not minimum <= value <= maximum:
+            raise ProfileError(f"{label} must be between {minimum} and {maximum}.")
+        result[key] = value
+    for key, label, choices in (
+        ("preferred_key_exchange", "key-exchange algorithm", SSH_KEY_EXCHANGE_CHOICES),
+        ("preferred_host_key", "host-key algorithm", SSH_HOST_KEY_CHOICES),
+        ("preferred_cipher", "cipher", SSH_CIPHER_CHOICES),
+        ("preferred_mac", "MAC", SSH_MAC_CHOICES),
+    ):
+        value = str(result[key]).strip()
+        if value not in choices:
+            raise ProfileError(f"Unsupported preferred {label}.")
+        result[key] = value
+    return result
+
+
+def ssh_preferences_from_profile(profile: object) -> dict[str, Any]:
+    """Read a profile's SSH preferences with backward-compatible defaults."""
+    if not isinstance(profile, dict):
+        return default_ssh_preferences()
+    connection_options = profile.get("connection_options", {})
+    if not isinstance(connection_options, dict):
+        return default_ssh_preferences()
+    stored = connection_options.get("ssh_preferences")
+    if stored is None:
+        legacy = default_ssh_preferences()
+        legacy["compression"] = bool(profile.get("compression", False))
+        terminal_options = profile.get("terminal_options", {})
+        if isinstance(terminal_options, dict):
+            legacy["agent_forwarding"] = bool(terminal_options.get("agent_forwarding", False))
+        return validate_ssh_preferences(legacy)
+    return validate_ssh_preferences(stored)
+
+
+def set_working_ssh_preference(profile: dict[str, Any], key: str, value: Any) -> None:
+    """Update only the supplied working profile; persistence remains explicit."""
+    if key not in default_ssh_preferences():
+        raise ProfileError("Unsupported SSH preference.")
+    connection_options = dict(profile.get("connection_options", {}))
+    preferences = dict(connection_options.get("ssh_preferences", {}))
+    preferences[key] = value
+    connection_options["ssh_preferences"] = preferences
+    profile["connection_options"] = connection_options
+
+
+@dataclass(frozen=True)
+class SSHRuntimePreferences:
+    """Validated per-host settings captured from one session snapshot."""
+
+    compression: bool
+    tcp_keepalive: bool
+    keepalive_interval: int
+    maximum_missed_keepalives: int
+    agent_forwarding: bool
+    preferred_key_exchange: str | None
+    preferred_host_key: str | None
+    preferred_cipher: str | None
+    preferred_mac: str | None
+
+    @property
+    def algorithm_preferences(self) -> dict[str, str]:
+        return {
+            key: value
+            for key, value in (
+                ("kex", self.preferred_key_exchange),
+                ("host_key", self.preferred_host_key),
+                ("cipher", self.preferred_cipher),
+                ("mac", self.preferred_mac),
+            )
+            if value is not None
+        }
+
+
+def ssh_runtime_preferences(profile: object) -> SSHRuntimePreferences:
+    """Build one immutable runtime policy; Automatic values are omitted."""
+    values = ssh_preferences_from_profile(profile)
+
+    def selected(key: str) -> str | None:
+        value = str(values[key])
+        return None if value == "Automatic" else value
+
+    return SSHRuntimePreferences(
+        compression=bool(values["compression"]),
+        tcp_keepalive=bool(values["tcp_keepalive"]),
+        keepalive_interval=int(values["keepalive_interval"]),
+        maximum_missed_keepalives=int(values["maximum_missed_keepalives"]),
+        agent_forwarding=bool(values["agent_forwarding"]),
+        preferred_key_exchange=selected("preferred_key_exchange"),
+        preferred_host_key=selected("preferred_host_key"),
+        preferred_cipher=selected("preferred_cipher"),
+        preferred_mac=selected("preferred_mac"),
+    )
 
 
 def default_profile_sections(raw: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -879,13 +1143,26 @@ def default_profile_sections(raw: dict[str, Any] | None = None) -> dict[str, Any
         },
         "terminal_options": {
             "terminal_type": "xterm-256color",
-            "scrollback": 5000,
+            "scrollback": 10000,
             "starting_directory": str(raw.get("startup_directory", "")),
             "startup_command": str(raw.get("startup_command", "")),
             "environment": {},
             "auto_open": True,
             "font_override": False,
             "font_size": 10,
+            "backend": "Automatic",
+            "font": "Monospace",
+            "cursor_shape": "Block",
+            "cursor_blink": True,
+            "bell": "System bell",
+            "color_theme": "System",
+            "agent_forwarding": False,
+            "x11_forwarding": False,
+            "x11_trusted": False,
+            "x11_display": "",
+            "close_on_logout": False,
+            "scroll_on_output": False,
+            "scroll_on_keystroke": True,
         },
         "sftp_options": {
             "initial_local_directory": "",
@@ -906,8 +1183,123 @@ def default_profile_sections(raw: dict[str, Any] | None = None) -> dict[str, Any
             "reopen_sftp": False,
             "restart_tunnels": False,
             "logging_level": "normal",
+            "ssh_preferences": default_ssh_preferences(),
         },
-        "launch_preferences": {"open_terminal": True, "open_sftp": False, "startup_command": ""},
+        "launch_preferences": {
+            "open_terminal": False,
+            "open_sftp": False,
+            "start_enabled_services": False,
+            "run_startup_commands": False,
+            "startup_command": "",
+        },
+    }
+
+
+X11_FORWARDING_STATUSES = ("Stopped", "Active", "Failed")
+
+
+def normalized_x11_forwarding_options(options: object) -> dict[str, Any]:
+    """Return the secret-free X11 options used by one connection snapshot."""
+    values = options if isinstance(options, dict) else {}
+    return {
+        "enabled": bool(values.get("x11_forwarding", False)),
+        "trusted": bool(values.get("x11_trusted", False)),
+        "display": str(values.get("x11_display", "")).strip(),
+    }
+
+
+def x11_display_screen(display: str) -> int:
+    """Extract the X11 screen number without exposing or validating host data."""
+    match = re.search(r":\d+(?:\.(\d+))?$", display.strip())
+    if match is None or match.group(1) is None:
+        return 0
+    return int(match.group(1))
+
+
+class X11ForwardingSession:
+    """Session-scoped X11 request policy for newly opened SSH channels."""
+
+    def __init__(
+        self,
+        session_id: str,
+        terminal_options: object,
+        environment: dict[str, str] | None = None,
+    ) -> None:
+        self.session_id = session_id
+        self.options = normalized_x11_forwarding_options(terminal_options)
+        self._environment = dict(os.environ if environment is None else environment)
+        self.status = "Stopped"
+        self.error = ""
+        self.closed = False
+        self.request_count = 0
+        self.last_request: dict[str, Any] | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.options["enabled"])
+
+    @property
+    def trusted(self) -> bool:
+        return bool(self.options["trusted"])
+
+    @property
+    def display(self) -> str:
+        explicit = str(self.options["display"])
+        return explicit or str(self._environment.get("DISPLAY", "")).strip()
+
+    def request_for_channel(self, channel: Any) -> bool:
+        """Request X11 on one channel; failure never escapes to the SSH session."""
+        if self.closed or not self.enabled:
+            return False
+        display = self.display
+        if not display:
+            self.status = "Failed"
+            self.error = "X11 display is unavailable."
+            return False
+        request = {
+            "display": display,
+            "trusted": self.trusted,
+            "screen_number": x11_display_screen(display),
+        }
+        self.last_request = request
+        try:
+            # SSH's channel request carries screen/cookie data. Trusted versus
+            # untrusted is a client policy; OpenSSH receives -Y/-X separately.
+            channel.request_x11(
+                screen_number=request["screen_number"],
+                single_connection=False,
+            )
+        except Exception:
+            self.status = "Failed"
+            self.error = "X11 forwarding request failed."
+            return False
+        self.request_count += 1
+        self.status = "Active"
+        self.error = ""
+        return True
+
+    def close(self) -> None:
+        """Forget this session's X11 policy without affecting other sessions."""
+        if self.closed:
+            return
+        self.closed = True
+        self.status = "Stopped"
+
+
+def normalized_launch_preferences(raw: object) -> dict[str, Any]:
+    """Return safe, profile-scoped post-login preferences.
+
+    These are intentionally separate from the application startup settings.
+    Old profiles load with passive defaults and are only changed on an explicit
+    profile save.
+    """
+    source = raw if isinstance(raw, dict) else {}
+    return {
+        "open_terminal": bool(source.get("open_terminal", False)),
+        "open_sftp": bool(source.get("open_sftp", False)),
+        "start_enabled_services": bool(source.get("start_enabled_services", False)),
+        "run_startup_commands": bool(source.get("run_startup_commands", False)),
+        "startup_command": str(source.get("startup_command", "")).strip(),
     }
 
 
@@ -1091,14 +1483,14 @@ class TunnelFormState:
     generation: int = 0
 
     def validate(self) -> str | None:
-        if self.kind not in {"Local", "Remote", "Dynamic/SOCKS"}:
+        if self.kind not in {"Local", "Remote", "Dynamic/SOCKS", "HTTP"}:
             return "Choose a tunnel type."
         try:
             validate_host(self.bind_host)
             validate_port(self.bind_port)
         except ProfileError as exc:
             return str(exc)
-        if self.kind != "Dynamic/SOCKS":
+        if self.kind not in {"Dynamic/SOCKS", "HTTP"}:
             try:
                 validate_host(self.destination_host)
                 validate_port(self.destination_port)
@@ -1139,7 +1531,7 @@ class TunnelFormState:
         return True
 
     def visible_fields(self) -> dict[str, bool]:
-        return {"bind": True, "destination": self.kind != "Dynamic/SOCKS"}
+        return {"bind": True, "destination": self.kind not in {"Dynamic/SOCKS", "HTTP"}}
 
 
 @dataclass
@@ -1255,6 +1647,274 @@ class TunnelManager:
         self.connected = False
 
 
+LOCAL_FORWARDING_STATUSES = ("Stopped", "Starting", "Active", "Failed")
+
+
+@dataclass
+class LocalForwardingRuleRuntime:
+    """Session-owned status for one immutable forwarding-rule snapshot."""
+
+    rule: dict[str, Any]
+    status: str = "Stopped"
+    error: str = ""
+
+
+class LocalForwardingSession:
+    """Own enabled Local listeners for exactly one authenticated session."""
+
+    def __init__(
+        self,
+        session_id: str,
+        transport: Any,
+        rules: list[dict[str, Any]],
+        starter: Callable[[RunningTunnel], None] | None = None,
+    ) -> None:
+        self.session_id = session_id
+        self.transport = transport
+        self.manager = TunnelManager(transport, id(transport))
+        self.starter = starter
+        self.rules = json.loads(json.dumps(rules))
+        self.records: dict[str, LocalForwardingRuleRuntime] = {}
+        for rule in self.rules:
+            rule_id = str(rule.get("rule_id") or uuid4())
+            rule["rule_id"] = rule_id
+            self.records[rule_id] = LocalForwardingRuleRuntime(rule)
+        self.closed = False
+
+    def start_enabled(self) -> dict[str, LocalForwardingRuleRuntime]:
+        if self.closed:
+            return self.records
+        for record in self.records.values():
+            if record.rule.get("type") != "Local" or not bool(record.rule.get("enabled", True)):
+                continue
+            if record.status in {"Starting", "Active"}:
+                continue
+            record.status = "Starting"
+            record.error = ""
+            try:
+                self.manager.start(record.rule, self.starter)
+            except Exception as exc:
+                record.status = "Failed"
+                record.error = str(redact_secrets(str(exc)))
+                continue
+            record.status = "Active"
+        return self.records
+
+    def stop_all(self) -> None:
+        if self.closed:
+            return
+        self.manager.stop_all()
+        for record in self.records.values():
+            if record.status in {"Starting", "Active"}:
+                record.status = "Stopped"
+        self.closed = True
+
+    def status(self, rule_id: str) -> str:
+        record = self.records.get(rule_id)
+        return record.status if record is not None else "Stopped"
+
+    def active_rule_ids(self) -> list[str]:
+        return [rule_id for rule_id, record in self.records.items() if record.status == "Active"]
+
+
+def start_local_forwarding_listener(running: RunningTunnel, transport: Any) -> None:
+    """Bind one local listener and bridge accepted sockets through *transport*."""
+    rule = running.rule
+    listen_host = str(rule["bind_address"])
+    listen_port = int(rule["bind_port"])
+    destination = (str(rule["destination_host"]), int(rule["destination_port"]))
+
+    class ForwardingHandler(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            channel = None
+            try:
+                channel = transport.open_channel(
+                    "direct-tcpip",
+                    destination,
+                    self.request.getpeername(),
+                )
+                if channel is None:
+                    return
+                while not running.runtime.stop_event.is_set():
+                    readable, _, _ = select.select([self.request, channel], [], [], 0.2)
+                    if self.request in readable:
+                        data = self.request.recv(65536)
+                        if not data:
+                            break
+                        channel.sendall(data)
+                    if channel in readable:
+                        data = channel.recv(65536)
+                        if not data:
+                            break
+                        self.request.sendall(data)
+            except (OSError, EOFError):
+                return
+            finally:
+                if channel is not None:
+                    try:
+                        channel.close()
+                    except Exception:
+                        pass
+
+    address_family = socket.AF_INET6 if ":" in listen_host else socket.AF_INET
+
+    class ForwardingServer(socketserver.ThreadingTCPServer):
+        allow_reuse_address = False
+        daemon_threads = True
+
+        def close(self) -> None:
+            self.server_close()
+
+    ForwardingServer.address_family = address_family
+    server = ForwardingServer((listen_host, listen_port), ForwardingHandler)
+    server.timeout = 0.2
+    running.runtime.listener = server
+
+    def serve() -> None:
+        try:
+            while not running.runtime.stop_event.is_set():
+                try:
+                    server.handle_request()
+                except OSError:
+                    break
+        finally:
+            server.server_close()
+
+    thread = threading.Thread(
+        target=serve,
+        daemon=True,
+        name=f"sshvault-local-forward-{listen_port}",
+    )
+    running.runtime.thread = thread
+    thread.start()
+
+
+REMOTE_FORWARDING_STATUSES = LOCAL_FORWARDING_STATUSES
+
+
+@dataclass
+class RemoteForwardingRuleRuntime:
+    """Session-owned status for one immutable Remote forwarding rule."""
+
+    rule: dict[str, Any]
+    status: str = "Stopped"
+    error: str = ""
+
+
+class RemoteForwardingSession:
+    """Own enabled Remote listeners for exactly one authenticated session."""
+
+    def __init__(
+        self,
+        session_id: str,
+        transport: Any,
+        rules: list[dict[str, Any]],
+        starter: Callable[[RunningTunnel], None] | None = None,
+    ) -> None:
+        self.session_id = session_id
+        self.transport = transport
+        self.manager = TunnelManager(transport, id(transport))
+        self.starter = starter
+        self.rules = json.loads(json.dumps(rules))
+        self.records: dict[str, RemoteForwardingRuleRuntime] = {}
+        for rule in self.rules:
+            rule_id = str(rule.get("rule_id") or uuid4())
+            rule["rule_id"] = rule_id
+            self.records[rule_id] = RemoteForwardingRuleRuntime(rule)
+        self.closed = False
+
+    def start_enabled(self) -> dict[str, RemoteForwardingRuleRuntime]:
+        if self.closed:
+            return self.records
+        for record in self.records.values():
+            if record.rule.get("type") != "Remote" or not bool(record.rule.get("enabled", True)):
+                continue
+            if record.status in {"Starting", "Active"}:
+                continue
+            record.status = "Starting"
+            record.error = ""
+            try:
+                self.manager.start(record.rule, self.starter)
+            except Exception as exc:
+                record.status = "Failed"
+                record.error = str(redact_secrets(str(exc)))
+                continue
+            record.status = "Active"
+        return self.records
+
+    def stop_all(self) -> None:
+        if self.closed:
+            return
+        self.manager.stop_all()
+        for record in self.records.values():
+            if record.status in {"Starting", "Active"}:
+                record.status = "Stopped"
+        self.closed = True
+
+    def status(self, rule_id: str) -> str:
+        record = self.records.get(rule_id)
+        return record.status if record is not None else "Stopped"
+
+    def active_rule_ids(self) -> list[str]:
+        return [rule_id for rule_id, record in self.records.items() if record.status == "Active"]
+
+
+def start_remote_forwarding_listener(running: RunningTunnel, transport: Any) -> None:
+    """Request one server-side listener and bridge its channels locally."""
+    rule = running.rule
+    listen_host = str(rule["bind_address"])
+    listen_port = int(rule["bind_port"])
+    destination = (str(rule["destination_host"]), int(rule["destination_port"]))
+
+    def bridge(channel: Any) -> None:
+        local_socket = None
+        try:
+            local_socket = socket.create_connection(destination)
+            while not running.runtime.stop_event.is_set():
+                readable, _, _ = select.select([local_socket, channel], [], [], 0.2)
+                if local_socket in readable:
+                    data = local_socket.recv(65536)
+                    if not data:
+                        break
+                    channel.sendall(data)
+                if channel in readable:
+                    data = channel.recv(65536)
+                    if not data:
+                        break
+                    local_socket.sendall(data)
+        except (OSError, EOFError):
+            return
+        finally:
+            if local_socket is not None:
+                local_socket.close()
+            try:
+                channel.close()
+            except Exception:
+                pass
+
+    def handler(channel: Any, _origin: Any, _server: Any) -> None:
+        threading.Thread(
+            target=bridge,
+            args=(channel,),
+            daemon=True,
+            name=f"sshvault-remote-forward-{listen_port}",
+        ).start()
+
+    transport.request_port_forward(listen_host, listen_port, handler=handler)
+
+    class RemoteForwardHandle:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            if self.closed:
+                return
+            self.closed = True
+            transport.cancel_port_forward(listen_host, listen_port)
+
+    running.runtime.listener = RemoteForwardHandle()
+
+
 def parse_socks5_connect(data: bytes) -> tuple[str, int] | None:
     """Parse a SOCKS5 CONNECT request, rejecting unsupported commands."""
     if len(data) < 7 or data[0] != 5 or data[1] != 1:
@@ -1282,6 +1942,413 @@ def parse_socks5_connect(data: bytes) -> tuple[str, int] | None:
         return host, int.from_bytes(data[pos : pos + 2], "big")
     except (UnicodeError, ValueError):
         return None
+
+
+def open_socks5_connect_channel(data: bytes, transport: Any, origin: tuple[str, int]) -> Any:
+    """Open one SSH channel for a validated SOCKS5 CONNECT request."""
+    target = parse_socks5_connect(data)
+    if target is None:
+        raise ProfileError("Only SOCKS5 CONNECT requests are supported.")
+    channel = transport.open_channel("direct-tcpip", target, origin)
+    if channel is None:
+        raise ProfileError("SOCKS5 destination connection failed.")
+    return channel
+
+
+DYNAMIC_FORWARDING_STATUSES = LOCAL_FORWARDING_STATUSES
+
+
+@dataclass
+class DynamicForwardingRuleRuntime:
+    """Session-owned status for one immutable Dynamic forwarding rule."""
+
+    rule: dict[str, Any]
+    status: str = "Stopped"
+    error: str = ""
+
+
+class DynamicForwardingSession:
+    """Own enabled SOCKS5 listeners for exactly one authenticated session."""
+
+    def __init__(
+        self,
+        session_id: str,
+        transport: Any,
+        rules: list[dict[str, Any]],
+        starter: Callable[[RunningTunnel], None] | None = None,
+    ) -> None:
+        self.session_id = session_id
+        self.transport = transport
+        self.manager = TunnelManager(transport, id(transport))
+        self.starter = starter
+        self.rules = json.loads(json.dumps(rules))
+        self.records: dict[str, DynamicForwardingRuleRuntime] = {}
+        for rule in self.rules:
+            rule_id = str(rule.get("rule_id") or uuid4())
+            rule["rule_id"] = rule_id
+            self.records[rule_id] = DynamicForwardingRuleRuntime(rule)
+        self.closed = False
+
+    def start_enabled(self) -> dict[str, DynamicForwardingRuleRuntime]:
+        if self.closed:
+            return self.records
+        for record in self.records.values():
+            if record.rule.get("type") not in {"SOCKS", "Dynamic", "Dynamic/SOCKS"} or not bool(
+                record.rule.get("enabled", True)
+            ):
+                continue
+            if record.status in {"Starting", "Active"}:
+                continue
+            record.status = "Starting"
+            record.error = ""
+            try:
+                self.manager.start(record.rule, self.starter)
+            except Exception as exc:
+                record.status = "Failed"
+                record.error = str(redact_secrets(str(exc)))
+                continue
+            record.status = "Active"
+        return self.records
+
+    def stop_all(self) -> None:
+        if self.closed:
+            return
+        self.manager.stop_all()
+        for record in self.records.values():
+            if record.status in {"Starting", "Active"}:
+                record.status = "Stopped"
+        self.closed = True
+
+    def status(self, rule_id: str) -> str:
+        record = self.records.get(rule_id)
+        return record.status if record is not None else "Stopped"
+
+    def active_rule_ids(self) -> list[str]:
+        return [rule_id for rule_id, record in self.records.items() if record.status == "Active"]
+
+
+def start_dynamic_forwarding_listener(running: RunningTunnel, transport: Any) -> None:
+    """Bind one TCP SOCKS5 CONNECT listener backed by SSH direct channels."""
+    listen_host = str(running.rule["bind_address"])
+    listen_port = int(running.rule["bind_port"])
+
+    def receive_exact(client: Any, count: int) -> bytes:
+        result = bytearray()
+        while len(result) < count:
+            chunk = client.recv(count - len(result))
+            if not chunk:
+                raise EOFError
+            result.extend(chunk)
+        return bytes(result)
+
+    def receive_request(client: Any) -> bytes:
+        header = receive_exact(client, 4)
+        atyp = header[3]
+        if atyp == 1:
+            address = receive_exact(client, 4)
+        elif atyp == 3:
+            length = receive_exact(client, 1)
+            address = length + receive_exact(client, length[0])
+        elif atyp == 4:
+            address = receive_exact(client, 16)
+        else:
+            address = b""
+        return header + address + receive_exact(client, 2)
+
+    class Socks5Handler(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            client = self.request
+            channel = None
+            try:
+                version, method_count = receive_exact(client, 2)
+                methods = receive_exact(client, method_count)
+                if version != 5 or 0 not in methods:
+                    client.sendall(b"\x05\xff")
+                    return
+                client.sendall(b"\x05\x00")
+                request = receive_request(client)
+                if request[1] != 1:
+                    client.sendall(b"\x05\x07\x00\x01" + b"\x00" * 6)
+                    return
+                channel = open_socks5_connect_channel(
+                    request,
+                    transport,
+                    client.getpeername(),
+                )
+                client.sendall(b"\x05\x00\x00\x01" + b"\x00" * 6)
+                while not running.runtime.stop_event.is_set():
+                    readable, _, _ = select.select([client, channel], [], [], 0.2)
+                    if client in readable:
+                        data = client.recv(65536)
+                        if not data:
+                            break
+                        channel.sendall(data)
+                    if channel in readable:
+                        data = channel.recv(65536)
+                        if not data:
+                            break
+                        client.sendall(data)
+            except (EOFError, OSError, ProfileError):
+                if channel is None:
+                    try:
+                        client.sendall(b"\x05\x01\x00\x01" + b"\x00" * 6)
+                    except OSError:
+                        pass
+            finally:
+                if channel is not None:
+                    try:
+                        channel.close()
+                    except Exception:
+                        pass
+
+    address_family = socket.AF_INET6 if ":" in listen_host else socket.AF_INET
+
+    class Socks5Server(socketserver.ThreadingTCPServer):
+        allow_reuse_address = False
+        daemon_threads = True
+
+        def close(self) -> None:
+            self.server_close()
+
+    Socks5Server.address_family = address_family
+    server = Socks5Server((listen_host, listen_port), Socks5Handler)
+    server.timeout = 0.2
+    running.runtime.listener = server
+
+    def serve() -> None:
+        try:
+            while not running.runtime.stop_event.is_set():
+                try:
+                    server.handle_request()
+                except OSError:
+                    break
+        finally:
+            server.server_close()
+
+    thread = threading.Thread(
+        target=serve,
+        daemon=True,
+        name=f"sshvault-socks5-{listen_port}",
+    )
+    running.runtime.thread = thread
+    thread.start()
+
+
+class HTTPConnectRequestError(ProfileError):
+    """A sanitized HTTP proxy request error with an explicit response code."""
+
+    def __init__(self, status_code: int, reason: str) -> None:
+        super().__init__(reason)
+        self.status_code = status_code
+        self.reason = reason
+
+    def response(self) -> bytes:
+        allow = b"Allow: CONNECT\r\n" if self.status_code == 405 else b""
+        status = f"HTTP/1.1 {self.status_code} {self.reason}\r\n".encode("ascii")
+        return status + allow + b"Connection: close\r\nContent-Length: 0\r\n\r\n"
+
+
+def parse_http_connect_request(data: bytes) -> tuple[str, int]:
+    """Parse one bounded CONNECT header without retaining request metadata."""
+    if len(data) > 16384 or b"\r\n\r\n" not in data:
+        raise HTTPConnectRequestError(400, "Bad Request")
+    try:
+        first_line = data.split(b"\r\n", 1)[0].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise HTTPConnectRequestError(400, "Bad Request") from exc
+    parts = first_line.split()
+    if not parts:
+        raise HTTPConnectRequestError(400, "Bad Request")
+    if parts[0] != "CONNECT":
+        raise HTTPConnectRequestError(405, "Method Not Allowed")
+    if len(parts) != 3 or parts[2] not in {"HTTP/1.0", "HTTP/1.1"}:
+        raise HTTPConnectRequestError(400, "Bad Request")
+    authority = parts[1]
+    if authority.startswith("["):
+        match = re.fullmatch(r"\[([^\]]+)\]:(\d{1,5})", authority)
+        if match is None:
+            raise HTTPConnectRequestError(400, "Bad Request")
+        host, raw_port = match.groups()
+    else:
+        if authority.count(":") != 1:
+            raise HTTPConnectRequestError(400, "Bad Request")
+        host, raw_port = authority.rsplit(":", 1)
+    try:
+        host = validate_host(host)
+        port = validate_port(raw_port)
+    except ProfileError as exc:
+        raise HTTPConnectRequestError(400, "Bad Request") from exc
+    return host, port
+
+
+def open_http_connect_channel(data: bytes, transport: Any, origin: tuple[str, int]) -> Any:
+    """Route one validated HTTP CONNECT request over the existing transport."""
+    target = parse_http_connect_request(data)
+    try:
+        channel = transport.open_channel("direct-tcpip", target, origin)
+    except Exception as exc:
+        raise HTTPConnectRequestError(502, "Bad Gateway") from exc
+    if channel is None:
+        raise HTTPConnectRequestError(502, "Bad Gateway")
+    return channel
+
+
+HTTP_FORWARDING_STATUSES = LOCAL_FORWARDING_STATUSES
+
+
+@dataclass
+class HTTPForwardingRuleRuntime:
+    """Session-owned status for one immutable HTTP CONNECT proxy rule."""
+
+    rule: dict[str, Any]
+    status: str = "Stopped"
+    error: str = ""
+
+
+class HTTPForwardingSession:
+    """Own enabled HTTP CONNECT listeners for one authenticated session."""
+
+    def __init__(
+        self,
+        session_id: str,
+        transport: Any,
+        rules: list[dict[str, Any]],
+        starter: Callable[[RunningTunnel], None] | None = None,
+    ) -> None:
+        self.session_id = session_id
+        self.transport = transport
+        self.manager = TunnelManager(transport, id(transport))
+        self.starter = starter
+        self.rules = json.loads(json.dumps(rules))
+        self.records: dict[str, HTTPForwardingRuleRuntime] = {}
+        for rule in self.rules:
+            rule_id = str(rule.get("rule_id") or uuid4())
+            rule["rule_id"] = rule_id
+            self.records[rule_id] = HTTPForwardingRuleRuntime(rule)
+        self.closed = False
+
+    def start_enabled(self) -> dict[str, HTTPForwardingRuleRuntime]:
+        if self.closed:
+            return self.records
+        for record in self.records.values():
+            if record.rule.get("type") != "HTTP" or not bool(record.rule.get("enabled", True)):
+                continue
+            if record.status in {"Starting", "Active"}:
+                continue
+            record.status = "Starting"
+            record.error = ""
+            try:
+                self.manager.start(record.rule, self.starter)
+            except Exception as exc:
+                record.status = "Failed"
+                record.error = str(redact_secrets(str(exc)))
+                continue
+            record.status = "Active"
+        return self.records
+
+    def stop_all(self) -> None:
+        if self.closed:
+            return
+        self.manager.stop_all()
+        for record in self.records.values():
+            if record.status in {"Starting", "Active"}:
+                record.status = "Stopped"
+        self.closed = True
+
+    def status(self, rule_id: str) -> str:
+        record = self.records.get(rule_id)
+        return record.status if record is not None else "Stopped"
+
+    def active_rule_ids(self) -> list[str]:
+        return [rule_id for rule_id, record in self.records.items() if record.status == "Active"]
+
+
+def start_http_connect_listener(running: RunningTunnel, transport: Any) -> None:
+    """Bind a CONNECT-only HTTP proxy backed by SSH direct channels."""
+    listen_host = str(running.rule["bind_address"])
+    listen_port = int(running.rule["bind_port"])
+
+    def receive_headers(client: Any) -> bytes:
+        result = bytearray()
+        while b"\r\n\r\n" not in result:
+            chunk = client.recv(4096)
+            if not chunk:
+                raise HTTPConnectRequestError(400, "Bad Request")
+            result.extend(chunk)
+            if len(result) > 16384:
+                raise HTTPConnectRequestError(400, "Bad Request")
+        marker = result.find(b"\r\n\r\n") + 4
+        return bytes(result[:marker])
+
+    class HTTPConnectHandler(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            client = self.request
+            channel = None
+            try:
+                request = receive_headers(client)
+                channel = open_http_connect_channel(
+                    request,
+                    transport,
+                    client.getpeername(),
+                )
+                client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                while not running.runtime.stop_event.is_set():
+                    readable, _, _ = select.select([client, channel], [], [], 0.2)
+                    if client in readable:
+                        payload = client.recv(65536)
+                        if not payload:
+                            break
+                        channel.sendall(payload)
+                    if channel in readable:
+                        payload = channel.recv(65536)
+                        if not payload:
+                            break
+                        client.sendall(payload)
+            except HTTPConnectRequestError as exc:
+                try:
+                    client.sendall(exc.response())
+                except OSError:
+                    pass
+            except (EOFError, OSError):
+                return
+            finally:
+                if channel is not None:
+                    try:
+                        channel.close()
+                    except Exception:
+                        pass
+
+    address_family = socket.AF_INET6 if ":" in listen_host else socket.AF_INET
+
+    class HTTPConnectServer(socketserver.ThreadingTCPServer):
+        allow_reuse_address = False
+        daemon_threads = True
+
+        def close(self) -> None:
+            self.server_close()
+
+    HTTPConnectServer.address_family = address_family
+    server = HTTPConnectServer((listen_host, listen_port), HTTPConnectHandler)
+    server.timeout = 0.2
+    running.runtime.listener = server
+
+    def serve() -> None:
+        try:
+            while not running.runtime.stop_event.is_set():
+                try:
+                    server.handle_request()
+                except OSError:
+                    break
+        finally:
+            server.server_close()
+
+    thread = threading.Thread(
+        target=serve,
+        daemon=True,
+        name=f"sshvault-http-connect-{listen_port}",
+    )
+    running.runtime.thread = thread
+    thread.start()
 
 
 @dataclass
@@ -1433,6 +2500,57 @@ class TransferItem:
         if self.total is None or self.speed <= 0:
             return None
         return max(0.0, (self.total - self.transferred) / self.speed)
+
+
+@dataclass(frozen=True)
+class SFTPTransferQueueRow:
+    item_id: str
+    file: str
+    direction: str
+    progress: str
+    speed: str
+    eta: str
+    status: str
+
+
+def sftp_transfer_queue_rows(items: list[TransferItem]) -> list[SFTPTransferQueueRow]:
+    rows = []
+    for item in items:
+        progress = item.progress()
+        eta = item.remaining_seconds()
+        rows.append(
+            SFTPTransferQueueRow(
+                item.item_id,
+                Path(item.source).name,
+                item.direction,
+                "—" if progress is None else f"{progress:.1f}%",
+                "—" if item.speed <= 0 else f"{item.speed:.0f} B/s",
+                "—" if eta is None else f"{eta:.0f}s",
+                item.status,
+            )
+        )
+    return rows
+
+
+def sftp_transfer_control_states(
+    selected: TransferItem | None,
+    items: list[TransferItem],
+) -> dict[str, bool]:
+    status = selected.status if selected is not None else None
+    return {
+        "pause": status
+        in {
+            TransferState.PENDING,
+            TransferState.PREPARING,
+            TransferState.TRANSFERRING,
+            TransferState.RESUMING,
+            TransferState.DOWNLOADING,
+        },
+        "resume": status == TransferState.PAUSED,
+        "cancel": selected is not None and status not in TransferState.TERMINAL,
+        "retry": status in {TransferState.FAILED, TransferState.CANCELLED},
+        "remove_completed": any(item.status == TransferState.COMPLETED for item in items),
+    }
 
 
 @dataclass
@@ -2424,6 +3542,119 @@ def safe_transfer_plan(root: str | Path, relative_paths: list[str]) -> list[tupl
     return plan
 
 
+class SFTPTransferRouter:
+    """Route browser selections through an existing transfer scheduler."""
+
+    def __init__(self, scheduler: TransferScheduler) -> None:
+        self.scheduler = scheduler
+
+    @staticmethod
+    def action_states(
+        *,
+        local_selected: bool,
+        remote_selected: bool,
+        connected: bool,
+        client_available: bool,
+    ) -> dict[str, bool]:
+        available = connected and client_available
+        return {
+            "upload": available and local_selected,
+            "download": available and remote_selected,
+        }
+
+    @staticmethod
+    def _upload(item: TransferItem, client: Any, worker: TransferWorker) -> None:
+        client.put(
+            item.source,
+            item.target,
+            callback=lambda transferred, total: worker.checkpoint(transferred, total),
+        )
+
+    @staticmethod
+    def _download(item: TransferItem, client: Any, worker: TransferWorker) -> None:
+        client.get(
+            item.source,
+            item.target,
+            callback=lambda transferred, total: worker.checkpoint(transferred, total),
+        )
+
+    def queue_uploads(self, local_paths: list[str], remote_directory: str) -> list[TransferItem]:
+        target_directory = normalize_remote_path(remote_directory or "/")
+        queued: list[TransferItem] = []
+        for raw_path in local_paths:
+            source = Path(raw_path)
+            if not source.is_file():
+                continue
+            item = TransferItem(
+                str(source),
+                posixpath.join(target_directory, source.name),
+                "Upload",
+                total=source.stat().st_size,
+            )
+            queued.append(self.scheduler.enqueue(item, self._upload))
+        return queued
+
+    def queue_downloads(
+        self,
+        remote_entries: list["RemoteBrowserEntry"],
+        local_directory: str,
+    ) -> list[TransferItem]:
+        target_directory = Path(local_directory)
+        queued: list[TransferItem] = []
+        for entry in remote_entries:
+            if entry.is_directory:
+                continue
+            item = TransferItem(
+                entry.full_path,
+                str(target_directory / entry.name),
+                "Download",
+                total=entry.size,
+            )
+            queued.append(self.scheduler.enqueue(item, self._download))
+        return queued
+
+
+class SFTPDragDropRouter:
+    """Route safe cross-pane drops through an existing transfer router.
+
+    Native drag-and-drop support is optional at the widget layer.  Keeping the
+    direction and connection checks here makes both native drops and their
+    display-free tests use the same transfer-scheduler path as the explicit
+    Upload and Download buttons.
+    """
+
+    def __init__(self, transfer_router: SFTPTransferRouter) -> None:
+        self.transfer_router = transfer_router
+
+    @property
+    def scheduler(self) -> TransferScheduler:
+        return self.transfer_router.scheduler
+
+    def route_drop(
+        self,
+        *,
+        source_pane: str,
+        target_pane: str,
+        connected: bool,
+        client_available: bool,
+        local_paths: list[str] | None = None,
+        remote_entries: list["RemoteBrowserEntry"] | None = None,
+        local_directory: str = "",
+        remote_directory: str = "",
+    ) -> list[TransferItem]:
+        """Queue one cross-pane copy, or safely ignore an invalid drop."""
+        if (
+            source_pane == target_pane
+            or {source_pane, target_pane} != {"local", "remote"}
+            or not connected
+            or not client_available
+        ):
+            return []
+        if source_pane == "local":
+            return self.transfer_router.queue_uploads(local_paths or [], remote_directory)
+        return self.transfer_router.queue_downloads(remote_entries or [], local_directory)
+
+
 class TransferQueueManager(TransferScheduler):
     """Compatibility facade for the former queue API.
 
@@ -2561,6 +3792,751 @@ class SessionDashboardState:
         self.status = status
         if event:
             self.add_event(event)
+
+
+class SessionLifecycleState(str, Enum):
+    """Canonical, display-free lifecycle state for one managed SSH session."""
+
+    DISCONNECTED = "disconnected"
+    VALIDATING = "validating"
+    RESOLVING = "resolving"
+    CONNECTING_PROXY = "connecting_proxy"
+    CONNECTING_HOST = "connecting_host"
+    VERIFYING_HOST_KEY = "verifying_host_key"
+    AUTHENTICATING = "authenticating"
+    CONNECTED = "connected"
+    RECONNECTING = "reconnecting"
+    DISCONNECTING = "disconnecting"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+_SESSION_TRANSITIONS: dict[SessionLifecycleState, set[SessionLifecycleState]] = {
+    SessionLifecycleState.DISCONNECTED: {SessionLifecycleState.VALIDATING},
+    SessionLifecycleState.VALIDATING: {
+        SessionLifecycleState.RESOLVING,
+        SessionLifecycleState.FAILED,
+        SessionLifecycleState.CANCELLED,
+    },
+    SessionLifecycleState.RESOLVING: {
+        SessionLifecycleState.CONNECTING_PROXY,
+        SessionLifecycleState.CONNECTING_HOST,
+        SessionLifecycleState.FAILED,
+        SessionLifecycleState.CANCELLED,
+    },
+    SessionLifecycleState.CONNECTING_PROXY: {
+        SessionLifecycleState.CONNECTING_HOST,
+        SessionLifecycleState.FAILED,
+        SessionLifecycleState.CANCELLED,
+    },
+    SessionLifecycleState.CONNECTING_HOST: {
+        SessionLifecycleState.VERIFYING_HOST_KEY,
+        SessionLifecycleState.FAILED,
+        SessionLifecycleState.CANCELLED,
+    },
+    SessionLifecycleState.VERIFYING_HOST_KEY: {
+        SessionLifecycleState.AUTHENTICATING,
+        SessionLifecycleState.FAILED,
+        SessionLifecycleState.CANCELLED,
+    },
+    SessionLifecycleState.AUTHENTICATING: {
+        SessionLifecycleState.CONNECTED,
+        SessionLifecycleState.FAILED,
+        SessionLifecycleState.CANCELLED,
+    },
+    SessionLifecycleState.CONNECTED: {
+        SessionLifecycleState.RECONNECTING,
+        SessionLifecycleState.DISCONNECTING,
+        SessionLifecycleState.FAILED,
+    },
+    SessionLifecycleState.RECONNECTING: {
+        SessionLifecycleState.RESOLVING,
+        SessionLifecycleState.CONNECTING_HOST,
+        SessionLifecycleState.FAILED,
+        SessionLifecycleState.DISCONNECTING,
+    },
+    SessionLifecycleState.DISCONNECTING: {SessionLifecycleState.DISCONNECTED, SessionLifecycleState.FAILED},
+    SessionLifecycleState.FAILED: {
+        SessionLifecycleState.RECONNECTING,
+        SessionLifecycleState.DISCONNECTING,
+        SessionLifecycleState.DISCONNECTED,
+        SessionLifecycleState.VALIDATING,
+    },
+    SessionLifecycleState.CANCELLED: {SessionLifecycleState.DISCONNECTING, SessionLifecycleState.DISCONNECTED},
+}
+
+
+def _session_snapshot(profile: dict[str, Any]) -> dict[str, Any]:
+    """Copy a profile for runtime use without retaining credentials."""
+    forbidden = {"password", "passphrase", "secret", "token", "private_key"}
+    safe = {key: value for key, value in dict(profile).items() if str(key).casefold() not in forbidden}
+    return cast(dict[str, Any], json.loads(json.dumps(safe)))
+
+
+@dataclass
+class SessionRecord:
+    """Stable runtime identity and safe ownership metadata for one session."""
+
+    session_id: str
+    profile_id: str
+    profile_snapshot: dict[str, Any]
+    created_at: str
+    state: SessionLifecycleState = SessionLifecycleState.DISCONNECTED
+    last_state_change: str = ""
+    last_error: str = ""
+    disconnect_reason: str = ""
+    connection_attempt: int = 0
+    is_user_initiated: bool = True
+    restore_eligible: bool = True
+    cleanly_closed: bool = False
+    terminal_ids: set[str] = field(default_factory=set)
+    sftp_view_ids: set[str] = field(default_factory=set)
+    tunnel_ids: set[str] = field(default_factory=set)
+    reconnect_status: str = "idle"
+    events: list[ConnectionLogEvent] = field(default_factory=list)
+    max_events: int = 200
+
+    def add_event(self, message: str, level: str = "info") -> None:
+        self.events.append(ConnectionLogEvent(message, level))
+        del self.events[: -self.max_events]
+
+    def restoration_record(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "profile_id": self.profile_id,
+            "created_at": self.created_at,
+            "restore_eligible": self.restore_eligible,
+            "was_connected": self.state is SessionLifecycleState.CONNECTED,
+            "cleanly_closed": self.cleanly_closed,
+        }
+
+
+class SFTPBrowserClient:
+    """Minimal browsing-only adapter around one independent SFTP channel."""
+
+    def __init__(self, channel: Any) -> None:
+        self._channel = channel
+        self._closed = False
+
+    def list_directory(self, path: str) -> Any:
+        return self._channel.listdir_attr(path)
+
+    def stat(self, path: str) -> Any:
+        return self._channel.stat(path)
+
+    def mkdir(self, path: str) -> None:
+        self._channel.mkdir(path)
+
+    def rename(self, old_path: str, new_path: str) -> None:
+        self._channel.rename(old_path, new_path)
+
+    def remove(self, path: str) -> None:
+        self._channel.remove(path)
+
+    def rmdir(self, path: str) -> None:
+        self._channel.rmdir(path)
+
+    def normalize(self, path: str) -> str:
+        return str(self._channel.normalize(path))
+
+    def home_directory(self) -> str:
+        return self.normalize(".")
+
+    def is_alive(self) -> bool:
+        if self._closed:
+            return False
+        get_channel = getattr(self._channel, "get_channel", None)
+        if not callable(get_channel):
+            return True
+        try:
+            channel = get_channel()
+        except Exception:
+            return False
+        if bool(getattr(channel, "closed", False)):
+            return False
+        active = getattr(channel, "active", None)
+        return True if active is None else bool(active)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._channel.close()
+        except Exception:
+            pass
+
+
+class SFTPBrowserRegistry:
+    """Tk-free ownership map for isolated per-view browsing channels."""
+
+    def __init__(self) -> None:
+        self._clients: dict[str, dict[str, SFTPBrowserClient]] = {}
+
+    def register(self, session_id: str, view_id: str, client: SFTPBrowserClient) -> None:
+        self._clients.setdefault(session_id, {})[view_id] = client
+
+    def get(self, session_id: str, view_id: str) -> SFTPBrowserClient | None:
+        return self._clients.get(session_id, {}).get(view_id)
+
+    def close_view(self, session_id: str, view_id: str) -> bool:
+        client = self._clients.get(session_id, {}).pop(view_id, None)
+        if client is None:
+            return False
+        client.close()
+        if not self._clients.get(session_id):
+            self._clients.pop(session_id, None)
+        return True
+
+    def close_session(self, session_id: str) -> None:
+        for view_id in list(self._clients.get(session_id, {})):
+            self.close_view(session_id, view_id)
+
+
+@dataclass(frozen=True)
+class LocalBrowserEntry:
+    name: str
+    full_path: str
+    is_directory: bool
+    is_symlink: bool
+    size: int | None
+    modified_time: float | None
+    type_label: str
+    permissions: str
+
+
+@dataclass(frozen=True)
+class RemoteBrowserEntry:
+    name: str
+    full_path: str
+    is_directory: bool
+    is_symlink: bool
+    size: int | None
+    modified_time: float | None
+    type_label: str
+    permissions: str
+    owner: str
+
+
+@dataclass
+class SFTPViewNavigationState:
+    local_current_path: str = field(default_factory=lambda: str(Path.home()))
+    local_back_history: list[str] = field(default_factory=list)
+    local_forward_history: list[str] = field(default_factory=list)
+    remote_current_path: str = ""
+    remote_back_history: list[str] = field(default_factory=list)
+    remote_forward_history: list[str] = field(default_factory=list)
+    local_sort_column: str = "name"
+    local_sort_descending: bool = False
+    remote_sort_column: str = "name"
+    remote_sort_descending: bool = False
+    local_loading: bool = False
+    remote_loading: bool = False
+    local_generation: int = 0
+    remote_generation: int = 0
+    last_local_error: str | None = None
+    last_remote_error: str | None = None
+    remote_available: bool = True
+
+    def next_generation(self, remote: bool) -> int:
+        if remote:
+            self.remote_generation += 1
+            return self.remote_generation
+        self.local_generation += 1
+        return self.local_generation
+
+    def generation_current(self, generation: int, remote: bool) -> bool:
+        return generation == (self.remote_generation if remote else self.local_generation)
+
+    def begin_remote_listing(self) -> int:
+        """Start one remote read and return its callback generation."""
+        generation = self.next_generation(True)
+        self.remote_loading = True
+        self.last_remote_error = None
+        return generation
+
+    def complete_remote_listing(
+        self,
+        generation: int,
+        path: str,
+        *,
+        error: str | None = None,
+        view_open: bool = True,
+        update_path: bool = True,
+    ) -> bool:
+        """Accept only the current open view's result.
+
+        A failed result records its sanitized domain error but deliberately
+        leaves the last successful path (and therefore its rendered entries)
+        unchanged.
+        """
+        if not view_open or not self.generation_current(generation, True):
+            return False
+        self.remote_loading = False
+        if error is not None:
+            self.last_remote_error = error
+            return False
+        if update_path:
+            self.remote_current_path = path
+        self.last_remote_error = None
+        return True
+
+    def mark_remote_disconnected(self) -> None:
+        """Invalidate pending remote work without changing paths or history."""
+        self.next_generation(True)
+        self.remote_loading = False
+        self.remote_available = False
+        self.last_remote_error = "Disconnected"
+
+    def mark_remote_reconnected(self, client_alive: bool) -> bool:
+        """Re-enable explicit remote actions without starting a directory read."""
+        if not client_alive:
+            return False
+        self.remote_available = True
+        self.remote_loading = False
+        self.last_remote_error = None
+        return True
+
+    def navigate_new(self, path: str, remote: bool) -> bool:
+        current = self.remote_current_path if remote else self.local_current_path
+        if not path or path == current:
+            return False
+        back = self.remote_back_history if remote else self.local_back_history
+        forward = self.remote_forward_history if remote else self.local_forward_history
+        if current and (not back or back[-1] != current):
+            back.append(current)
+        forward.clear()
+        if remote:
+            self.remote_current_path = path
+        else:
+            self.local_current_path = path
+        return True
+
+    def navigate_back(self, remote: bool) -> bool:
+        back = self.remote_back_history if remote else self.local_back_history
+        forward = self.remote_forward_history if remote else self.local_forward_history
+        if not back:
+            return False
+        current = self.remote_current_path if remote else self.local_current_path
+        previous = back.pop()
+        if current and (not forward or forward[-1] != current):
+            forward.append(current)
+        if remote:
+            self.remote_current_path = previous
+        else:
+            self.local_current_path = previous
+        return True
+
+    def navigate_forward(self, remote: bool) -> bool:
+        back = self.remote_back_history if remote else self.local_back_history
+        forward = self.remote_forward_history if remote else self.local_forward_history
+        if not forward:
+            return False
+        current = self.remote_current_path if remote else self.local_current_path
+        following = forward.pop()
+        if current and (not back or back[-1] != current):
+            back.append(current)
+        if remote:
+            self.remote_current_path = following
+        else:
+            self.local_current_path = following
+        return True
+
+    def navigate_up(self, remote: bool) -> bool:
+        path = self.remote_current_path if remote else self.local_current_path
+        parent = posixpath.dirname(path) or "/" if remote else str(Path(path).parent)
+        return self.navigate_new(parent, remote)
+
+    def navigate_home(self, home: str, remote: bool) -> bool:
+        return self.navigate_new(home, remote)
+
+    def refresh(self, remote: bool) -> str:
+        return self.remote_current_path if remote else self.local_current_path
+
+
+def normalize_local_path(path: str) -> str:
+    return os.path.normpath(os.path.expanduser(path))
+
+
+def validate_sftp_item_name(name: str) -> str:
+    value = str(name).strip()
+    if not value:
+        raise ProfileError("Enter a name.")
+    if value in {".", ".."} or "/" in value or "\\" in value:
+        raise ProfileError("Name must not contain path separators.")
+    return value
+
+
+def create_local_browser_folder(directory: str, name: str) -> str:
+    target = Path(directory) / validate_sftp_item_name(name)
+    target.mkdir()
+    return str(target)
+
+
+def rename_local_browser_entry(source: str, name: str) -> str:
+    path = Path(source)
+    target = path.with_name(validate_sftp_item_name(name))
+    path.rename(target)
+    return str(target)
+
+
+def delete_local_browser_entries(entries: list[Any]) -> list[str]:
+    for entry in entries:
+        path = Path(entry.full_path)
+        if entry.is_directory and not entry.is_symlink:
+            try:
+                next(path.iterdir())
+            except StopIteration:
+                continue
+            raise ProfileError("Directory must be empty before deletion.")
+    deleted = []
+    for entry in entries:
+        path = Path(entry.full_path)
+        if entry.is_directory and not entry.is_symlink:
+            path.rmdir()
+        else:
+            path.unlink()
+        deleted.append(str(path))
+    return deleted
+
+
+def initial_local_browser_path(path: str, home: str | None = None) -> str:
+    fallback = normalize_local_path(home or str(Path.home()))
+    candidate = normalize_local_path(path or fallback)
+    return candidate if Path(candidate).is_dir() else fallback
+
+
+def normalize_remote_path(path: str, home: str = "/") -> str:
+    value = path or home
+    return posixpath.normpath(value) if value.startswith("/") else posixpath.normpath(posixpath.join(home, value))
+
+
+def create_remote_browser_folder(client: SFTPBrowserClient, directory: str, name: str) -> str:
+    target = posixpath.join(normalize_remote_path(directory or "/"), validate_sftp_item_name(name))
+    client.mkdir(target)
+    return target
+
+
+def rename_remote_browser_entry(client: SFTPBrowserClient, source: str, name: str) -> str:
+    target = posixpath.join(posixpath.dirname(source), validate_sftp_item_name(name))
+    client.rename(source, target)
+    return target
+
+
+def delete_remote_browser_entries(client: SFTPBrowserClient, entries: list[Any]) -> list[str]:
+    for entry in entries:
+        if entry.is_directory and list(client.list_directory(entry.full_path)):
+            raise ProfileError("Directory must be empty before deletion.")
+    deleted = []
+    for entry in entries:
+        if entry.is_directory:
+            client.rmdir(entry.full_path)
+        else:
+            client.remove(entry.full_path)
+        deleted.append(str(entry.full_path))
+    return deleted
+
+
+def _permissions(mode: int | None) -> str:
+    if mode is None:
+        return "—"
+    try:
+        return oct(int(mode) & 0o777)
+    except (TypeError, ValueError):
+        return "—"
+
+
+def list_local_browser_entries(path: str, show_hidden: bool = False) -> list[LocalBrowserEntry]:
+    target = normalize_local_path(path)
+    try:
+        children = list(Path(target).iterdir())
+    except FileNotFoundError as exc:
+        raise ProfileError("Local directory not found") from exc
+    except PermissionError as exc:
+        raise ProfileError("Local permission denied") from exc
+    entries = []
+    for child in children:
+        if not show_hidden and child.name.startswith("."):
+            continue
+        try:
+            info = child.lstat()
+            directory = child.is_dir()
+            symlink = child.is_symlink()
+            entries.append(
+                LocalBrowserEntry(
+                    child.name,
+                    str(child),
+                    directory,
+                    symlink,
+                    info.st_size,
+                    info.st_mtime,
+                    "Directory" if directory else "File",
+                    _permissions(info.st_mode),
+                )
+            )
+        except OSError:
+            entries.append(LocalBrowserEntry(child.name, str(child), False, False, None, None, "—", "—"))
+    return sort_browser_entries(entries, "name", False)
+
+
+def list_remote_browser_entries(
+    client: SFTPBrowserClient, path: str, show_hidden: bool = False
+) -> list[RemoteBrowserEntry]:
+    target = normalize_remote_path(path, client.home_directory())
+    try:
+        attrs = client.list_directory(target)
+    except FileNotFoundError as exc:
+        raise ProfileError("Remote directory not found") from exc
+    except PermissionError as exc:
+        raise ProfileError("Remote permission denied") from exc
+    except Exception as exc:
+        raise ProfileError("Directory listing failed") from exc
+    entries = []
+    for item in attrs:
+        name = str(getattr(item, "filename", ""))
+        if not name or (not show_hidden and name.startswith(".")):
+            continue
+        mode = getattr(item, "st_mode", None)
+        directory = bool(mode is not None and (int(cast(int, mode)) & 0o170000) == 0o040000)
+        entries.append(
+            RemoteBrowserEntry(
+                name,
+                posixpath.join(target, name),
+                directory,
+                False,
+                getattr(item, "st_size", None),
+                getattr(item, "st_mtime", None),
+                "Directory" if directory else "File",
+                _permissions(mode),
+                str(getattr(item, "st_uid", "—")),
+            )
+        )
+    return sort_browser_entries(entries, "name", False)
+
+
+def sort_browser_entries(entries: list[Any], column: str, descending: bool) -> list[Any]:
+    key = {
+        "name": lambda e: e.name.casefold(),
+        "size": lambda e: e.size if e.size is not None else -1,
+        "modified": lambda e: e.modified_time if e.modified_time is not None else -1,
+        "type": lambda e: e.type_label,
+        "permissions": lambda e: e.permissions,
+        "owner": lambda e: getattr(e, "owner", ""),
+    }.get(column, lambda e: e.name.casefold())
+    directories = [entry for entry in entries if entry.is_directory]
+    files = [entry for entry in entries if not entry.is_directory]
+    return sorted(directories, key=key, reverse=descending) + sorted(files, key=key, reverse=descending)
+
+
+def selected_directory_target(entries: list[Any], selected_paths: list[str]) -> str | None:
+    """Return one selected directory path; file or multi-selection is inert."""
+    if len(selected_paths) != 1:
+        return None
+    selected = selected_paths[0]
+    return next(
+        (str(entry.full_path) for entry in entries if entry.full_path == selected and entry.is_directory),
+        None,
+    )
+
+
+def selected_file_entries(entries: list[Any], selected_paths: list[str]) -> list[Any]:
+    """Return selected files in listing order; directories remain navigation-only."""
+    selected = set(selected_paths)
+    return [entry for entry in entries if entry.full_path in selected and not entry.is_directory]
+
+
+def selected_browser_entries(entries: list[Any], selected_paths: list[str]) -> list[Any]:
+    selected = set(selected_paths)
+    return [entry for entry in entries if entry.full_path in selected]
+
+
+def selected_browser_path(entries: list[Any], selected_paths: list[str]) -> str | None:
+    selected = selected_browser_entries(entries, selected_paths)
+    return str(selected[0].full_path) if len(selected) == 1 else None
+
+
+def browser_entry_properties(entry: Any) -> dict[str, str]:
+    return {
+        "Name": str(entry.name),
+        "Full path": str(entry.full_path),
+        "Type": str(entry.type_label),
+        "Size": "—" if entry.size is None else str(entry.size),
+        "Modified": "—" if entry.modified_time is None else str(entry.modified_time),
+        "Permissions": str(entry.permissions or "—"),
+        "Owner": str(getattr(entry, "owner", "—") or "—"),
+    }
+
+
+def confirmed_sftp_delete_entries(entries: list[Any], confirmed: bool) -> list[Any]:
+    return list(entries) if confirmed else []
+
+
+def sftp_file_action_states(
+    *,
+    local_selection_count: int,
+    remote_selection_count: int,
+    local_loading: bool,
+    remote_loading: bool,
+    remote_available: bool,
+) -> dict[str, bool]:
+    return {
+        "local_delete": not local_loading and local_selection_count > 0,
+        "local_properties": not local_loading and local_selection_count == 1,
+        "local_copy_path": not local_loading and local_selection_count == 1,
+        "remote_delete": remote_available and not remote_loading and remote_selection_count > 0,
+        "remote_properties": remote_available and not remote_loading and remote_selection_count == 1,
+        "remote_copy_path": remote_available and not remote_loading and remote_selection_count == 1,
+    }
+
+
+def sftp_mutation_action_states(
+    *,
+    local_selection_count: int,
+    remote_selection_count: int,
+    local_loading: bool,
+    remote_loading: bool,
+    remote_available: bool,
+) -> dict[str, bool]:
+    return {
+        "local_new_folder": not local_loading,
+        "local_rename": not local_loading and local_selection_count == 1,
+        "remote_new_folder": remote_available and not remote_loading,
+        "remote_rename": remote_available and not remote_loading and remote_selection_count == 1,
+    }
+
+
+def update_browser_sort(state: SFTPViewNavigationState, column: str, *, remote: bool = False) -> None:
+    column_attribute = "remote_sort_column" if remote else "local_sort_column"
+    direction_attribute = "remote_sort_descending" if remote else "local_sort_descending"
+    if getattr(state, column_attribute) == column:
+        setattr(state, direction_attribute, not getattr(state, direction_attribute))
+    else:
+        setattr(state, column_attribute, column)
+        setattr(state, direction_attribute, False)
+
+
+class SessionController:
+    """Thread-safe, Tk-free owner of session identity and lifecycle state."""
+
+    def __init__(self) -> None:
+        self.sessions: dict[str, SessionRecord] = {}
+        self._lock = threading.RLock()
+
+    def create_session(self, profile: dict[str, Any], *, user_initiated: bool = True) -> SessionRecord:
+        snapshot = _session_snapshot(profile)
+        validated = validate_profile(snapshot, check_key_exists=False)
+        session = SessionRecord(
+            session_id=str(uuid4()),
+            profile_id=validated["id"],
+            profile_snapshot=validated,
+            created_at=datetime.now().astimezone().isoformat(),
+            last_state_change=datetime.now().astimezone().isoformat(),
+            is_user_initiated=user_initiated,
+        )
+        session.add_event("Session created.")
+        with self._lock:
+            self.sessions[session.session_id] = session
+        return session
+
+    def get(self, session_id: str) -> SessionRecord | None:
+        with self._lock:
+            return self.sessions.get(session_id)
+
+    def for_profile(self, profile_id: str) -> list[SessionRecord]:
+        with self._lock:
+            return [record for record in self.sessions.values() if record.profile_id == profile_id]
+
+    def transition(self, session_id: str, state: SessionLifecycleState, message: str = "") -> SessionRecord:
+        with self._lock:
+            record = self.sessions.get(session_id)
+            if record is None:
+                raise KeyError(f"Unknown session: {session_id}")
+            if state is record.state:
+                return record
+            if state is not SessionLifecycleState.DISCONNECTING and state not in _SESSION_TRANSITIONS[record.state]:
+                raise ValueError(f"Invalid session transition: {record.state.value} -> {state.value}")
+            old_state = record.state
+            record.state = state
+            record.last_state_change = datetime.now().astimezone().isoformat()
+            if state is SessionLifecycleState.FAILED:
+                record.last_error = str(redact_secrets(message))
+            if state is SessionLifecycleState.DISCONNECTED:
+                record.cleanly_closed = old_state is SessionLifecycleState.DISCONNECTING
+            record.add_event(
+                message or f"{old_state.value} → {state.value}.",
+                "error" if state is SessionLifecycleState.FAILED else "info",
+            )
+            return record
+
+    def begin_connection(self, session_id: str) -> bool:
+        record = self.get(session_id)
+        if record is None or record.state not in {SessionLifecycleState.DISCONNECTED, SessionLifecycleState.FAILED}:
+            return False
+        self.transition(session_id, SessionLifecycleState.VALIDATING, "Validating session profile.")
+        return True
+
+    def disconnect(self, session_id: str, reason: str = "") -> bool:
+        record = self.get(session_id)
+        if record is None or record.state is SessionLifecycleState.DISCONNECTED:
+            return False
+        if record.state is not SessionLifecycleState.DISCONNECTING:
+            self.transition(session_id, SessionLifecycleState.DISCONNECTING, "Disconnecting session.")
+        record.disconnect_reason = str(redact_secrets(reason))
+        self.transition(session_id, SessionLifecycleState.DISCONNECTED, "Session disconnected.")
+        return True
+
+    def cancel(self, session_id: str) -> bool:
+        record = self.get(session_id)
+        if record is None or record.state in {SessionLifecycleState.CONNECTED, SessionLifecycleState.DISCONNECTED}:
+            return False
+        self.transition(session_id, SessionLifecycleState.CANCELLED, "Connection cancelled.")
+        return True
+
+    def reconnect(self, session_id: str) -> bool:
+        record = self.get(session_id)
+        if record is None or record.state not in {SessionLifecycleState.CONNECTED, SessionLifecycleState.FAILED}:
+            return False
+        self.transition(session_id, SessionLifecycleState.RECONNECTING, "Reconnect requested.")
+        record.connection_attempt += 1
+        record.reconnect_status = "reconnecting"
+        return True
+
+    def _register(self, session_id: str, value: str, attribute: str) -> None:
+        record = self.get(session_id)
+        if record is None:
+            raise KeyError(f"Unknown session: {session_id}")
+        cast(set[str], getattr(record, attribute)).add(value)
+
+    def _unregister(self, session_id: str, value: str, attribute: str) -> None:
+        record = self.get(session_id)
+        if record is not None:
+            cast(set[str], getattr(record, attribute)).discard(value)
+
+    def register_terminal(self, session_id: str, terminal_id: str) -> None:
+        self._register(session_id, terminal_id, "terminal_ids")
+
+    def unregister_terminal(self, session_id: str, terminal_id: str) -> None:
+        self._unregister(session_id, terminal_id, "terminal_ids")
+
+    def register_sftp_view(self, session_id: str, view_id: str) -> None:
+        self._register(session_id, view_id, "sftp_view_ids")
+
+    def unregister_sftp_view(self, session_id: str, view_id: str) -> None:
+        self._unregister(session_id, view_id, "sftp_view_ids")
+
+    def register_tunnel(self, session_id: str, tunnel_id: str) -> None:
+        self._register(session_id, tunnel_id, "tunnel_ids")
+
+    def unregister_tunnel(self, session_id: str, tunnel_id: str) -> None:
+        self._unregister(session_id, tunnel_id, "tunnel_ids")
+
+    def restorable_sessions(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [record.restoration_record() for record in self.sessions.values() if record.restore_eligible]
+
+    def shutdown_all(self) -> None:
+        for session_id in list(self.sessions):
+            self.disconnect(session_id, "Application shutdown.")
 
 
 @dataclass
@@ -2718,7 +4694,14 @@ class TerminalPanelState:
         return max(1, (max(0, width) - 8) // max(1, char_width)), max(1, (max(0, height) - 4) // max(1, char_height))
 
 
-def terminal_key_sequence(keysym: str, char: str = "", state: int = 0, *, application_cursor: bool = False) -> str:
+def terminal_key_sequence(
+    keysym: str,
+    char: str = "",
+    state: int = 0,
+    *,
+    application_cursor: bool = False,
+    application_keypad: bool = False,
+) -> str:
     """Translate a Tk key event to bytes understood by an xterm-compatible PTY.
 
     This deliberately has no Tk dependency so recorded key events can be
@@ -2731,6 +4714,25 @@ def terminal_key_sequence(keysym: str, char: str = "", state: int = 0, *, applic
             modifier = 1 + shift + 4 * control + 2 * alt
             return f"\x1b[1;{modifier}{cursor[keysym]}"
         return f"\x1bO{cursor[keysym]}" if application_cursor else f"\x1b[{cursor[keysym]}"
+    keypad = {
+        "KP_0": "p",
+        "KP_1": "q",
+        "KP_2": "r",
+        "KP_3": "s",
+        "KP_4": "t",
+        "KP_5": "u",
+        "KP_6": "v",
+        "KP_7": "w",
+        "KP_8": "x",
+        "KP_9": "y",
+        "KP_Add": "k",
+        "KP_Subtract": "m",
+        "KP_Multiply": "j",
+        "KP_Divide": "o",
+        "KP_Decimal": "n",
+    }
+    if keysym in keypad and application_keypad:
+        return "\x1bO" + keypad[keysym]
     fixed = {
         "Delete": "\x1b[3~",
         "Insert": "\x1b[2~",
@@ -2762,6 +4764,10 @@ def terminal_key_sequence(keysym: str, char: str = "", state: int = 0, *, applic
         }.get(int(keysym[1:]), "")
     if control and len(char) == 1 and char.isalpha():
         return chr(ord(char.upper()) - ord("@"))
+    if control:
+        controls = {"@": "\x00", "[": "\x1b", "\\": "\x1c", "]": "\x1d", "^": "\x1e", "_": "\x1f", "?": "\x7f"}
+        if char in controls:
+            return controls[char]
     if alt and char:
         return "\x1b" + char
     return char
@@ -2885,7 +4891,22 @@ def validate_profile(raw: dict[str, Any], *, check_key_exists: bool = True) -> d
         "launch_preferences",
     ):
         value = raw.get(section)
-        result[section] = value if isinstance(value, dict) else defaults[section]
+        result[section] = (
+            normalized_launch_preferences(value)
+            if section == "launch_preferences"
+            else value
+            if isinstance(value, dict)
+            else defaults[section]
+        )
+    raw_connection_options = result["connection_options"]
+    connection_options = dict(raw_connection_options) if isinstance(raw_connection_options, dict) else {}
+    if "ssh_preferences" in connection_options:
+        connection_options["ssh_preferences"] = validate_ssh_preferences(connection_options["ssh_preferences"])
+    else:
+        legacy_profile = dict(result)
+        legacy_profile["connection_options"] = connection_options
+        connection_options["ssh_preferences"] = ssh_preferences_from_profile(legacy_profile)
+    result["connection_options"] = connection_options
     return result
 
 
@@ -2936,23 +4957,31 @@ def validate_tunnel_rules(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for raw in rules:
         rule = dict(raw)
         kind = str(rule.get("type", "Local"))
-        if kind not in {"Local", "Remote", "SOCKS"}:
-            raise ProfileError("Tunnel type must be Local, Remote, or SOCKS.")
-        bind_port = validate_port(rule.get("bind_port", 0)) if rule.get("bind_port", 0) else 0
-        destination_port = validate_port(rule.get("destination_port", 0)) if rule.get("destination_port", 0) else 0
-        if kind != "SOCKS" and (not str(rule.get("destination_host", "")).strip() or not destination_port):
+        kind = "SOCKS" if kind in {"Dynamic", "Dynamic/SOCKS", "SOCKS"} else kind
+        if kind not in {"Local", "Remote", "SOCKS", "HTTP"}:
+            raise ProfileError("Tunnel type must be Local, Remote, Dynamic, or HTTP.")
+        bind_address = str(rule.get("bind_address", "127.0.0.1")).strip()
+        if not bind_address:
+            raise ProfileError("Listen host is required.")
+        bind_port = validate_port(rule.get("bind_port", 0))
+        destination_free = kind in {"SOCKS", "HTTP"}
+        destination_port = validate_port(rule.get("destination_port", 0)) if not destination_free else 0
+        if not destination_free and (not str(rule.get("destination_host", "")).strip() or not destination_port):
             raise ProfileError("Local and Remote tunnels require a destination host and port.")
-        if kind == "SOCKS":
+        if destination_free:
             destination_port, rule["destination_host"] = 0, ""
-        endpoint = (str(rule.get("bind_address", "127.0.0.1")), bind_port)
-        if bool(rule.get("enabled", True)) and endpoint in endpoints:
-            raise ProfileError("Enabled tunnel bind endpoints must be unique.")
-        endpoints.add(endpoint)
+        endpoint = (bind_address.casefold(), bind_port)
+        enabled = bool(rule.get("enabled", True))
+        if enabled:
+            if endpoint in endpoints:
+                raise ProfileError("Enabled tunnel listen endpoints must be unique.")
+            endpoints.add(endpoint)
         rule.update(
             {
                 "rule_id": str(rule.get("rule_id") or uuid4()),
-                "enabled": bool(rule.get("enabled", True)),
+                "enabled": enabled,
                 "type": kind,
+                "bind_address": bind_address,
                 "bind_port": bind_port,
                 "destination_port": destination_port,
                 "description": str(rule.get("description", ""))[:200],
@@ -2960,6 +4989,83 @@ def validate_tunnel_rules(rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
         )
         result.append(rule)
     return result
+
+
+def port_forwarding_display_row(rule: dict[str, Any]) -> tuple[str, str, str, str, str, str]:
+    """Return the Services table representation of a canonical tunnel rule."""
+    kind = "Dynamic" if rule.get("type") == "SOCKS" else str(rule.get("type", "Local"))
+    return (
+        "Yes" if bool(rule.get("enabled", True)) else "No",
+        kind,
+        str(rule.get("bind_address", "127.0.0.1")),
+        str(rule.get("bind_port", "")),
+        "" if kind in {"Dynamic", "HTTP"} else str(rule.get("destination_host", "")),
+        "" if kind in {"Dynamic", "HTTP"} else str(rule.get("destination_port", "")),
+    )
+
+
+@dataclass
+class PortForwardingEditor:
+    """Display-free working-copy editor for saved forwarding rules."""
+
+    rules: list[dict[str, Any]] = field(default_factory=list)
+    loaded_rules: list[dict[str, Any]] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.rules = validate_tunnel_rules(json.loads(json.dumps(self.rules)))
+        self.loaded_rules = json.loads(json.dumps(self.rules))
+
+    @classmethod
+    def from_profile(cls, profile: dict[str, Any]) -> "PortForwardingEditor":
+        section = profile.get("tunnel_options", {})
+        rules = section.get("rules", []) if isinstance(section, dict) else []
+        return cls(rules)
+
+    @property
+    def dirty(self) -> bool:
+        return self.rules != self.loaded_rules
+
+    def add(self, rule: dict[str, Any]) -> dict[str, Any]:
+        candidate = validate_tunnel_rules([*self.rules, rule])
+        self.rules = candidate
+        return self.rules[-1]
+
+    def edit(self, rule_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+        index = next(
+            (position for position, rule in enumerate(self.rules) if rule.get("rule_id") == rule_id),
+            None,
+        )
+        if index is None:
+            raise ProfileError("Port-forwarding rule not found.")
+        updated = dict(self.rules[index])
+        updated.update(updates)
+        updated["rule_id"] = rule_id
+        candidate = list(self.rules)
+        candidate[index] = updated
+        self.rules = validate_tunnel_rules(candidate)
+        return self.rules[index]
+
+    def remove(self, rule_id: str) -> bool:
+        remaining = [rule for rule in self.rules if rule.get("rule_id") != rule_id]
+        if len(remaining) == len(self.rules):
+            return False
+        self.rules = remaining
+        return True
+
+    def duplicate(self, rule_id: str) -> dict[str, Any]:
+        source = next((rule for rule in self.rules if rule.get("rule_id") == rule_id), None)
+        if source is None:
+            raise ProfileError("Port-forwarding rule not found.")
+        duplicate = json.loads(json.dumps(source))
+        duplicate["rule_id"] = str(uuid4())
+        # An enabled exact copy would conflict with its source listener.
+        duplicate["enabled"] = False
+        return self.add(duplicate)
+
+    def apply_to_working_profile(self, profile: dict[str, Any]) -> None:
+        section = dict(profile.get("tunnel_options", {}))
+        section["rules"] = json.loads(json.dumps(self.rules))
+        profile["tunnel_options"] = section
 
 
 def connection_kwargs(profile: dict[str, Any], password: str | None = None) -> dict[str, Any]:
@@ -2990,6 +5096,14 @@ def connection_kwargs(profile: dict[str, Any], password: str | None = None) -> d
 def friendly_connection_error(error: BaseException) -> str:
     """Translate common transport errors into actionable, non-secret UI text."""
     message = str(error).lower()
+    if isinstance(error, ProfileError) and (
+        ("unsupported" in message and "ssh" in message)
+        or "ssh algorithm" in message
+        or "ssh keepalive" in message
+        or "ssh runtime" in message
+        or "preferred ssh" in message
+    ):
+        return "The selected SSH runtime preference is unsupported by this backend."
     if isinstance(error, TimeoutError) or "timed out" in message:
         return "The server did not respond. Check the hostname, port, VPN, or network connection."
     if "authentication" in message or "auth fail" in message:
@@ -3430,3 +5544,425 @@ class ProfileStore:
             self.entries = old
             raise
         return summary
+
+
+# ── Native VTE terminal backend ────────────────────────────────────────────
+# This remains in the core module so the canonical single-file wheel can start
+# the helper without adding a second, separately packaged executable.
+
+
+@dataclass(frozen=True)
+class VTEAvailability:
+    available: bool
+    interpreter: str | None = None
+    reason: str = ""
+
+
+def _gi_probe(interpreter: str) -> bool:
+    try:
+        result = subprocess.run(
+            [
+                interpreter,
+                "-c",
+                'import gi; gi.require_version("Gtk", "3.0"); gi.require_version("Vte", "2.91"); from gi.repository import Gtk, Vte',
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def detect_vte_backend() -> VTEAvailability:
+    """Use the system interpreter for GTK/VTE, never an incompatible venv."""
+    if platform.system() != "Linux":
+        return VTEAvailability(False, reason="Native VTE is available only on Linux.")
+    candidate = "/usr/bin/python3"
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK) and _gi_probe(candidate):
+        return VTEAvailability(True, candidate)
+    return VTEAvailability(False, reason="Install python3-gi and the VTE GTK introspection bindings.")
+
+
+_VTE_ENV_NAMES = {
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "PATH",
+    "LANG",
+    "LANGUAGE",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+}
+
+
+def vte_inherited_environment(parent: dict[str, str] | None = None) -> dict[str, str]:
+    """Copy the GUI/session environment required by VTE and OpenSSH.
+
+    Values are deliberately never sent through IPC or diagnostics.
+    """
+    source = os.environ if parent is None else parent
+    names = _VTE_ENV_NAMES | {name for name in source if name.startswith("LC_")}
+    return {name: source[name] for name in names if source.get(name)}
+
+
+def vte_agent_diagnostics(environment: dict[str, str] | None = None) -> dict[str, bool]:
+    """Return safe agent booleans only; never reveal a socket path or contents."""
+    env = vte_inherited_environment(environment)
+    path = env.get("SSH_AUTH_SOCK")
+    return {"agent_socket_present": bool(path), "agent_socket_exists": bool(path and os.path.exists(path))}
+
+
+def _safe_ssh_target(host: object, username: object) -> str:
+    host_text, user_text = str(host).strip(), str(username).strip()
+    try:
+        validate_host(host_text)
+    except ProfileError as exc:
+        raise ProfileError("Native terminal host is invalid.") from exc
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", user_text):
+        raise ProfileError("Native terminal username is invalid.")
+    return f"{user_text}@{host_text}"
+
+
+def build_native_ssh_argv(profile: dict[str, Any]) -> list[str]:
+    """Build a restricted OpenSSH argv; no profile field is shell-expanded."""
+    target = _safe_ssh_target(profile.get("host", ""), profile.get("user", ""))
+    try:
+        port = int(profile.get("port", DEFAULT_PORT))
+    except (TypeError, ValueError) as exc:
+        raise ProfileError("Native terminal port is invalid.") from exc
+    if not 1 <= port <= 65535:
+        raise ProfileError("Native terminal port is invalid.")
+    argv = ["ssh", "-tt", "-p", str(port)]
+    timeout = profile.get("timeout")
+    if timeout not in (None, ""):
+        try:
+            value = int(cast(Any, timeout))
+        except (TypeError, ValueError) as exc:
+            raise ProfileError("Native terminal timeout is invalid.") from exc
+        if not 1 <= value <= 3600:
+            raise ProfileError("Native terminal timeout is invalid.")
+        argv += ["-o", f"ConnectTimeout={value}"]
+    options = profile.get("connection_options", {})
+    if not isinstance(options, dict):
+        options = {}
+    for source, option, maximum in (
+        ("keepalive_interval", "ServerAliveInterval", 3600),
+        ("keepalive_count", "ServerAliveCountMax", 100),
+    ):
+        if options.get(source) not in (None, ""):
+            value = int(options[source])
+            if not 0 <= value <= maximum:
+                raise ProfileError(f"Native terminal {source} is invalid.")
+            argv += ["-o", f"{option}={value}"]
+    if profile.get("compression") is True:
+        argv.append("-C")
+    proxy = profile.get("proxy_jump")
+    if proxy:
+        if not isinstance(proxy, str) or not re.fullmatch(r"[A-Za-z0-9@._,:\-\[\]]{1,512}", proxy):
+            raise ProfileError("Native terminal ProxyJump is invalid.")
+        argv += ["-J", proxy]
+    if profile.get("auth_method") == "key":
+        path = Path(str(profile.get("key_path", ""))).expanduser()
+        if not path.is_file():
+            raise ProfileError("Native terminal identity file is invalid.")
+        argv += ["-i", str(path), "-o", "IdentitiesOnly=yes"]
+    terminal_options = profile.get("terminal_options", {})
+    terminal_options = terminal_options if isinstance(terminal_options, dict) else {}
+    terminal_type = str(terminal_options.get("terminal_type", "xterm-256color")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,64}", terminal_type):
+        raise ProfileError("Native terminal type is invalid.")
+    argv += ["-o", f"SetEnv=TERM={terminal_type}"]
+    if terminal_options.get("agent_forwarding") is True:
+        argv.append("-A")
+    if terminal_options.get("x11_forwarding") is True:
+        argv.append("-Y" if terminal_options.get("x11_trusted") is True else "-X")
+    # Passwords are deliberately absent: OpenSSH prompts inside VTE.
+    argv.append(target)
+    command = str(profile.get("terminal_options", {}).get("startup_command", "")).strip()
+    if command:
+        argv.append(command)
+    return argv
+
+
+class TerminalBackend:
+    label = "Legacy terminal"
+
+    def open_terminal_tab(self, profile: dict[str, Any]) -> bool:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+
+class LegacyPyteTerminalBackend(TerminalBackend):
+    """Marker backend: the Tk caller owns the existing TerminalWidget."""
+
+    label = "Legacy terminal"
+
+    def open_terminal_tab(self, profile: dict[str, Any]) -> bool:
+        return False
+
+    def close(self) -> None:
+        return None
+
+
+class VTETerminalBackend(TerminalBackend):
+    """Control-plane client for the isolated GTK/VTE helper (never terminal bytes)."""
+
+    label = "Native VTE"
+
+    def __init__(self, availability: VTEAvailability | None = None):
+        self.availability = availability or detect_vte_backend()
+        self._directory: Path | None = None
+        self._connection: socket.socket | None = None
+        self._process: subprocess.Popen[bytes] | None = None
+        self._token = secrets.token_urlsafe(32)
+        self._environment = vte_inherited_environment()
+        self.reason = self.availability.reason
+        self._terminals: dict[str, dict[str, Any]] = {}
+        self._last_window_id: str | None = None
+        self.last_terminal_id: str | None = None
+
+    @property
+    def status(self) -> str:
+        if self._connection and self._process and self._process.poll() is None:
+            return "Native VTE ready"
+        if not self.availability.available:
+            return "Legacy terminal — VTE unavailable"
+        return f"Legacy terminal — VTE helper failed: {self.reason or 'helper exited early'}"
+
+    @staticmethod
+    def _helper_path() -> Path:
+        return Path(__file__).resolve().with_name("sshvault_vte_helper.py")
+
+    def _startup_error(self, fallback: str) -> str:
+        if not self._process or not self._process.stderr:
+            return fallback
+        try:
+            detail = self._process.stderr.read(4096).decode("utf-8", "replace").strip()
+        except (OSError, ValueError):
+            return fallback
+        if "GI/VTE import failed" in detail:
+            return "GI import failed"
+        if "display unavailable" in detail:
+            return "display unavailable"
+        if "Permission denied" in detail:
+            return "permission error"
+        return fallback
+
+    def _fail(self, reason: str) -> bool:
+        self.reason = reason
+        self.close()
+        return False
+
+    def _receive(self, timeout: float) -> dict[str, Any] | None:
+        if not self._connection:
+            return None
+        self._connection.settimeout(timeout)
+        try:
+            payload = self._connection.recv(4096)
+            message = json.loads(payload.decode("utf-8").split("\n", 1)[0])
+            return message if isinstance(message, dict) else None
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+
+    def _request(self, command: str, **payload: Any) -> dict[str, Any] | None:
+        """Send one authenticated control request and wait for its response."""
+        if not self._connection:
+            return None
+        request_id = str(uuid4())
+        message = {"type": command, "token": self._token, "request_id": request_id, **payload}
+        try:
+            self._connection.sendall((json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8"))
+            response = self._receive(3)
+        except OSError:
+            return None
+        if not response or response.get("type") != "response" or response.get("request_id") != request_id:
+            return None
+        return response
+
+    def _start(self) -> bool:
+        if self._connection and self._process and self._process.poll() is None:
+            return True
+        if not self.availability.available or not self.availability.interpreter:
+            return self._fail(self.availability.reason or "VTE unavailable")
+        helper = self._helper_path()
+        if not helper.is_file():
+            return self._fail("helper module missing")
+        try:
+            probe = subprocess.run(
+                [self.availability.interpreter, str(helper), "--probe"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                env=self._environment,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return self._fail("helper module missing")
+        if probe.returncode != 0:
+            return self._fail("GI import failed")
+        self._directory = Path(tempfile.mkdtemp(prefix="sshvault-vte-"))
+        os.chmod(self._directory, 0o700)
+        socket_path = self._directory / "control.sock"
+        try:
+            self._process = subprocess.Popen(
+                [
+                    self.availability.interpreter,
+                    str(helper),
+                    "--socket",
+                    str(socket_path),
+                    "--token",
+                    self._token,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                close_fds=True,
+                env=self._environment,
+            )
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if self._process.poll() is not None:
+                    return self._fail(self._startup_error("helper exited early"))
+                if socket_path.exists():
+                    mode = socket_path.stat().st_mode & 0o777
+                    directory_mode = self._directory.stat().st_mode & 0o777
+                    if mode != 0o600 or directory_mode != 0o700:
+                        return self._fail("IPC socket permission error")
+                    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    try:
+                        connection.connect(str(socket_path))
+                    except OSError:
+                        connection.close()
+                        time.sleep(0.05)
+                        continue
+                    self._connection = connection
+                    ready = self._receive(2)
+                    if ready != {"type": "ready", "token": self._token}:
+                        return self._fail("readiness handshake failed")
+                    pong = self._request("ping")
+                    if not pong or not pong.get("ok"):
+                        return self._fail("readiness handshake failed")
+                    self.reason = ""
+                    return True
+                time.sleep(0.05)
+            return self._fail("readiness timeout")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return self._fail("IPC socket could not be created")
+
+    def ensure_ready(self) -> bool:
+        """Start and authenticate the helper before exposing Native VTE."""
+        return self._start()
+
+    def open_terminal_tab(self, profile: dict[str, Any]) -> bool:
+        """Open another VTE tab in the last native window (or a first window)."""
+        return self._open(profile, "open_tab")
+
+    def open_terminal_window(self, profile: dict[str, Any]) -> bool:
+        """Open an independent native VTE window."""
+        return self._open(profile, "open_window")
+
+    def _open(self, profile: dict[str, Any], command: str) -> bool:
+        if not self._start():
+            return False
+        try:
+            request: dict[str, Any] = {
+                "argv": build_native_ssh_argv(profile),
+                "title": str(profile.get("name", "SSHVault")),
+                "terminal_options": dict(profile.get("terminal_options", {})),
+            }
+            if command == "open_tab" and self._last_window_id:
+                request["window_id"] = self._last_window_id
+            response = self._request(command, **request)
+            if not response or not response.get("ok"):
+                return self._fail("helper rejected terminal request")
+            terminal_id, window_id = response.get("terminal_id"), response.get("window_id")
+            if not isinstance(terminal_id, str) or not isinstance(window_id, str):
+                return self._fail("invalid helper response")
+            self._terminals[terminal_id] = {
+                "terminal_id": terminal_id,
+                "window_id": window_id,
+                "title": request["title"],
+            }
+            self.last_terminal_id = terminal_id
+            self._last_window_id = window_id
+        except (OSError, TypeError, ProfileError):
+            return self._fail("helper exited early")
+        return True
+
+    def list_terminals(self) -> list[dict[str, Any]]:
+        if not self._start():
+            return []
+        response = self._request("list_terminals")
+        terminals = response.get("terminals", []) if response and response.get("ok") else []
+        if isinstance(terminals, list):
+            self._terminals = {
+                str(item["terminal_id"]): item for item in terminals if isinstance(item, dict) and "terminal_id" in item
+            }
+            return list(self._terminals.values())
+        return []
+
+    def close_terminal(self, terminal_id: str) -> bool:
+        """Close one native terminal without affecting sibling tabs/windows."""
+        if terminal_id not in self._terminals or not self._start():
+            return False
+        response = self._request("close_tab", terminal_id=terminal_id)
+        if not response or not response.get("ok"):
+            return False
+        self._terminals.pop(terminal_id, None)
+        if self.last_terminal_id == terminal_id:
+            self.last_terminal_id = next(reversed(self._terminals), None)
+        return True
+
+    def agent_diagnostics(self, *, selected_authentication: str = "") -> dict[str, bool]:
+        """Opt-in safe diagnostics; values and credentials are never exposed."""
+        status = vte_agent_diagnostics(self._environment)
+        status["helper_inherited_agent"] = status["agent_socket_present"]
+        status["openssh_child_inherited_agent"] = status["agent_socket_present"]
+        status["agent_authentication_selected"] = selected_authentication == "agent"
+        return status
+
+    def development_diagnostics(self) -> dict[str, int | bool | str | None]:
+        """Safe development-only state; command arguments are never exposed."""
+        return {
+            "helper_pid": self._process.pid if self._process else None,
+            "helper_alive": bool(self._process and self._process.poll() is None),
+            "vte_tabs": len(self._terminals),
+            "openssh_child_pid": next((item.get("pid") for item in self._terminals.values()), None),
+            "backend_state": self.status,
+        }
+
+    def close(self) -> None:
+        if self._connection:
+            try:
+                self._connection.sendall(
+                    (json.dumps({"type": "shutdown", "token": self._token, "request_id": str(uuid4())}) + "\n").encode()
+                )
+            except OSError:
+                pass
+            self._connection.close()
+            self._connection = None
+        if self._process and self._process.poll() is None:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+        self._process = None
+        self._terminals.clear()
+        self._last_window_id = None
+        self.last_terminal_id = None
+        if self._directory:
+            shutil.rmtree(self._directory, ignore_errors=True)
+            self._directory = None

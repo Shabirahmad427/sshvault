@@ -65,3 +65,37 @@ class TerminalPanelStateTests(unittest.TestCase):
         self.assertEqual(terminal_key_sequence("F12"), "\x1b[24~")
         self.assertEqual(terminal_key_sequence("a", "a", 0x0004), "\x01")
         self.assertEqual(terminal_key_sequence("x", "x", 0x0008), "\x1bx")
+
+    def test_editor_and_shell_control_sequences_are_not_local_shortcuts(self) -> None:
+        controls = {
+            "c": "\x03",
+            "d": "\x04",
+            "z": "\x1a",
+            "l": "\x0c",
+            "o": "\x0f",
+            "x": "\x18",
+            "s": "\x13",
+            "q": "\x11",
+        }
+        for key, expected in controls.items():
+            with self.subTest(key=key):
+                self.assertEqual(terminal_key_sequence(key, key, 0x0004), expected)
+        self.assertEqual(terminal_key_sequence("Escape"), "\x1b")
+        self.assertEqual(terminal_key_sequence("Return"), "\r")
+        self.assertEqual(terminal_key_sequence("Prior"), "\x1b[5~")
+        self.assertEqual(terminal_key_sequence("Next"), "\x1b[6~")
+
+    def test_terminal_control_punctuation_and_application_keypad(self) -> None:
+        for char, expected in {
+            "@": "\x00",
+            "[": "\x1b",
+            "\\": "\x1c",
+            "]": "\x1d",
+            "^": "\x1e",
+            "_": "\x1f",
+            "?": "\x7f",
+        }.items():
+            with self.subTest(char=char):
+                self.assertEqual(terminal_key_sequence(char, char, 0x0004), expected)
+        self.assertEqual(terminal_key_sequence("KP_7", application_keypad=True), "\x1bOw")
+        self.assertEqual(terminal_key_sequence("KP_Add", application_keypad=True), "\x1bOk")
