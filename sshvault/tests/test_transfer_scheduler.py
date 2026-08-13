@@ -27,6 +27,23 @@ class FakeSFTP:
         self.closed = True
 
 
+class _TimeoutChannel:
+    def __init__(self) -> None:
+        self.timeout = None
+
+    def settimeout(self, value) -> None:
+        self.timeout = value
+
+
+class TimeoutSFTP(FakeSFTP):
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.channel = _TimeoutChannel()
+
+    def get_channel(self):
+        return self.channel
+
+
 class FakeTransport:
     def __init__(self):
         self.active = True
@@ -112,6 +129,48 @@ class TransferSchedulerTests(unittest.TestCase):
         scheduler.shutdown()
         self.assertTrue(all(client.closed for client in self.clients))
 
+    def test_worker_channel_receives_remote_operation_timeout(self):
+        scheduler = TransferScheduler(lambda: TimeoutSFTP(self), concurrency=1, operation_timeout=7)
+        item = scheduler.enqueue(
+            TransferItem("a", "a", "Upload", total=1),
+            lambda row, _client, worker: worker.checkpoint(1, row.total),
+        )
+        for _ in range(100):
+            if item.status == TransferState.COMPLETED:
+                break
+            time.sleep(0.005)
+        self.assertEqual(item.status, TransferState.COMPLETED)
+        self.assertEqual(self.clients[0].channel.timeout, 7)
+        scheduler.shutdown()
+
+    def test_retry_failed_resubmits_only_failed_items(self):
+        scheduler = self.scheduler(1)
+        attempts: dict[str, int] = {}
+
+        def operation(item, _client, worker):
+            attempts[item.source] = attempts.get(item.source, 0) + 1
+            if item.source == "failed" and attempts[item.source] == 1:
+                raise OSError("one file failed")
+            worker.checkpoint(item.total or 0, item.total)
+
+        failed = scheduler.enqueue(TransferItem("failed", "failed", "Upload", total=1), operation)
+        completed = scheduler.enqueue(TransferItem("completed", "completed", "Upload", total=1), operation)
+        cancelled = scheduler.record(
+            TransferItem("cancelled", "cancelled", "Upload", total=1, status=TransferState.CANCELLED)
+        )
+        for _ in range(200):
+            if failed.status == TransferState.FAILED and completed.status == TransferState.COMPLETED:
+                break
+            time.sleep(0.005)
+        scheduler.retry_failed()
+        for _ in range(200):
+            if failed.status == TransferState.COMPLETED:
+                break
+            time.sleep(0.005)
+        self.assertEqual(attempts, {"failed": 2, "completed": 1})
+        self.assertEqual(cancelled.status, TransferState.CANCELLED)
+        scheduler.shutdown()
+
 
 class ParallelResumeSchedulerTests(unittest.TestCase):
     def setUp(self):
@@ -183,6 +242,31 @@ class ParallelResumeSchedulerTests(unittest.TestCase):
         self.wait_for(lambda: row.status == TransferState.COMPLETED)
         self.assertTrue(lock_was_free.is_set())
         scheduler.shutdown()
+
+    def test_reuse_worker_channels_across_sequential_items(self):
+        created = []
+
+        def factory():
+            client = FakeSFTP(self)
+            created.append(client)
+            return client
+
+        scheduler = TransferScheduler(factory, concurrency=1, reuse_worker_channels=True)
+        seen = []
+
+        def operation(item, client, worker):
+            seen.append(id(client))
+            worker.checkpoint(item.total or 0, item.total)
+
+        rows = [scheduler.enqueue(TransferItem(str(i), str(i), "Upload", total=1), operation) for i in range(3)]
+        for _ in range(200):
+            if all(row.status == TransferState.COMPLETED for row in rows):
+                break
+            time.sleep(0.005)
+        self.assertEqual(len(created), 1)
+        self.assertEqual(len(set(seen)), 1)
+        scheduler.shutdown()
+        self.assertTrue(created[0].closed)
 
     def test_stall_fails_one_worker_without_blocking_other_resumes(self):
         entered = threading.Event()

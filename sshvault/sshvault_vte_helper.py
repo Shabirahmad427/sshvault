@@ -16,6 +16,64 @@ from uuid import uuid4
 NATIVE_VTE_CLOSE_TAB_LABEL = "Close This Terminal"
 
 
+def _terminal_shortcut_action(control: bool, shift: bool, keyval: int, has_selection: bool) -> str | None:
+    if control and shift and keyval in (ord("c"), ord("C")):
+        return "copy" if has_selection else "handled"
+    if control and shift and keyval in (ord("v"), ord("V")):
+        return "paste"
+    if control and keyval == 65379:
+        return "copy" if has_selection else "handled"
+    if shift and keyval == 65379:
+        return "paste"
+    return None
+
+
+def _dispatch_terminal_keypress(widget: Any, event: Any) -> bool:
+    """Handle only local shortcuts; ordinary input goes straight to VTE's PTY."""
+    control, shift = bool(event.state & 4), bool(event.state & 1)
+    action = _terminal_shortcut_action(control, shift, event.keyval, widget.get_has_selection())
+    if action == "copy":
+        widget.copy_clipboard()
+    elif action == "paste":
+        widget.paste_clipboard()
+    return action is not None
+
+
+def _read_control_messages(
+    connection: socket.socket,
+    pending: bytes,
+) -> tuple[bytes, list[dict[str, Any]], bool]:
+    """Drain all available control bytes in one GTK wakeup.
+
+    Terminal output is intentionally absent from this socket: VTE reads its
+    child PTY directly.  The loop only batches sparse helper control messages.
+    """
+    chunks: list[bytes] = []
+    connected = True
+    while True:
+        try:
+            data = connection.recv(65536)
+        except BlockingIOError:
+            break
+        if not data:
+            connected = False
+            break
+        chunks.append(data)
+    if chunks:
+        pending += b"".join(chunks)
+    lines = pending.split(b"\n")
+    pending = lines.pop()
+    messages: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            message = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(message, dict):
+            messages.append(message)
+    return pending, messages, connected
+
+
 def _terminal_tab_label(Gtk: Any, title: str, close_callback: Any) -> Any:
     """Build a compact per-tab label with an independent close control."""
     box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -110,9 +168,9 @@ def main(socket_path: str, token: str) -> int:
         if not terminals:
             Gtk.main_quit()
 
-    def new_window() -> str:
+    def new_window(title: str) -> str:
         window_id = str(uuid4())
-        window = Gtk.Window(title="SSHVault — Native VTE")
+        window = Gtk.Window(title=title)
         notebook = Gtk.Notebook()
         window.add(notebook)
         window.set_default_size(1000, 700)
@@ -155,7 +213,7 @@ def main(socket_path: str, token: str) -> int:
             str(requested) if not force_new_window and isinstance(requested, str) and requested in windows else ""
         )
         if not window_id:
-            window_id = new_window()
+            window_id = new_window(str(message.get("title", "SSHVault")))
         terminal_id = str(uuid4())
         terminal = Vte.Terminal()
         options = message.get("terminal_options")
@@ -189,6 +247,7 @@ def main(socket_path: str, token: str) -> int:
             "page": page,
             "window_id": window_id,
             "title": title,
+            "session_id": str(message.get("session_id", "")),
             "pid": None,
         }
 
@@ -212,25 +271,7 @@ def main(socket_path: str, token: str) -> int:
             None,
         )
 
-        def keypress(widget: Any, event: Any) -> bool:
-            ctrl, shift = bool(event.state & 4), bool(event.state & 1)
-            if ctrl and shift and event.keyval in (ord("c"), ord("C")):
-                if widget.get_has_selection():
-                    widget.copy_clipboard()
-                return True
-            if ctrl and shift and event.keyval in (ord("v"), ord("V")):
-                widget.paste_clipboard()
-                return True
-            if ctrl and event.keyval == 65379:  # Insert
-                if widget.get_has_selection():
-                    widget.copy_clipboard()
-                return True
-            if shift and event.keyval == 65379:
-                widget.paste_clipboard()
-                return True
-            return False  # notably preserves Ctrl-C and native selection keys
-
-        terminal.connect("key-press-event", keypress)
+        terminal.connect("key-press-event", _dispatch_terminal_keypress)
 
         def menu(_widget: Any, event: Any) -> bool:
             if event.button != 3:
@@ -269,7 +310,6 @@ def main(socket_path: str, token: str) -> int:
             return True
 
         terminal.connect("button-press-event", menu)
-        terminal.connect("focus-in-event", lambda widget, _event: (widget.grab_focus(), False)[1])
         container["window"].show_all()
         terminal.grab_focus()
         return terminal_id, window_id
@@ -292,7 +332,11 @@ def main(socket_path: str, token: str) -> int:
                 terminal_id, window_id = open_terminal(message, True)
                 response(request_id, True, terminal_id=terminal_id, window_id=window_id)
             elif kind == "close_tab":
-                response(request_id, close_tab(str(message.get("terminal_id", ""))))
+                terminal_id = str(message.get("terminal_id", ""))
+                exists = terminal_id in terminals
+                response(request_id, exists)
+                if exists:
+                    GLib.idle_add(lambda: (close_tab(terminal_id), False)[1])
             elif kind == "close_window":
                 window_id = str(message.get("window_id", ""))
                 window = windows.get(window_id)
@@ -318,32 +362,32 @@ def main(socket_path: str, token: str) -> int:
 
     def list_terminals() -> list[dict[str, Any]]:
         return [
-            {"terminal_id": key, "window_id": value["window_id"], "title": value["title"], "pid": value["pid"]}
+            {
+                "terminal_id": key,
+                "window_id": value["window_id"],
+                "title": value["title"],
+                "session_id": value["session_id"],
+                "pid": value["pid"],
+            }
             for key, value in terminals.items()
         ]
 
-    def poll() -> bool:
+    def control_ready(_source: Any, condition: Any) -> bool:
         nonlocal pending
-        try:
-            data = connection.recv(65536)
-        except BlockingIOError:
-            return True
-        if not data:
+        if condition & (GLib.IO_HUP | GLib.IO_ERR):
             Gtk.main_quit()
             return False
-        pending += data
-        lines = pending.split(b"\n")
-        pending = lines.pop()
-        for line in lines:
-            try:
-                message = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if isinstance(message, dict):
-                handle(message)
+        pending, messages, connected = _read_control_messages(connection, pending)
+        for message in messages:
+            handle(message)
+        if not connected:
+            Gtk.main_quit()
+            return False
         return True
 
-    GLib.timeout_add(25, poll)
+    # Wake only when control data is ready.  VTE owns terminal PTY reads/writes,
+    # so neither terminal output nor keystrokes are delayed by helper polling.
+    GLib.io_add_watch(connection.fileno(), GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, control_ready)
     Gtk.main()
     connection.close()
     listener.close()

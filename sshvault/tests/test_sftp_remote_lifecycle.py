@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
+from sshvault import SSHVaultApp
 from sshvault_core import (
     SFTPBrowserClient,
     SFTPBrowserRegistry,
     SFTPViewNavigationState,
     SessionController,
+    TransferItem,
+    TransferScheduler,
     list_local_browser_entries,
 )
 
@@ -29,6 +34,56 @@ class _Channel:
 
 
 class RemoteLifecycleTests(unittest.TestCase):
+    def test_closing_sftp_view_returns_immediately_and_keeps_transfer(self) -> None:
+        release = threading.Event()
+        close_entered = threading.Event()
+
+        class SlowChannel(_Channel):
+            def close(self) -> None:
+                close_entered.set()
+                release.wait(1)
+                super().close()
+
+        class Window:
+            destroyed = False
+
+            def destroy(self):
+                self.destroyed = True
+
+        controller = SessionController()
+        session = controller.create_session({"id": "profile", "host": "host", "user": "user"})
+        controller.register_sftp_view(session.session_id, "view")
+        registry = SFTPBrowserRegistry()
+        registry.register(session.session_id, "view", SFTPBrowserClient(SlowChannel()))
+        scheduler = TransferScheduler()
+        transfer = scheduler.record(TransferItem("source", "target", "Upload"))
+        window = Window()
+        app = type(
+            "App",
+            (),
+            {
+                "_close_sftp_views_for_session": SSHVaultApp._close_sftp_views_for_session,
+                "_session_controller": controller,
+                "_sftp_browser_clients": registry,
+                "_sftp_views": {"view": window},
+                "_sftp_view_state_callbacks": {"view": object()},
+                "_sftp_transfer_status_callbacks": {"view": object()},
+                "_sftp_transfer_queue_callbacks": {"view": object()},
+                "_refresh_sessions": lambda self: None,
+            },
+        )()
+        try:
+            started = time.monotonic()
+            app._close_sftp_views_for_session(session.session_id)
+            self.assertLess(time.monotonic() - started, 0.2)
+            self.assertTrue(window.destroyed)
+            self.assertTrue(close_entered.wait(0.5))
+            self.assertIs(scheduler.get(transfer.item_id), transfer)
+            self.assertFalse(scheduler.closed)
+        finally:
+            release.set()
+            scheduler.shutdown()
+
     def test_disconnect_disables_remote_controls_state(self) -> None:
         state = SFTPViewNavigationState(remote_current_path="/remote")
         state.mark_remote_disconnected()

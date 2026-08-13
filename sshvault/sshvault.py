@@ -25,6 +25,9 @@ from pathlib import Path
 from datetime import datetime
 from uuid import uuid4
 from sshvault_security import (
+    AgentAuthenticationDiagnostic,
+    agent_environment_diagnostics,
+    prepare_agent_environment,
     ChangedHostKeyRejected,
     KnownHostsStore,
     SSHConnectionManager,
@@ -49,6 +52,7 @@ from sshvault_core import (
     terminal_key_sequence,
     VTETerminalBackend,
     detect_vte_backend,
+    session_resource_title,
     TunnelFormState,
     TunnelRuntime,
     TunnelManager,
@@ -126,8 +130,12 @@ from sshvault_core import (
     SFTPBrowserRegistry,
     SFTPDragDropRouter,
     SFTPTransferRouter,
+    SFTPListingCache,
     SFTPViewNavigationState,
     browser_entry_properties,
+    batch_browser_entries,
+    browser_keyboard_index,
+    path_entry_shortcut_action,
     confirmed_sftp_delete_entries,
     create_local_browser_folder,
     create_remote_browser_folder,
@@ -1277,7 +1285,7 @@ class SFTPTransferManagerWindow(tk.Toplevel):
         self.state_model = TransferManagerWindowState.from_settings(
             settings.get("transfer_manager_window") if isinstance(settings, dict) else None
         )
-        self.title("SFTP Transfer Manager")
+        self.title(session_resource_title("SFTP Transfer Manager", panel._owner_profile))
         width, height, x, y = self.state_model.geometry_for_screen(self.winfo_screenwidth(), self.winfo_screenheight())
         self.geometry(f"{width}x{height}+{x}+{y}")
         self.minsize(760, 240)
@@ -1487,9 +1495,21 @@ class SFTPTransferManagerWindow(tk.Toplevel):
 
 
 class SFTPPanel(tk.Frame):
-    def __init__(self, parent, sftp, default_local_directory=None, **kw):
+    def __init__(
+        self,
+        parent,
+        sftp,
+        default_local_directory=None,
+        *,
+        verify_completed=True,
+        session_id: str | None = None,
+        owner_profile: dict | None = None,
+        **kw,
+    ):
         super().__init__(parent, bg=PANEL, **kw)
         self._sftp = sftp
+        self.session_id = session_id
+        self._owner_profile = dict(owner_profile or {})
         self._remote_cwd = "/"
         self._local_cwd = (
             str(Path(default_local_directory).expanduser()) if default_local_directory else str(Path.home())
@@ -1506,12 +1526,17 @@ class SFTPPanel(tk.Frame):
         self._closed = False
         self._remote_generation = 0
         self._sftp_state = SFTPPanelState()
+        self._verify_completed = bool(verify_completed)
         settings = getattr(self.winfo_toplevel(), "_runtime_settings", {})
         self._transfer_transport = getattr(self._sftp.get_channel(), "transport", None)
         self._transfer_manager = TransferScheduler(
             self._new_transfer_client,
             concurrency=settings.get("maximum_sftp_transfers", 3) if isinstance(settings, dict) else 3,
             on_change=self._request_transfer_refresh,
+            reuse_worker_channels=True,
+            session_id=self.session_id,
+            profile_id=str(self._owner_profile.get("id", "")) or None,
+            operation_timeout=30,
         )
         self._transfer_window = None
         self._local_load_state = DirectoryLoadState()
@@ -2770,57 +2795,30 @@ class SFTPPanel(tk.Frame):
             self._refresh_transfer_tree()
 
     def _scheduled_upload(self, item, sftp, worker, local: Path, remote: str, replace: bool):
-        """Worker-owned, atomic upload; a partial is restarted unless verified."""
-        total = local.stat().st_size
-        item.total = total
+        """Worker-owned atomic upload with validated partial resume and reconnect."""
         if not replace:
             try:
                 sftp.stat(remote)
+            except (FileNotFoundError, OSError):
+                pass
+            else:
                 raise FileExistsError("A remote file with this name already exists.")
-            except (FileNotFoundError, OSError):
-                pass
-        partial = self._partial_remote_path(remote)
-        # A size alone cannot prove a remote prefix is safe.  Restart rather
-        # than claiming resumability when an extension hash is unavailable.
-        try:
-            if sftp.stat(partial).st_size:
-                item.restart_required = True
-                sftp.remove(partial)
-        except (FileNotFoundError, OSError):
-            pass
-        try:
-            with local.open("rb") as source, sftp.open(partial, "wb") as target:
-                self._enable_upload_pipelining(target)
-                chunk_size = self._transfer_chunk_size()
-                while True:
-                    started = time.perf_counter()
-                    chunk = source.read(chunk_size)
-                    item.metrics.record("local_read", time.perf_counter() - started, len(chunk))
-                    if not chunk:
-                        break
-                    started = time.perf_counter()
-                    target.write(chunk)
-                    item.metrics.record("remote_write", time.perf_counter() - started, len(chunk))
-                    worker.checkpoint(source.tell(), total)
-            if sftp.stat(partial).st_size != total:
-                raise OSError("Upload size verification failed")
-            try:
-                sftp.remove(remote)
-            except (FileNotFoundError, OSError):
-                pass
-            sftp.rename(partial, remote)
-        except InterruptedError:
-            try:
-                sftp.remove(partial)
-            except Exception:
-                pass
-            raise
+        SFTPTransferRouter(
+            self._transfer_manager, verify_completed=bool(getattr(self, "_verify_completed", False))
+        )._upload(item, sftp, worker)
 
     def _scheduled_download(self, item, sftp, worker, remote: str, local: Path, replace: bool):
         """Worker-owned, sidecar-validated resumable and atomic download."""
         attributes = sftp.stat(remote)
         total = attributes.st_size
+        source_snapshot = (int(total), getattr(attributes, "st_mtime", None))
         item.total = total
+        timeout_setter = getattr(worker, "set_operation_timeout", None)
+        transfer_manager = getattr(self, "_transfer_manager", None)
+        if callable(timeout_setter) and transfer_manager is not None:
+            timeout_setter(
+                SFTPTransferRouter._large_file_timeout(total, transfer_manager.operation_timeout)
+            )
         local.parent.mkdir(parents=True, exist_ok=True)
         plan = inspect_download_resume(
             local,
@@ -2881,6 +2879,7 @@ class SFTPPanel(tk.Frame):
                 tuner = AdaptiveTransferTuner(
                     total if chunk_size == 1048576 else 0, chunk_size=chunk_size, prefetch_depth=8
                 )
+                source_checked_at = offset
                 while True:
                     started = time.perf_counter()
                     chunk = source.read(chunk_size)
@@ -2891,6 +2890,12 @@ class SFTPPanel(tk.Frame):
                     target.write(chunk)
                     item.metrics.record("local_write", time.perf_counter() - started, len(chunk))
                     transferred += len(chunk)
+                    if transferred - source_checked_at >= 16 * 1024 * 1024:
+                        current = sftp.stat(remote)
+                        if (int(current.st_size), getattr(current, "st_mtime", None)) != source_snapshot:
+                            item.diagnostics.append("Source still changing")
+                            raise ProfileError("Source file is still being modified")
+                        source_checked_at = transferred
                     chunk_size, _prefetch_depth = tuner.observe(transferred, time.monotonic())
                     now = time.monotonic()
                     if policy.due(transferred, now) or worker.durable_update_required():
@@ -2899,7 +2904,16 @@ class SFTPPanel(tk.Frame):
                 if policy.completed_bytes != transferred:
                     self._persist_download_progress(target, plan, local, transferred, policy, item.metrics)
             if partial.stat().st_size != total:
-                raise OSError("Download size verification failed")
+                raise ProfileError("Final size mismatch")
+            final_source = sftp.stat(remote)
+            if (int(final_source.st_size), getattr(final_source, "st_mtime", None)) != source_snapshot:
+                item.diagnostics.append("Source still changing")
+                raise ProfileError("Source file is still being modified")
+            if bool(getattr(self, "_verify_completed", False)):
+                verifier = SFTPTransferRouter(self._transfer_manager, verify_completed=True)
+                remote_digest = verifier._digest_remote(sftp, remote)
+                if remote_digest is not None and remote_digest != verifier._digest_local(partial):
+                    raise ProfileError("Checksum mismatch")
             item.status = TransferState.VERIFYING
             os.replace(partial, local)
             self._partial_local_metadata_path(local).unlink(missing_ok=True)
@@ -2914,13 +2928,24 @@ class SFTPPanel(tk.Frame):
                 partial.unlink(missing_ok=True)
                 self._partial_local_metadata_path(local).unlink(missing_ok=True)
             raise
-        except Exception:
+        except Exception as exc:
             # The file context has closed (and therefore flushed) before this
             # handler runs. Preserve that durable offset for a safe retry.
             try:
                 self._persist_closed_download_progress(plan, local, partial, item.metrics)
             except OSError:
                 pass
+            failure = SFTPTransferRouter._channel_failure(exc)
+            reconnects = sum(
+                diagnostic in {"SFTP channel timeout", "Connection interrupted"}
+                for diagnostic in item.diagnostics
+            )
+            if failure is not None:
+                item.diagnostics.append(failure)
+                if reconnects < 3:
+                    replacement = worker.reconnect_client()
+                    return self._scheduled_download(item, replacement, worker, remote, local, replace)
+                raise ProfileError(failure) from exc
             raise
 
     def _collision_choice(self, direction: str, name: str) -> str:
@@ -4452,14 +4477,17 @@ class ConnectionTab(tk.Frame):
         *,
         session_controller=None,
         session_id: str | None = None,
+        native_terminal_backend=None,
         **kw,
     ):
         super().__init__(parent, bg=BG, **kw)
         self._entry = entry
         self._session_controller = session_controller
         self.session_id = session_id
-        self._vte_availability = detect_vte_backend()
-        self._native_terminal_backend = VTETerminalBackend(self._vte_availability)
+        self._owns_native_terminal_backend = native_terminal_backend is None
+        self._native_terminal_backend = native_terminal_backend or VTETerminalBackend(detect_vte_backend())
+        self._vte_availability = self._native_terminal_backend.availability
+        self._native_terminal_ids: set[str] = set()
         # Capability detection is cheap and display-free.  The persistent GTK
         # helper starts only for the first explicit native terminal request.
         self._native_vte_ready = False
@@ -4827,26 +4855,6 @@ class ConnectionTab(tk.Frame):
                     int(session_snapshot.get("port", 22)),
                     generation,
                 )
-            if secure_profile["auth_method"] == "agent":
-                # no explicit credential — collect all default keys from ~/.ssh/
-                # and also check ~/.ssh/config for this host's IdentityFile
-                key_files = []
-                ssh_cfg = paramiko.SSHConfig()
-                cfg_path = Path.home() / ".ssh" / "config"
-                if cfg_path.exists():
-                    with open(cfg_path) as f:
-                        ssh_cfg.parse(f)
-                cfg_info = ssh_cfg.lookup(session_snapshot.get("name", session_snapshot["host"]))
-                for raw in cfg_info.get("identityfile", []):
-                    p = Path(str(raw).replace("%d", str(Path.home()))).expanduser()
-                    if p.exists():
-                        key_files.append(str(p))
-                for name in ("id_ed25519", "id_ecdsa", "id_rsa", "id_dsa"):
-                    p = Path.home() / ".ssh" / name
-                    if p.exists() and str(p) not in key_files:
-                        key_files.append(str(p))
-                if key_files:
-                    extra["key_filename"] = key_files
             manager = SSHConnectionManager(
                 KnownHostsStore(KNOWN_HOSTS_FILE), secure_profile["host"], secure_profile["port"]
             )
@@ -4855,6 +4863,7 @@ class ConnectionTab(tk.Frame):
                 self._trust_broker.request,
                 self._entry.get("password") or None,
                 extra,
+                self._report_agent_authentication,
             )
             if generation != self._session_generation:
                 client.close()
@@ -4900,6 +4909,15 @@ class ConnectionTab(tk.Frame):
                 self._proxy_context.close()
                 self._proxy_context = None
             dispatch(lambda err=e: self._on_error(err))
+
+    def _report_agent_authentication(self, event: AgentAuthenticationDiagnostic) -> None:
+        """Publish only the username and public fingerprint for an agent offer."""
+        message = event.sanitized_message()
+        log(message)
+        try:
+            self.after(0, lambda: self._terminal.write(f"[auth] {message}\n", "info"))
+        except (RuntimeError, tk.TclError):
+            pass
 
     def _make_proxy_sock(self, proxy_alias: str, target_host: str, target_port: int, generation=None):
         self.after(0, lambda: self._terminal.write(f"[proxy] connecting via jump host '{proxy_alias}'…\n", "info"))
@@ -4954,7 +4972,12 @@ class ConnectionTab(tk.Frame):
         }
         manager = SSHConnectionManager(KnownHostsStore(KNOWN_HOSTS_FILE), proxy_host, proxy_port)
         try:
-            proxy_client = manager.connect(proxy_profile, self._trust_broker.request, proxy_pass)
+            proxy_client = manager.connect(
+                proxy_profile,
+                self._trust_broker.request,
+                proxy_pass,
+                diagnose_agent_key=self._report_agent_authentication,
+            )
         except paramiko.BadHostKeyException as exc:
             self._trust_broker.warn_changed_key(manager.changed_request(proxy_profile, exc))
             raise ChangedHostKeyRejected("The jump-host server identity changed.") from exc
@@ -5226,6 +5249,11 @@ class ConnectionTab(tk.Frame):
                 return record.profile_snapshot
         return self._entry
 
+    def _owned_session_profile_snapshot(self) -> dict:
+        snapshot = dict(self._session_profile_snapshot())
+        snapshot["_session_id"] = self.session_id or ""
+        return snapshot
+
     def _start_x11_forwarding(self) -> None:
         """Capture X11 policy once, after authentication, for this session."""
         if not self.session_id:
@@ -5274,7 +5302,7 @@ class ConnectionTab(tk.Frame):
         threading.Thread(target=worker, daemon=True, name="sshvault-startup-command").start()
 
     def _attach_shell(self, terminal: TerminalWidget):
-        snapshot = self._session_profile_snapshot()
+        snapshot = self._owned_session_profile_snapshot()
         if self._vte_availability.available and self._native_terminal_backend.open_terminal_tab(snapshot):
             if (
                 self._session_controller is not None
@@ -5284,6 +5312,8 @@ class ConnectionTab(tk.Frame):
                 self._session_controller.register_terminal(
                     self.session_id, self._native_terminal_backend.last_terminal_id
                 )
+            if self._native_terminal_backend.last_terminal_id:
+                self._native_terminal_ids.add(self._native_terminal_backend.last_terminal_id)
             self._native_vte_ready = True
             self._terminal_backend_status.set(self._native_terminal_backend.status)
             terminal.write("[Native VTE terminal opened in its own window]\n", "info")
@@ -5331,7 +5361,7 @@ class ConnectionTab(tk.Frame):
                 messagebox.showinfo(
                     "Native VTE terminal", "OpenSSH will request the password interactively in the terminal."
                 )
-            if self._native_terminal_backend.open_terminal_tab(self._session_profile_snapshot()):
+            if self._native_terminal_backend.open_terminal_tab(self._owned_session_profile_snapshot()):
                 if (
                     self._session_controller is not None
                     and self.session_id
@@ -5340,6 +5370,8 @@ class ConnectionTab(tk.Frame):
                     self._session_controller.register_terminal(
                         self.session_id, self._native_terminal_backend.last_terminal_id
                     )
+                if self._native_terminal_backend.last_terminal_id:
+                    self._native_terminal_ids.add(self._native_terminal_backend.last_terminal_id)
                 self._native_vte_ready = True
                 self._terminal_backend_status.set(self._native_terminal_backend.status)
                 return
@@ -5421,7 +5453,13 @@ class ConnectionTab(tk.Frame):
         self._cleanup_connection_panels()
         for terminal in list(self._terminals):
             terminal.detach()
-        self._native_terminal_backend.close()
+        for terminal_id in list(self._native_terminal_ids):
+            self._native_terminal_backend.close_terminal(terminal_id)
+            if self._session_controller is not None and self.session_id:
+                self._session_controller.unregister_terminal(self.session_id, terminal_id)
+        self._native_terminal_ids.clear()
+        if self._owns_native_terminal_backend:
+            self._native_terminal_backend.close()
         self._agent_forwarding_handlers.clear()
         # A proxied destination belongs to its context; that context closes
         # destination, channel, and jump client exactly once in order.
@@ -5510,7 +5548,21 @@ class ConnectionTab(tk.Frame):
                     self._apply_workspace_state()
                 return
             self._sftp_opening = False
-            self._sftp_panel = SFTPPanel(self._nb, sftp, self._entry.get("default_download_directory"))
+            sftp_options = self._entry.get("sftp_options", {})
+            verify_completed = bool(
+                sftp_options.get(
+                    "verify_completed_transfers",
+                    sftp_options.get("verify_transfers", self._entry.get("verify_transfers", True)),
+                )
+            )
+            self._sftp_panel = SFTPPanel(
+                self._nb,
+                sftp,
+                self._entry.get("default_download_directory"),
+                verify_completed=verify_completed,
+                session_id=self.session_id,
+                owner_profile=self._session_profile_snapshot(),
+            )
             self._nb.add(self._sftp_panel, text="SFTP")
             self._nb.select(self._sftp_panel)
             self._ftp_bridge_panel = FTPBridgePanel(self._nb, sftp)
@@ -6144,6 +6196,7 @@ class DiagnosticsDialog(tk.Toplevel):
         bar.pack(fill="x", padx=8, pady=(0, 8))
         ttk.Button(bar, text="Refresh", command=self.refresh).pack(side="left", padx=3)
         ttk.Button(bar, text="Run Network Check", command=self.network_check).pack(side="left", padx=3)
+        ttk.Button(bar, text="Agent Diagnostics", command=self.agent_diagnostics).pack(side="left", padx=3)
         ttk.Button(bar, text="Copy Diagnostics", command=self.copy).pack(side="left", padx=3)
         ttk.Button(bar, text="Save Diagnostics", command=self.save).pack(side="left", padx=3)
         self.refresh()
@@ -6178,6 +6231,17 @@ class DiagnosticsDialog(tk.Toplevel):
                 pass
 
         threading.Thread(target=worker, daemon=True, name="sshvault-network-check").start()
+
+    def agent_diagnostics(self):
+        details = agent_environment_diagnostics()
+        lines = [
+            f"SSH_AUTH_SOCK: {details['ssh_auth_sock'] or 'Unavailable'}",
+            f"Visible agent keys: {details['key_count']}",
+        ]
+        lines.extend(f"{item['type']} {item['fingerprint']}" for item in details["keys"])
+        if details["warning"]:
+            lines.append(f"Warning: {details['warning']}")
+        messagebox.showinfo("SSH Agent Diagnostics", "\n".join(lines), parent=self)
 
     def _network_done(self, result):
         records = [r for r in self._diagnostics.records if r.field not in {"DNS result", "TCP connection timing"}]
@@ -6527,8 +6591,8 @@ class SSHVaultApp(tk.Tk):
         self._runtime_settings = self._load_settings()
         self._apply_appearance(self._runtime_settings)
         self._vault = Vault()
-        # This helper is deliberately application-scoped: one process can own
-        # many VTE windows/tabs, none of which is tied to a Paramiko session.
+        # Application scope is capability detection only. Connected sessions
+        # each construct and own their own backend/helper below.
         self._native_terminal_backend = VTETerminalBackend(detect_vte_backend())
         self._session_controller = SessionController()
         self.selected_profile_id: str | None = None
@@ -6545,6 +6609,7 @@ class SSHVaultApp(tk.Tk):
         self._sftp_transfer_schedulers = {}
         self._sftp_transfer_status_callbacks = {}
         self._sftp_transfer_queue_callbacks = {}
+        self._sftp_change_queue: queue.SimpleQueue[str] = queue.SimpleQueue()
         self._local_forwarding_services = {}
         self._remote_forwarding_services = {}
         self._dynamic_forwarding_services = {}
@@ -6555,6 +6620,7 @@ class SSHVaultApp(tk.Tk):
         self._build_ui()
         self._build_statusbar()
         self._restore_session()
+        self.after(100, self._poll_sftp_transfer_changes)
         self.after_idle(self._apply_configured_startup)
 
     def _load_settings(self):
@@ -6632,11 +6698,11 @@ class SSHVaultApp(tk.Tk):
 
     def _open_transfer_manager(self):
         """Open the selected session's manager without disturbing workspace focus."""
-        for tab in self._conn_tabs.values():
-            panel = getattr(tab, "_sftp_panel", None)
-            if panel is not None:
-                panel._show_transfer_manager()
-                return "break"
+        record = self._selected_session_record()
+        tab = self._conn_tabs.get(record.session_id) if record else None
+        panel = getattr(tab, "_sftp_panel", None)
+        if panel is not None:
+            panel._show_transfer_manager()
         return "break"
 
     def _show_about(self):
@@ -7329,7 +7395,7 @@ class SSHVaultApp(tk.Tk):
             "resume_partial": tk.BooleanVar(value=True),
             "preserve_timestamps": tk.BooleanVar(value=True),
             "concurrent_transfers": tk.StringVar(value="3"),
-            "verify_transfers": tk.BooleanVar(value=False),
+            "verify_transfers": tk.BooleanVar(value=True),
             "follow_symlinks": tk.BooleanVar(value=False),
         }
         groups = []
@@ -7436,7 +7502,7 @@ class SSHVaultApp(tk.Tk):
                 "resume_partial": True,
                 "preserve_timestamps": True,
                 "concurrent_transfers": self._runtime_settings.get("maximum_sftp_transfers", 3),
-                "verify_transfers": False,
+                "verify_transfers": True,
                 "follow_symlinks": False,
             }
             for key, default in defaults.items():
@@ -7917,7 +7983,11 @@ class SSHVaultApp(tk.Tk):
             widget.configure(state="normal" if proxy_enabled else "disabled")
 
     def _login_field_changed(self, field):
-        if not hasattr(self, "_login_vars") or self.working_profile is None:
+        if (
+            not hasattr(self, "_login_vars")
+            or self.working_profile is None
+            or getattr(self, "_login_refreshing", False)
+        ):
             return
         mapping = {"user": "user", "host": "host", "port": "port", "key_path": "key_path"}
         if field in mapping:
@@ -7931,20 +8001,24 @@ class SSHVaultApp(tk.Tk):
     def _refresh_login_tab(self):
         if not hasattr(self, "_login_vars") or self.working_profile is None:
             return
-        for key in ("host", "port", "user", "key_path"):
-            self._login_vars[key].set(str(self.working_profile.get(key, "")))
-        self._login_vars["auth_method"].set(
-            {"agent": "SSH Agent", "key": "Private Key", "password": "Password"}.get(
-                self.working_profile.get("auth_method"), "Automatic"
+        self._login_refreshing = True
+        try:
+            for key in ("host", "port", "user", "key_path"):
+                self._login_vars[key].set(str(self.working_profile.get(key, "")))
+            self._login_vars["auth_method"].set(
+                {"agent": "SSH Agent", "key": "Private Key", "password": "Password"}.get(
+                    self.working_profile.get("auth_method"), "Automatic"
+                )
             )
-        )
-        self._login_vars["proxy_type"].set("SSH ProxyJump" if self.working_profile.get("proxy_jump") else "None")
-        proxy = str(self.working_profile.get("proxy_jump", ""))
-        user, _, host = proxy.partition("@")
-        self._login_vars["proxy_host"].set(host if host else proxy)
-        self._login_vars["proxy_user"].set(user if host else "")
-        self._login_vars["proxy_port"].set("22" if proxy else "")
-        self._sync_login_visibility()
+            self._login_vars["proxy_type"].set("SSH ProxyJump" if self.working_profile.get("proxy_jump") else "None")
+            proxy = str(self.working_profile.get("proxy_jump", ""))
+            user, _, host = proxy.partition("@")
+            self._login_vars["proxy_host"].set(host if host else proxy)
+            self._login_vars["proxy_user"].set(user if host else "")
+            self._login_vars["proxy_port"].set("22" if proxy else "")
+            self._sync_login_visibility()
+        finally:
+            self._login_refreshing = False
 
     @staticmethod
     def _profile_dropdown_items(entries) -> list[tuple[str, str]]:
@@ -8093,6 +8167,20 @@ class SSHVaultApp(tk.Tk):
         session_id = getattr(self, "_selected_session_id", None)
         return self._session_controller.get(session_id) if session_id else None
 
+    def _select_session_for_profile(self, profile_id: str) -> None:
+        """Focus a profile's own session without disturbing other sessions."""
+        records = self._session_controller.for_profile(profile_id)
+        inactive_states = {
+            SessionLifecycleState.DISCONNECTED,
+            SessionLifecycleState.FAILED,
+            SessionLifecycleState.CANCELLED,
+        }
+        active_records = [record for record in records if record.state not in inactive_states]
+        selected = (active_records or records)[-1] if records else None
+        self._selected_session_id = selected.session_id if selected is not None else None
+        self._refresh_controller_log()
+        self._refresh_sessions()
+
     def resolve_unsaved_profile_changes(self, pending_action) -> bool:
         if not self.profile_dirty:
             return bool(pending_action())
@@ -8137,6 +8225,10 @@ class SSHVaultApp(tk.Tk):
         record = self._selected_session_record()
         if record and record.profile_snapshot.get("connection_options", {}).get("close_sftp_windows", False):
             self._close_sftp_views_for_session(record.session_id)
+        if record:
+            stop_sftp_resources = getattr(self, "_stop_sftp_resources_for_session", None)
+            if callable(stop_sftp_resources):
+                stop_sftp_resources(record.session_id)
         tab = self._conn_tabs.get(record.session_id) if record else None
         if tab:
             # Logout leaves the controller workspace reusable.  Full shutdown
@@ -8150,6 +8242,14 @@ class SSHVaultApp(tk.Tk):
             self._stop_x11_forwarding_for_session(record.session_id)
             self._session_controller.disconnect(record.session_id, "User requested log out.")
         self._refresh_action_states()
+
+    def _stop_sftp_resources_for_session(self, session_id: str) -> None:
+        """Stop only the browser channels and transfer workers owned by one session."""
+        scheduler = self._sftp_transfer_schedulers.pop(session_id, None)
+        if scheduler is not None:
+            scheduler.invalidate_session(fail_active=True)
+            scheduler.shutdown()
+        self._sftp_browser_clients.close_session(session_id)
 
     def _stop_local_forwarding_for_session(self, session_id: str) -> None:
         service = self._local_forwarding_services.pop(session_id, None)
@@ -8204,7 +8304,6 @@ class SSHVaultApp(tk.Tk):
             if record is None or view_id not in record.sftp_view_ids:
                 continue
             self._session_controller.unregister_sftp_view(session_id, view_id)
-            self._sftp_browser_clients.close_view(session_id, view_id)
             self._sftp_views.pop(view_id, None)
             self._sftp_view_state_callbacks.pop(view_id, None)
             self._sftp_transfer_status_callbacks.pop(view_id, None)
@@ -8213,6 +8312,12 @@ class SSHVaultApp(tk.Tk):
                 window.destroy()
             except tk.TclError:
                 pass
+            threading.Thread(
+                target=self._sftp_browser_clients.close_view,
+                args=(session_id, view_id),
+                daemon=True,
+                name="sshvault-sftp-view-close",
+            ).start()
         self._refresh_sessions()
 
     def _reconnect_selected_session(self):
@@ -8233,27 +8338,47 @@ class SSHVaultApp(tk.Tk):
             self._open_sftp_placeholder(record)
 
     def _sftp_transfer_router(self, record) -> SFTPTransferRouter:
+        options = record.profile_snapshot.get("sftp_options", {})
+        verify_completed = bool(options.get("verify_completed_transfers", options.get("verify_transfers", True)))
         scheduler = self._sftp_transfer_schedulers.get(record.session_id)
         if scheduler is None:
             tab = self._conn_tabs.get(record.session_id)
             client = getattr(tab, "_client", None)
             if client is None or record.state is not SessionLifecycleState.CONNECTED:
                 raise ProfileError("SFTP transfers are unavailable.")
-            options = record.profile_snapshot.get("sftp_options", {})
             concurrency = int(options.get("concurrent_transfers", 3))
             scheduler = TransferScheduler(
                 lambda connection=client: connection.open_sftp(),
                 concurrency=concurrency,
                 on_change=lambda session_id=record.session_id: self._sftp_transfer_changed(session_id),
+                reuse_worker_channels=True,
+                session_id=record.session_id,
+                profile_id=str(record.profile_snapshot.get("id", "")) or None,
+                operation_timeout=float(options.get("operation_timeout", 30.0)),
             )
             self._sftp_transfer_schedulers[record.session_id] = scheduler
-        return SFTPTransferRouter(scheduler)
+        return SFTPTransferRouter(
+            scheduler,
+            verify_completed=verify_completed,
+            follow_symlinks=bool(options.get("follow_symlinks", False)),
+        )
 
     def _sftp_transfer_changed(self, session_id: str) -> None:
-        def update() -> None:
+        changes = getattr(self, "_sftp_change_queue", None)
+        if changes is not None:
+            changes.put(session_id)
+
+    def _poll_sftp_transfer_changes(self) -> None:
+        changed: set[str] = set()
+        while True:
+            try:
+                changed.add(self._sftp_change_queue.get_nowait())
+            except queue.Empty:
+                break
+        for session_id in changed:
             scheduler = self._sftp_transfer_schedulers.get(session_id)
             if scheduler is None:
-                return
+                continue
             summary = scheduler.summary()
             if summary["failed"]:
                 message = "Transfer failed."
@@ -8269,9 +8394,8 @@ class SSHVaultApp(tk.Tk):
             for view_session_id, callback in list(self._sftp_transfer_queue_callbacks.values()):
                 if view_session_id == session_id:
                     callback()
-
         try:
-            self.after(0, update)
+            self.after(100, self._poll_sftp_transfer_changes)
         except (RuntimeError, tk.TclError):
             return
 
@@ -8282,7 +8406,7 @@ class SSHVaultApp(tk.Tk):
         snapshot = json.loads(json.dumps(record.profile_snapshot))
         view_id = str(uuid4())
         window = tk.Toplevel(self)
-        window.title(f"SFTP — {snapshot.get('user', '')}@{snapshot.get('host', '')}")
+        window.title(session_resource_title("SFTP", snapshot))
         window.geometry("900x540")
         body = ttk.Frame(window, padding=8)
         body.pack(fill="both", expand=True)
@@ -8295,6 +8419,7 @@ class SSHVaultApp(tk.Tk):
         initial = initial_local_browser_path(str(options.get("initial_local_directory", Path.home())))
         state = SFTPViewNavigationState(local_current_path=initial)
         local_entries = []
+        local_cache = SFTPListingCache()
         path_var, status_var = tk.StringVar(value=state.local_current_path), tk.StringVar()
         columns = ("name", "size", "modified", "type", "permissions")
         tree = ttk.Treeview(local, columns=columns, show="headings", selectmode="extended")
@@ -8302,43 +8427,75 @@ class SSHVaultApp(tk.Tk):
             tree.heading(column, text=label)
             tree.column(column, width=90, stretch=column == "name")
 
-        def load(path=None):
+        def load(path=None, *, force: bool = False):
             target = normalize_local_path(path or state.local_current_path)
+            if state.local_loading and not force:
+                return
+            generation = state.next_generation(False)
             state.local_loading = True
             update_mutation_actions()
-            try:
-                entries = list_local_browser_entries(target, bool(options.get("show_hidden", False)))
-            except Exception:
-                state.local_loading = False
-                status_var.set("Local directory not found")
-                update_mutation_actions()
-                return
-            entries = sort_browser_entries(entries, state.local_sort_column, state.local_sort_descending)
-            local_entries[:] = entries
-            if target != state.local_current_path:
-                state.navigate_new(target, False)
-            path_var.set(state.local_current_path)
-            tree.delete(*tree.get_children())
-            for entry in entries:
-                tree.insert(
-                    "",
-                    "end",
-                    values=(
-                        entry.name,
-                        entry.size if entry.size is not None else "—",
-                        entry.modified_time or "—",
-                        entry.type_label,
-                        entry.permissions,
-                    ),
-                    tags=(entry.full_path, "dir" if entry.is_directory else "file"),
-                )
-            status_var.set(f"{len(entries)} items")
-            state.local_loading = False
-            update_mutation_actions()
+            cache_key = f"{target}|{bool(options.get('show_hidden', False))}"
+
+            def worker() -> None:
+                try:
+                    cached = None if force else local_cache.get(cache_key)
+                    entries = (
+                        cached
+                        if cached is not None
+                        else list_local_browser_entries(target, bool(options.get("show_hidden", False)))
+                    )
+                    error = None
+                except ProfileError as exc:
+                    entries = []
+                    error = str(exc)
+                except Exception:
+                    entries = []
+                    error = "Local directory not found"
+
+                def apply_result() -> None:
+                    if view_id not in self._sftp_views or not state.generation_current(generation, False):
+                        return
+                    state.local_loading = False
+                    if error is not None:
+                        state.last_local_error = error
+                        status_var.set(error)
+                        update_mutation_actions()
+                        return
+                    state.last_local_error = None
+                    local_cache.put(cache_key, entries)
+                    sorted_entries = sort_browser_entries(entries, state.local_sort_column, state.local_sort_descending)
+                    local_entries[:] = sorted_entries
+                    if target != state.local_current_path:
+                        state.navigate_new(target, False)
+                    path_var.set(state.local_current_path)
+                    tree.delete(*tree.get_children())
+                    for batch in batch_browser_entries(sorted_entries):
+                        for entry in batch:
+                            tree.insert(
+                                "",
+                                "end",
+                                values=(
+                                    entry.name,
+                                    entry.size if entry.size is not None else "—",
+                                    entry.modified_time or "—",
+                                    entry.type_label,
+                                    entry.permissions,
+                                ),
+                                tags=(entry.full_path, "dir" if entry.is_directory else "file"),
+                            )
+                    status_var.set(f"{len(sorted_entries)} items")
+                    update_mutation_actions()
+
+                try:
+                    self.after(0, apply_result)
+                except (RuntimeError, tk.TclError):
+                    return
+
+            threading.Thread(target=worker, daemon=True, name=f"sshvault-sftp-local-{view_id[:8]}").start()
 
         def sort(column):
             update_browser_sort(state, column)
-            load()
+            load(force=True)
 
         for column in columns:
             tree.heading(column, command=lambda name=column: sort(name))
@@ -8353,7 +8510,7 @@ class SSHVaultApp(tk.Tk):
             ("Forward", lambda: state.navigate_forward(False) and load()),
             ("Up", lambda: state.navigate_up(False) and load()),
             ("Home", lambda: state.navigate_home(str(Path.home()), False) and load()),
-            ("Refresh", load),
+            ("Refresh", lambda: load(force=True)),
             ("New Folder", None),
             ("Rename", None),
             ("Delete", None),
@@ -8366,7 +8523,43 @@ class SSHVaultApp(tk.Tk):
             local_buttons[label] = button
         entry = ttk.Entry(local, textvariable=path_var)
         entry.pack(fill="x", pady=3)
-        entry.bind("<Return>", lambda _e: load(path_var.get()))
+
+        def bind_path_shortcuts(widget, navigate):
+            """Keep path editing predictable across keyboard layouts."""
+
+            def shortcut(event):
+                key = path_entry_shortcut_action(str(event.keysym))
+                if key is None:
+                    return
+                try:
+                    if key == "a":
+                        widget.selection_range(0, "end")
+                    elif key == "c":
+                        if widget.selection_present():
+                            widget.clipboard_clear()
+                            widget.clipboard_append(widget.selection_get())
+                    elif key == "x":
+                        if widget.selection_present():
+                            widget.clipboard_clear()
+                            widget.clipboard_append(widget.selection_get())
+                            widget.delete("sel.first", "sel.last")
+                    elif key == "v":
+                        value = widget.clipboard_get()
+                        if widget.selection_present():
+                            widget.delete("sel.first", "sel.last")
+                        widget.insert("insert", value)
+                    else:
+                        return
+                except tk.TclError:
+                    return "break"
+                return "break"
+
+            # A generic Control binding keeps Ctrl+Shift shortcuts working
+            # when Caps Lock changes the key symbol's case.
+            widget.bind("<Control-KeyPress>", shortcut, add="+")
+            widget.bind("<Return>", navigate, add="+")
+
+        bind_path_shortcuts(entry, lambda _event: load(path_var.get()))
 
         def open_selected(_event=None):
             selection = tree.selection()
@@ -8378,6 +8571,44 @@ class SSHVaultApp(tk.Tk):
 
         tree.bind("<Double-Button-1>", open_selected)
         tree.bind("<Return>", open_selected)
+
+        def bind_list_navigation(widget):
+            def move(event):
+                item_ids = list(widget.get_children())
+                if not item_ids:
+                    return "break"
+                focused = widget.focus()
+                current = item_ids.index(focused) if focused in item_ids else 0
+                try:
+                    page = max(1, int(widget.cget("height")))
+                except (TypeError, ValueError, tk.TclError):
+                    page = 10
+                target = browser_keyboard_index(current, len(item_ids), str(event.keysym), page)
+                if target is None:
+                    return "break"
+                target_id = item_ids[target]
+                # Treeview's native mouse handling remains responsible for
+                # Ctrl/Shift ranges; keyboard movement preserves those modes.
+                if event.state & 0x0001:  # Shift
+                    anchor = getattr(widget, "_sshvault_anchor", current)
+                    lo, hi = sorted((anchor, target))
+                    widget.selection_set(item_ids[lo : hi + 1])
+                elif event.state & 0x0004:  # Control
+                    if target_id in widget.selection():
+                        widget.selection_remove(target_id)
+                    else:
+                        widget.selection_add(target_id)
+                else:
+                    widget.selection_set(target_id)
+                widget._sshvault_anchor = target
+                widget.focus(target_id)
+                widget.see(target_id)
+                return "break"
+
+            for key in ("Up", "Down", "Prior", "Next", "Home", "End"):
+                widget.bind(f"<{key}>", move, add="+")
+
+        bind_list_navigation(tree)
         tree.pack(fill="both", expand=True)
         ttk.Label(local, textvariable=status_var).pack(anchor="w")
         remote_path_var = tk.StringVar(value=str(options.get("initial_remote_directory", "")))
@@ -8462,6 +8693,14 @@ class SSHVaultApp(tk.Tk):
         body.rowconfigure(0, weight=1)
         tab = self._conn_tabs.get(record.session_id)
         client = getattr(tab, "_client", None)
+        # Let the shell paint before the channel handshake begins; directory
+        # reads themselves are dispatched asynchronously below.
+        remote_status_var.set("Connecting…")
+        try:
+            window.update_idletasks()
+        except tk.TclError:
+            window.destroy()
+            return None
         try:
             browser_client = SFTPBrowserClient(client.open_sftp()) if client is not None else None
         except Exception:
@@ -8536,6 +8775,8 @@ class SSHVaultApp(tk.Tk):
         queue_tree.bind("<<TreeviewSelect>>", update_queue_actions)
         self._sftp_transfer_queue_callbacks[view_id] = (record.session_id, refresh_transfer_queue)
 
+        remote_cache = SFTPListingCache()
+
         def selected_paths(widget) -> list[str]:
             paths = []
             for item_id in widget.selection():
@@ -8554,6 +8795,12 @@ class SSHVaultApp(tk.Tk):
             return selected_browser_entries(local_entries, selected_paths(tree))
 
         def selected_remote_items():
+            return selected_browser_entries(remote_entries, selected_paths(remote_tree))
+
+        def selected_local_transfer_items():
+            return selected_browser_entries(local_entries, selected_paths(tree))
+
+        def selected_remote_transfer_items():
             return selected_browser_entries(remote_entries, selected_paths(remote_tree))
 
         def update_mutation_actions(_event=None) -> None:
@@ -8593,31 +8840,47 @@ class SSHVaultApp(tk.Tk):
 
         def update_transfer_actions(_event=None) -> None:
             current = self._session_controller.get(record.session_id)
+            state_inputs = {
+                "local_selected": bool(selected_local_transfer_items()),
+                "remote_selected": bool(selected_remote_transfer_items()),
+                "connected": bool(current and current.state is SessionLifecycleState.CONNECTED),
+                "client_available": state.remote_available and browser_client.is_alive(),
+            }
             enabled = SFTPTransferRouter.action_states(
-                local_selected=bool(selected_local_files()),
-                remote_selected=bool(selected_remote_files()),
-                connected=bool(current and current.state is SessionLifecycleState.CONNECTED),
-                client_available=state.remote_available and browser_client.is_alive(),
+                **state_inputs,
             )
             upload_button.configure(state="normal" if enabled["upload"] else "disabled")
             download_button.configure(state="normal" if enabled["download"] else "disabled")
+            reasons = SFTPTransferRouter.disabled_reasons(**state_inputs)
+            previous = getattr(window, "_sshvault_transfer_disabled_reasons", {})
+            if reasons != previous:
+                profile_id = str(record.profile_snapshot.get("id", "unknown"))[:12]
+                for action, reason in reasons.items():
+                    if reason and previous.get(action) != reason:
+                        log(
+                            f"SFTP {action} disabled session={record.session_id[:12]} "
+                            f"profile={profile_id} reason={reason}"
+                        )
+                window._sshvault_transfer_disabled_reasons = reasons
 
         def queue_uploads() -> None:
             try:
                 queued = self._sftp_transfer_router(record).queue_uploads(
-                    [entry.full_path for entry in selected_local_files()],
+                    [entry.full_path for entry in selected_local_transfer_items()],
                     state.remote_current_path,
                 )
-            except Exception:
-                transfer_status_var.set("Upload could not be queued.")
+            except Exception as exc:
+                log(f"SFTP upload queue failure session={record.session_id[:12]} type={type(exc).__name__}")
+                transfer_status_var.set("Transfer could not be queued")
                 return
             transfer_status_var.set(f"Queued {len(queued)} upload(s).")
 
         def queue_downloads() -> None:
             try:
                 queued = self._sftp_transfer_router(record).queue_downloads(
-                    selected_remote_files(),
+                    selected_remote_transfer_items(),
                     state.local_current_path,
+                    browser_client=browser_client,
                 )
             except Exception:
                 transfer_status_var.set("Download could not be queued.")
@@ -8705,7 +8968,8 @@ class SSHVaultApp(tk.Tk):
             except (OSError, ProfileError):
                 status_var.set("Could not create local folder.")
                 return
-            load()
+            local_cache.clear()
+            load(force=True)
 
         def local_rename() -> None:
             selected = selected_local_items()
@@ -8719,7 +8983,8 @@ class SSHVaultApp(tk.Tk):
             except (OSError, ProfileError):
                 status_var.set("Could not rename local item.")
                 return
-            load()
+            local_cache.clear()
+            load(force=True)
 
         def show_properties(item) -> None:
             dialog = tk.Toplevel(window)
@@ -8765,7 +9030,8 @@ class SSHVaultApp(tk.Tk):
             except (OSError, ProfileError):
                 status_var.set("Could not delete selected local item(s).")
                 return
-            load()
+            local_cache.clear()
+            load(force=True)
 
         def local_properties() -> None:
             selected = selected_local_items()
@@ -8790,20 +9056,21 @@ class SSHVaultApp(tk.Tk):
                 state.remote_sort_descending,
             )
             remote_tree.delete(*remote_tree.get_children())
-            for item in sorted_entries:
-                remote_tree.insert(
-                    "",
-                    "end",
-                    values=(
-                        item.name,
-                        item.size if item.size is not None else "—",
-                        item.modified_time or "—",
-                        item.type_label,
-                        item.permissions,
-                        item.owner,
-                    ),
-                    tags=(item.full_path, "dir" if item.is_directory else "file"),
-                )
+            for batch in batch_browser_entries(sorted_entries):
+                for item in batch:
+                    remote_tree.insert(
+                        "",
+                        "end",
+                        values=(
+                            item.name,
+                            item.size if item.size is not None else "—",
+                            item.modified_time or "—",
+                            item.type_label,
+                            item.permissions,
+                            item.owner,
+                        ),
+                        tags=(item.full_path, "dir" if item.is_directory else "file"),
+                    )
             remote_status_var.set(f"{len(sorted_entries)} items")
             update_transfer_actions()
             update_mutation_actions()
@@ -8830,11 +9097,16 @@ class SSHVaultApp(tk.Tk):
                         raise ProfileError("SFTP channel unavailable")
                     home = browser_client.home_directory()
                     target = normalize_remote_path(requested, home)
-                    entries = list_remote_browser_entries(
-                        browser_client,
-                        target,
-                        bool(options.get("show_hidden", False)),
-                    )
+                    cache_key = f"{target}|{bool(options.get('show_hidden', False))}"
+                    cached = None if history_action == "refresh" else remote_cache.get(cache_key)
+                    if cached is not None:
+                        entries = cached
+                    else:
+                        entries = list_remote_browser_entries(
+                            browser_client,
+                            target,
+                            bool(options.get("show_hidden", False)),
+                        )
                     error = None
                 except ProfileError as exc:
                     target = state.remote_current_path
@@ -8871,6 +9143,7 @@ class SSHVaultApp(tk.Tk):
                     elif history_action == "initial":
                         state.remote_current_path = target
                     remote_entries[:] = entries
+                    remote_cache.put(cache_key, entries)
                     remote_path_var.set(state.remote_current_path)
                     render_remote()
 
@@ -8916,6 +9189,7 @@ class SSHVaultApp(tk.Tk):
                         remote_entry.configure(state="normal")
                         update_mutation_actions()
                         return
+                    remote_cache.clear()
                     for label in ("Back", "Forward", "Up", "Home", "Refresh"):
                         remote_buttons[label].configure(state="normal")
                     remote_entry.configure(state="normal")
@@ -9048,9 +9322,11 @@ class SSHVaultApp(tk.Tk):
         remote_buttons["Copy Path"].configure(command=remote_copy_path)
         for column in remote_columns:
             remote_tree.heading(column, command=lambda name=column: sort_remote(name))
-        remote_entry.bind("<Return>", lambda _event: load_remote(remote_path_var.get()))
+        bind_path_shortcuts(remote_entry, lambda _event: load_remote(remote_path_var.get()))
         remote_tree.bind("<Double-Button-1>", open_remote_selected)
         remote_tree.bind("<Return>", open_remote_selected)
+        bind_list_navigation(remote_tree)
+        bind_list_navigation(queue_tree)
 
         def sync_remote_session(session_state: SessionLifecycleState) -> None:
             connected = session_state is SessionLifecycleState.CONNECTED and browser_client.is_alive()
@@ -9080,13 +9356,18 @@ class SSHVaultApp(tk.Tk):
         def close() -> None:
             state.next_generation(True)
             self._session_controller.unregister_sftp_view(record.session_id, view_id)
-            self._sftp_browser_clients.close_view(record.session_id, view_id)
             self._sftp_views.pop(view_id, None)
             self._sftp_view_state_callbacks.pop(view_id, None)
             self._sftp_transfer_status_callbacks.pop(view_id, None)
             self._sftp_transfer_queue_callbacks.pop(view_id, None)
             window.destroy()
             self._refresh_sessions()
+            threading.Thread(
+                target=self._sftp_browser_clients.close_view,
+                args=(record.session_id, view_id),
+                daemon=True,
+                name="sshvault-sftp-view-close",
+            ).start()
 
         window.protocol("WM_DELETE_WINDOW", close)
         self._refresh_sessions()
@@ -9118,6 +9399,7 @@ class SSHVaultApp(tk.Tk):
         self._refresh_services_tab()
         self._refresh_ssh_tab()
         self._refresh_profile_heading()
+        self._select_session_for_profile(self.selected_profile_id)
         active = None
         try:
             active = self._conn_notebook.nametowidget(self._conn_notebook.select())
@@ -9160,6 +9442,7 @@ class SSHVaultApp(tk.Tk):
         self._refresh_services_tab()
         self._refresh_ssh_tab()
         self._refresh_profile_heading()
+        self._select_session_for_profile(profile_id)
         return True
 
     def update_working_profile_field(self, field: str, value) -> bool:
@@ -9555,23 +9838,11 @@ class SSHVaultApp(tk.Tk):
         return profile
 
     def _open_selected_terminal(self):
-        """Open an intentional native terminal without creating Paramiko/SFTP state."""
-        profile = self._selected_native_profile()
-        if profile is None:
-            return
-        if self._native_terminal_backend.open_terminal_window(profile):
-            self._status_var.set(f"Opened terminal for {profile.get('name', profile.get('host', 'profile'))}.")
-        else:
-            messagebox.showwarning("Native VTE terminal", self._native_terminal_backend.status, parent=self)
+        """Route terminal creation through the selected SessionRecord owner."""
+        self._open_selected_session_terminal()
 
     def _open_selected_terminal_tab(self):
-        profile = self._selected_native_profile()
-        if profile is None:
-            return
-        if self._native_terminal_backend.open_terminal_tab(profile):
-            self._status_var.set(f"Opened terminal tab for {profile.get('name', profile.get('host', 'profile'))}.")
-        else:
-            messagebox.showwarning("Native VTE terminal", self._native_terminal_backend.status, parent=self)
+        self._open_selected_session_terminal()
 
     def _open_selected_terminal_window(self):
         self._open_selected_terminal()
@@ -10181,6 +10452,9 @@ class SSHVaultApp(tk.Tk):
 
 def main() -> None:
     """Launch the SSHVault desktop application."""
+    # Desktop launchers may inherit a stale agent variable; select a live
+    # user-session socket before any connection or native terminal starts.
+    prepare_agent_environment()
     app = SSHVaultApp()
     app.mainloop()
 

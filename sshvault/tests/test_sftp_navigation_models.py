@@ -4,9 +4,13 @@ from pathlib import Path
 
 from sshvault_core import (
     SFTPBrowserClient,
+    SFTPListingCache,
     SFTPViewNavigationState,
+    batch_browser_entries,
+    browser_keyboard_index,
     list_local_browser_entries,
     list_remote_browser_entries,
+    path_entry_shortcut_action,
     sort_browser_entries,
 )
 
@@ -36,6 +40,34 @@ class _Remote:
 
 
 class NavigationModelTests(unittest.TestCase):
+    def test_keyboard_navigation_clamps_and_pages(self):
+        self.assertEqual(browser_keyboard_index(2, 8, "Up"), 1)
+        self.assertEqual(browser_keyboard_index(2, 8, "Down"), 3)
+        self.assertEqual(browser_keyboard_index(6, 8, "Prior", 3), 3)
+        self.assertEqual(browser_keyboard_index(1, 8, "Next", 3), 4)
+        self.assertEqual(browser_keyboard_index(4, 8, "Home"), 0)
+        self.assertEqual(browser_keyboard_index(4, 8, "End"), 7)
+
+    def test_batch_insertion_bounds_rows(self):
+        rows = list(range(205))
+        batches = batch_browser_entries(rows, 100)
+        self.assertEqual([len(batch) for batch in batches], [100, 100, 5])
+
+    def test_path_shortcuts_are_case_insensitive(self):
+        self.assertEqual([path_entry_shortcut_action(key) for key in "aCvX"], ["a", "c", "v", "x"])
+        self.assertIsNone(path_entry_shortcut_action("z"))
+
+    def test_listing_cache_returns_copies_and_invalidates(self):
+        cache = SFTPListingCache()
+        cache.put("/tmp", ["row"])
+        result = cache.get("/tmp")
+        self.assertEqual(result, ["row"])
+        assert result is not None
+        result.append("changed")
+        self.assertEqual(cache.get("/tmp"), ["row"])
+        cache.clear()
+        self.assertIsNone(cache.get("/tmp"))
+
     def test_local_listing_filters_hidden_and_directories_first(self):
         with tempfile.TemporaryDirectory() as root:
             Path(root, "dir").mkdir()

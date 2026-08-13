@@ -9,7 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+import errno
 import ipaddress
+import hashlib
 import json
 import os
 import platform
@@ -684,7 +686,7 @@ class SFTPOptions:
     initial_remote_directory: str = ""
     collision_behavior: str = "ask"
     preserve_timestamps: bool = False
-    verify_transfers: bool = False
+    verify_transfers: bool = True
     auto_open: bool = False
 
 
@@ -1169,7 +1171,7 @@ def default_profile_sections(raw: dict[str, Any] | None = None) -> dict[str, Any
             "initial_remote_directory": "",
             "collision_behavior": "ask",
             "preserve_timestamps": False,
-            "verify_transfers": False,
+            "verify_transfers": True,
             "auto_open": False,
         },
         "tunnel_options": {"rules": []},
@@ -2491,6 +2493,9 @@ class TransferItem:
     restart_required: bool = False
     delete_partial_on_cancel: bool = False
     parent_id: str | None = None
+    session_id: str | None = None
+    profile_id: str | None = None
+    diagnostics: list[str] = field(default_factory=list)
     metrics: TransferTimingMetrics = field(default_factory=TransferTimingMetrics)
 
     def progress(self) -> float | None:
@@ -2523,9 +2528,11 @@ def sftp_transfer_queue_rows(items: list[TransferItem]) -> list[SFTPTransferQueu
                 item.item_id,
                 Path(item.source).name,
                 item.direction,
-                "—" if progress is None else f"{progress:.1f}%",
-                "—" if item.speed <= 0 else f"{item.speed:.0f} B/s",
-                "—" if eta is None else f"{eta:.0f}s",
+                "0.0%" if progress is None else f"{progress:.1f}%",
+                "0 B/s" if item.speed <= 0 else f"{item.speed:.0f} B/s",
+                ("Complete" if item.status == TransferState.COMPLETED else "calculating…")
+                if eta is None
+                else f"{eta:.0f}s",
                 item.status,
             )
         )
@@ -2866,6 +2873,17 @@ class TransferWorker:
         """Return whether pause/cancel/shutdown needs a durable local offset."""
         return self.scheduler._durable_update_required(self.item_id, self.attempt)
 
+    def reconnect_client(self) -> Any:
+        """Replace this worker's failed channel without changing its queue item."""
+        self.client = self.scheduler._reconnect_worker_client(
+            self.item_id, self.attempt, self.worker_id, self.client
+        )
+        return self.client
+
+    def set_operation_timeout(self, value: float) -> None:
+        """Raise the per-operation channel timeout for a known large transfer."""
+        self.scheduler._set_client_timeout(self.client, value)
+
     @property
     def cancelled(self) -> bool:
         return self.scheduler._cancelled(self.item_id, self.attempt)
@@ -2889,6 +2907,10 @@ class TransferScheduler:
         stall_timeout: float = 60.0,
         monitor_interval: float = 1.0,
         debug_transfers: bool = False,
+        reuse_worker_channels: bool = False,
+        session_id: str | None = None,
+        profile_id: str | None = None,
+        operation_timeout: float = 30.0,
     ) -> None:
         self.client_factory = client_factory
         self.concurrency = max(1, min(8, int(concurrency)))
@@ -2910,6 +2932,12 @@ class TransferScheduler:
         self.stall_timeout = max(1.0, float(stall_timeout))
         self.monitor_interval = max(0.05, float(monitor_interval))
         self.debug_transfers = debug_transfers
+        self.reuse_worker_channels = bool(reuse_worker_channels)
+        self.session_id = session_id
+        self.profile_id = profile_id
+        self.operation_timeout = max(1.0, float(operation_timeout))
+        self._idle_worker_clients: list[Any] = []
+        self._producer_threads: set[threading.Thread] = set()
         self.diagnostic_events: list[dict[str, Any]] = []
         self._monitor_stop = threading.Event()
         self._monitor_thread: threading.Thread | None = None
@@ -2918,6 +2946,50 @@ class TransferScheduler:
                 target=self._monitor_stalls, daemon=True, name="sshvault-sftp-transfer-monitor"
             )
             self._monitor_thread.start()
+
+    @staticmethod
+    def _set_client_timeout(client: Any, value: float) -> None:
+        channel_getter = getattr(client, "get_channel", None)
+        if not callable(channel_getter):
+            return
+        channel = channel_getter()
+        timeout_setter = getattr(channel, "settimeout", None)
+        if callable(timeout_setter):
+            timeout_setter(value)
+
+    def _reconnect_worker_client(
+        self,
+        item_id: str,
+        attempt: int,
+        worker_id: str,
+        failed_client: Any,
+    ) -> Any:
+        """Reconnect one worker and atomically publish its replacement channel."""
+        if self.client_factory is None:
+            raise RuntimeError("No SFTP client factory is available.")
+        try:
+            failed_client.close()
+        except Exception:
+            pass
+        replacement = self.client_factory()
+        self._set_client_timeout(replacement, self.operation_timeout)
+        with self._condition:
+            item = self.get(item_id)
+            if (
+                item is None
+                or self.closed
+                or attempt != self._attempts.get(item_id)
+                or item_id in self._cancelled_ids
+                or item_id in self._stalled_ids
+            ):
+                try:
+                    replacement.close()
+                except Exception:
+                    pass
+                raise InterruptedError
+            self._clients[item_id] = replacement
+            self._diagnostic_locked(item, worker_id, "channel-reconnected", reason="resume")
+        return replacement
 
     @property
     def active(self) -> TransferItem | None:
@@ -2940,6 +3012,8 @@ class TransferScheduler:
         with self._condition:
             if self.closed:
                 raise ProfileError("Transfer queue is closed.")
+            item.session_id = self.session_id
+            item.profile_id = self.profile_id
             item.generation = self.generation
             item.status = TransferState.PENDING
             self.items.append(item)
@@ -2955,6 +3029,8 @@ class TransferScheduler:
         with self._condition:
             if self.closed:
                 raise ProfileError("Transfer queue is closed.")
+            item.session_id = self.session_id
+            item.profile_id = self.profile_id
             item.generation = self.generation
             self.items.append(item)
         self._changed()
@@ -2969,6 +3045,55 @@ class TransferScheduler:
             item.parent_id = batch.batch_id
             batch.children.append((self.enqueue(item, operation) if operation else self.record(item)).item_id)
         return batch
+
+    def create_batch(self, batch: TransferBatch) -> TransferBatch:
+        with self._condition:
+            if self.closed:
+                raise ProfileError("Transfer queue is closed.")
+            self.batches.append(batch)
+        self._changed()
+        return batch
+
+    def add_batch_item(
+        self,
+        batch: TransferBatch,
+        item: TransferItem,
+        operation: TransferOperation | None,
+    ) -> TransferItem:
+        item.parent_id = batch.batch_id
+        queued = self.enqueue(item, operation) if operation else self.record(item)
+        with self._condition:
+            batch.children.append(queued.item_id)
+        return queued
+
+    def start_producer(self, item: TransferItem, producer: Callable[[TransferItem], None]) -> TransferItem:
+        """Show a planning row immediately and run incremental discovery off-thread."""
+        item.status = TransferState.PREPARING
+        self.record(item)
+
+        def run() -> None:
+            try:
+                producer(item)
+                with self._condition:
+                    if not self.closed and item.status != TransferState.FAILED:
+                        item.status = TransferState.COMPLETED
+            except Exception as exc:
+                with self._condition:
+                    if not self.closed:
+                        item.status = TransferState.FAILED
+                        item.error = str(redact_secrets(str(exc)))
+            finally:
+                with self._condition:
+                    self._producer_threads.discard(threading.current_thread())
+                self._changed()
+
+        thread = threading.Thread(target=run, daemon=True, name="sshvault-sftp-folder-scan")
+        with self._condition:
+            if self.closed:
+                raise ProfileError("Transfer queue is closed.")
+            self._producer_threads.add(thread)
+        thread.start()
+        return item
 
     def batch_progress(self, batch_id: str) -> TransferProgress | None:
         batch = next((x for x in self.batches if x.batch_id == batch_id), None)
@@ -3070,11 +3195,18 @@ class TransferScheduler:
     def _run(self, item_id: str, generation: int, attempt: int) -> None:
         client = None
         worker: TransferWorker | None = None
+        reusable = False
         try:
             if self.client_factory is None:
                 raise RuntimeError("No SFTP client factory is available.")
             channel_started = time.perf_counter()
-            client = self.client_factory()
+            if self.reuse_worker_channels:
+                with self._condition:
+                    if self._idle_worker_clients:
+                        client = self._idle_worker_clients.pop()
+            if client is None:
+                client = self.client_factory()
+            self._set_client_timeout(client, self.operation_timeout)
             worker = TransferWorker(self, item_id, attempt, client)
             with self._condition:
                 item = self.get(item_id)
@@ -3098,6 +3230,7 @@ class TransferScheduler:
             if operation is None:
                 raise RuntimeError("No transfer operation is available.")
             operation(item, client, worker)
+            reusable = self.reuse_worker_channels
             with self._condition:
                 item = self.get(item_id)
                 if (
@@ -3135,7 +3268,13 @@ class TransferScheduler:
                         item, worker.worker_id if worker else "", TransferState.FAILED, reason="error"
                     )
         finally:
-            if client is not None:
+            if worker is not None:
+                client = worker.client
+            keep_client = reusable and self.reuse_worker_channels and not self.closed and generation == self.generation
+            if client is not None and keep_client:
+                with self._condition:
+                    self._idle_worker_clients.append(client)
+            elif client is not None:
                 try:
                     client.close()
                 except Exception:
@@ -3320,6 +3459,8 @@ class TransferScheduler:
             item = self.get(item_id)
             if item is None or item.status not in {TransferState.FAILED, TransferState.CANCELLED}:
                 return False
+            if item_id not in self._operations and self.client_factory is not None:
+                return False
             # A stalled SFTP channel is closed before the row is marked failed.
             # Do not let an uninterruptible legacy channel write beside a retry.
             if item_id in self._threads:
@@ -3427,6 +3568,8 @@ class TransferScheduler:
                         item.error = "SFTP session disconnected"
             self._cancelled_ids.update(self._active)
             clients = list(self._clients.values())
+            clients.extend(self._idle_worker_clients)
+            self._idle_worker_clients.clear()
             self._condition.notify_all()
         for client in clients:
             try:
@@ -3443,7 +3586,10 @@ class TransferScheduler:
                     item.status = TransferState.CANCELLED
             self._cancelled_ids.update(self._active)
             threads = list(self._threads.values())
+            producer_threads = list(self._producer_threads)
             clients = list(self._clients.values())
+            clients.extend(self._idle_worker_clients)
+            self._idle_worker_clients.clear()
             self._condition.notify_all()
         self._monitor_stop.set()
         for client in clients:
@@ -3454,6 +3600,9 @@ class TransferScheduler:
         for thread in threads:
             if thread is not threading.current_thread():
                 thread.join(timeout=timeout)
+        for thread in producer_threads:
+            if thread is not threading.current_thread():
+                thread.join(timeout=min(timeout, 0.1))
         if self._monitor_thread is not None and self._monitor_thread is not threading.current_thread():
             self._monitor_thread.join(timeout=timeout)
         self._changed()
@@ -3545,8 +3694,81 @@ def safe_transfer_plan(root: str | Path, relative_paths: list[str]) -> list[tupl
 class SFTPTransferRouter:
     """Route browser selections through an existing transfer scheduler."""
 
-    def __init__(self, scheduler: TransferScheduler) -> None:
+    def __init__(
+        self,
+        scheduler: TransferScheduler,
+        *,
+        verify_completed: bool = True,
+        follow_symlinks: bool = False,
+    ) -> None:
         self.scheduler = scheduler
+        self.verify_completed = verify_completed
+        self.follow_symlinks = follow_symlinks
+
+    @staticmethod
+    def _raise_remote_error(exc: BaseException, fallback: str = "Transfer failed") -> None:
+        """Translate common SFTP failures into stable, user-facing reasons."""
+        detail = str(exc).casefold()
+        code = getattr(exc, "errno", None)
+        if code in {errno.EACCES, errno.EPERM} or "permission denied" in detail:
+            raise ProfileError("Remote permission denied") from exc
+        if code == errno.ENOENT or "no such file" in detail or "not found" in detail:
+            raise ProfileError("Remote directory not found") from exc
+        if code in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)} or any(
+            text in detail for text in ("no space left", "quota exceeded", "disk full", "filesystem full")
+        ):
+            raise ProfileError("Remote filesystem full") from exc
+        raise ProfileError(fallback) from exc
+
+    @staticmethod
+    def _channel_failure(exc: BaseException) -> str | None:
+        detail = str(exc).casefold()
+        if isinstance(exc, (TimeoutError, socket.timeout)) or "timed out" in detail or "timeout" in detail:
+            return "SFTP channel timeout"
+        if isinstance(exc, (EOFError, ConnectionError, BrokenPipeError)) or any(
+            text in detail
+            for text in ("connection reset", "connection aborted", "broken pipe", "server connection dropped", "eof")
+        ):
+            return "Connection interrupted"
+        return None
+
+    @staticmethod
+    def _source_snapshot(path: Path) -> tuple[int, int]:
+        info = path.stat()
+        return int(info.st_size), int(info.st_mtime_ns)
+
+    @staticmethod
+    def _large_file_timeout(total: int, configured: float) -> float:
+        """Scale a socket-operation timeout without imposing a whole-file deadline."""
+        gib = max(0.0, total / float(1024**3))
+        return max(configured, min(900.0, 60.0 + gib * 30.0))
+
+    @staticmethod
+    def _existing_remote_directory(client: Any, path: str) -> bool:
+        try:
+            info = client.stat(path)
+        except Exception:
+            return False
+        mode = getattr(info, "st_mode", None)
+        return mode is None or (int(mode) & 0o170000) == 0o040000
+
+    @classmethod
+    def _ensure_remote_directory(cls, client: Any, path: str) -> None:
+        try:
+            client.mkdir(path)
+        except OSError as exc:
+            if cls._existing_remote_directory(client, path):
+                return
+            cls._raise_remote_error(exc, "Remote directory could not be created")
+
+    @classmethod
+    def _mkdir_remote(cls, item: TransferItem, client: Any, _worker: TransferWorker) -> None:
+        """Create one remote directory, treating an existing directory as success."""
+        cls._ensure_remote_directory(client, item.target)
+
+    @staticmethod
+    def _mkdir_local(item: TransferItem, _client: Any, _worker: TransferWorker) -> None:
+        Path(item.target).mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def action_states(
@@ -3563,33 +3785,485 @@ class SFTPTransferRouter:
         }
 
     @staticmethod
-    def _upload(item: TransferItem, client: Any, worker: TransferWorker) -> None:
-        client.put(
-            item.source,
-            item.target,
-            callback=lambda transferred, total: worker.checkpoint(transferred, total),
+    def disabled_reasons(
+        *,
+        local_selected: bool,
+        remote_selected: bool,
+        connected: bool,
+        client_available: bool,
+    ) -> dict[str, str]:
+        common = (
+            ""
+            if connected and client_available
+            else ("session is not connected" if not connected else "remote client is unavailable")
         )
+        return {
+            "upload": common or ("" if local_selected else "no local item selected"),
+            "download": common or ("" if remote_selected else "no remote item selected"),
+        }
+
+    def _digest_local(self, path: Path, length: int | None = None) -> bytes:
+        digest = hashlib.sha1()
+        remaining = length
+        with path.open("rb") as source:
+            while True:
+                size = 256 * 1024 if remaining is None else min(256 * 1024, remaining)
+                chunk = source.read(size)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                if remaining is not None:
+                    remaining -= len(chunk)
+                    if remaining <= 0:
+                        break
+        return digest.digest()
 
     @staticmethod
-    def _download(item: TransferItem, client: Any, worker: TransferWorker) -> None:
-        client.get(
-            item.source,
-            item.target,
-            callback=lambda transferred, total: worker.checkpoint(transferred, total),
+    def _digest_remote(client: Any, path: str, length: int | None = None) -> bytes | None:
+        try:
+            with client.open(path, "rb") as source:
+                checker = getattr(source, "check", None)
+                if not callable(checker):
+                    return None
+                return cast(bytes, checker("sha1", length=length or 0))
+        except (OSError, NotImplementedError, AttributeError, TypeError):
+            return None
+
+    def _verify_remote_file(self, client: Any, local: Path, remote: str, total: int) -> bool:
+        try:
+            if int(client.stat(remote).st_size) != total:
+                return False
+        except (OSError, AttributeError, TypeError, ValueError):
+            return False
+        if not self.verify_completed:
+            return True
+        remote_digest = self._digest_remote(client, remote)
+        return remote_digest is None or remote_digest == self._digest_local(local)
+
+    def _partial_matches_source(self, client: Any, local: Path, remote: str, offset: int) -> bool:
+        if offset <= 0:
+            return True
+        if not self.verify_completed:
+            return True
+        remote_digest = self._digest_remote(client, remote, offset)
+        return remote_digest is None or remote_digest == self._digest_local(local, offset)
+
+    @staticmethod
+    def _tune_stream(stream: Any, *, remaining: int | None = None) -> None:
+        """Enable Paramiko's safe pipelining/prefetch when the channel supports it.
+
+        Lightweight test doubles and non-Paramiko clients simply fall back to
+        the existing streaming loop. No transfer semantics depend on tuning.
+        """
+        pipelined = getattr(stream, "set_pipelined", None)
+        if callable(pipelined):
+            try:
+                pipelined(True)
+            except Exception:
+                pass
+        if remaining is None or remaining <= 0:
+            return
+        prefetch = getattr(stream, "prefetch", None)
+        if callable(prefetch):
+            try:
+                prefetch(file_size=remaining, max_concurrent_prefetch_requests=32)
+            except Exception:
+                try:
+                    prefetch(file_size=remaining)
+                except Exception:
+                    pass
+
+    def _upload(self, item: TransferItem, client: Any, worker: TransferWorker) -> None:
+        local = Path(item.source)
+        try:
+            start_snapshot = self._source_snapshot(local)
+            total = start_snapshot[0]
+            if not local.is_file() or not os.access(local, os.R_OK):
+                raise PermissionError(item.source)
+        except OSError as exc:
+            raise ProfileError("Local file unreadable") from exc
+        item.total = total
+        set_timeout = getattr(worker, "set_operation_timeout", None)
+        if callable(set_timeout):
+            set_timeout(self._large_file_timeout(total, self.scheduler.operation_timeout))
+        parent = posixpath.dirname(item.target)
+        if parent and parent != "/":
+            current = "/" if parent.startswith("/") else ""
+            for part in parent.strip("/").split("/"):
+                current = posixpath.join(current, part)
+                self._ensure_remote_directory(client, current)
+
+        try:
+            final = client.stat(item.target)
+        except (OSError, FileNotFoundError):
+            final = None
+        source_mtime = local.stat().st_mtime
+        if (
+            final is not None
+            and int(getattr(final, "st_size", -1)) == total
+            and getattr(final, "st_mtime", None) is not None
+            and int(final.st_mtime) == int(source_mtime)
+            and self._verify_remote_file(client, local, item.target, total)
+        ):
+            if self._source_snapshot(local) != start_snapshot:
+                item.diagnostics.append("Source still changing")
+                raise ProfileError("Source file is still being modified")
+            item.transferred = total
+            item.resume_offset = total
+            worker.checkpoint(total, total)
+            return
+
+        partial = f"{item.target}.sshvault-part"
+        reconnects = 0
+        while True:
+            partial_present = False
+            try:
+                partial_stat = client.stat(partial)
+                partial_present = True
+                offset = int(getattr(partial_stat, "st_size", 0))
+            except (OSError, FileNotFoundError, TypeError, ValueError):
+                offset = 0
+            invalid_partial = offset < 0 or offset > total
+            if partial_present and not invalid_partial:
+                invalid_partial = not self._partial_matches_source(client, local, partial, offset)
+            if invalid_partial:
+                item.restart_required = True
+                item.diagnostics.append("Invalid partial file")
+                offset = 0
+            if partial_present and offset == total:
+                break
+            source = target = None
+            try:
+                source = local.open("rb")
+                target = client.open(partial, "ab" if offset else "wb")
+                if offset:
+                    source.seek(offset)
+                    target.seek(offset)
+                item.resume_offset = offset
+                item.transferred = offset
+                self._tune_stream(target)
+                worker.checkpoint(offset, total)
+                while chunk := source.read(1024 * 1024):
+                    if self._source_snapshot(local) != start_snapshot:
+                        item.diagnostics.append("Source still changing")
+                        raise ProfileError("Source file is still being modified")
+                    target.write(chunk)
+                    item.transferred += len(chunk)
+                    worker.checkpoint(item.transferred, total)
+                target.close()
+                target = None
+                break
+            except ProfileError:
+                raise
+            except Exception as exc:
+                failure = self._channel_failure(exc)
+                if failure is None:
+                    self._raise_remote_error(exc)
+                    raise AssertionError("unreachable")
+                item.diagnostics.append(failure)
+                if reconnects >= 3 or not hasattr(worker, "reconnect_client"):
+                    raise ProfileError(failure) from exc
+                reconnects += 1
+                try:
+                    client = worker.reconnect_client()
+                except Exception as reconnect_exc:
+                    raise ProfileError("Connection interrupted") from reconnect_exc
+            finally:
+                if source is not None:
+                    source.close()
+                if target is not None:
+                    try:
+                        target.close()
+                    except Exception:
+                        pass
+        if self._source_snapshot(local) != start_snapshot:
+            item.diagnostics.append("Source still changing")
+            raise ProfileError("Source file is still being modified")
+        try:
+            final_partial_size = int(client.stat(partial).st_size)
+        except Exception as exc:
+            failure = self._channel_failure(exc)
+            raise ProfileError(failure or "Final size mismatch") from exc
+        if final_partial_size != total:
+            raise ProfileError("Final size mismatch")
+        if self.verify_completed:
+            remote_digest = self._digest_remote(client, partial)
+            if remote_digest is not None and remote_digest != self._digest_local(local):
+                raise ProfileError("Checksum mismatch")
+        try:
+            client.remove(item.target)
+        except (OSError, FileNotFoundError):
+            pass
+        try:
+            client.rename(partial, item.target)
+        except OSError as exc:
+            self._raise_remote_error(exc)
+        try:
+            if int(client.stat(item.target).st_size) != total:
+                raise ProfileError("Final size mismatch")
+        except ProfileError:
+            raise
+        except Exception as exc:
+            self._raise_remote_error(exc, "Final size mismatch")
+        utime = getattr(client, "utime", None)
+        if callable(utime):
+            try:
+                utime(item.target, (source_mtime, source_mtime))
+            except OSError:
+                pass
+
+    def _download(self, item: TransferItem, client: Any, worker: TransferWorker) -> None:
+        target = Path(item.target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        remote_stat = client.stat(item.source)
+        total = int(getattr(remote_stat, "st_size", 0))
+        item.total = total
+        remote_mtime = getattr(remote_stat, "st_mtime", None)
+        start_snapshot = (total, remote_mtime)
+        set_timeout = getattr(worker, "set_operation_timeout", None)
+        if callable(set_timeout):
+            set_timeout(self._large_file_timeout(total, self.scheduler.operation_timeout))
+        if (
+            target.is_file()
+            and target.stat().st_size == total
+            and remote_mtime is not None
+            and int(target.stat().st_mtime) == int(remote_mtime)
+        ):
+            if not self.verify_completed or self._digest_remote(client, item.source) in {
+                None,
+                self._digest_local(target),
+            }:
+                item.transferred = total
+                item.resume_offset = total
+                worker.checkpoint(total, total)
+                return
+
+        partial = Path(f"{item.target}.sshvault-part")
+        reconnects = 0
+        while True:
+            try:
+                offset = partial.stat().st_size
+                partial_present = True
+            except OSError:
+                offset = 0
+                partial_present = False
+            invalid_partial = offset < 0 or offset > total
+            if partial_present and not invalid_partial and offset and self.verify_completed:
+                remote_prefix = self._digest_remote(client, item.source, offset)
+                invalid_partial = remote_prefix is not None and remote_prefix != self._digest_local(partial)
+            if invalid_partial:
+                item.restart_required = True
+                item.diagnostics.append("Invalid partial file")
+                partial.unlink(missing_ok=True)
+                offset = 0
+            if partial_present and offset == total:
+                break
+            source = destination = None
+            try:
+                source = client.open(item.source, "rb")
+                destination = partial.open("r+b" if offset else "wb")
+                if offset:
+                    source.seek(offset)
+                    destination.seek(offset)
+                item.resume_offset = offset
+                item.transferred = offset
+                self._tune_stream(source, remaining=total - offset)
+                worker.checkpoint(offset, total)
+                checked_at = offset
+                while chunk := source.read(1024 * 1024):
+                    destination.write(chunk)
+                    item.transferred += len(chunk)
+                    worker.checkpoint(item.transferred, total)
+                    if item.transferred - checked_at >= 16 * 1024 * 1024:
+                        current = client.stat(item.source)
+                        if (int(current.st_size), getattr(current, "st_mtime", None)) != start_snapshot:
+                            item.diagnostics.append("Source still changing")
+                            raise ProfileError("Source file is still being modified")
+                        checked_at = item.transferred
+                destination.flush()
+                break
+            except ProfileError:
+                raise
+            except Exception as exc:
+                failure = self._channel_failure(exc)
+                if failure is None:
+                    self._raise_remote_error(exc)
+                    raise AssertionError("unreachable")
+                item.diagnostics.append(failure)
+                if reconnects >= 3 or not hasattr(worker, "reconnect_client"):
+                    raise ProfileError(failure) from exc
+                reconnects += 1
+                try:
+                    client = worker.reconnect_client()
+                except Exception as reconnect_exc:
+                    raise ProfileError("Connection interrupted") from reconnect_exc
+            finally:
+                if source is not None:
+                    try:
+                        source.close()
+                    except Exception:
+                        pass
+                if destination is not None:
+                    destination.close()
+        final_source = client.stat(item.source)
+        if (int(final_source.st_size), getattr(final_source, "st_mtime", None)) != start_snapshot:
+            item.diagnostics.append("Source still changing")
+            raise ProfileError("Source file is still being modified")
+        if partial.stat().st_size != total:
+            raise ProfileError("Final size mismatch")
+        if self.verify_completed:
+            remote_digest = self._digest_remote(client, item.source)
+            if remote_digest is not None and remote_digest != self._digest_local(partial):
+                raise ProfileError("Checksum mismatch")
+        partial.replace(target)
+        if remote_mtime is not None:
+            try:
+                os.utime(target, (remote_mtime, remote_mtime))
+            except OSError:
+                pass
+
+    def _queue_batch(
+        self,
+        name: str,
+        direction: str,
+        source: str,
+        target: str,
+        children: list[tuple[TransferItem, TransferOperation | None]],
+    ) -> list[TransferItem]:
+        batch = TransferBatch(name, direction, source, target)
+        self.scheduler.add_batch(batch, children)
+        return [item for item_id in batch.children if (item := self.scheduler.get(item_id)) is not None]
+
+    def _record_local_failure(
+        self,
+        source: Path,
+        target: str,
+        *,
+        error: str = "Local file unreadable",
+    ) -> TransferItem:
+        item = TransferItem(
+            str(source),
+            target,
+            "Upload",
+            status=TransferState.FAILED,
+            error=error,
         )
+        return self.scheduler.record(item)
+
+    def _folder_upload_children(self, source: Path, remote_root: str) -> Any:
+        """Yield folder jobs as they are discovered; callers consume off-thread."""
+        visited: set[tuple[int, int]] = set()
+        for directory, names, files in os.walk(source, followlinks=self.follow_symlinks):
+            local_directory = Path(directory)
+            try:
+                identity = local_directory.stat()
+            except OSError:
+                names.clear()
+                yield (
+                    TransferItem(
+                        str(local_directory),
+                        remote_root,
+                        "Upload",
+                        status=TransferState.FAILED,
+                        error="Local file unreadable",
+                    ),
+                    None,
+                )
+                continue
+            key = (identity.st_dev, identity.st_ino)
+            if key in visited:
+                names.clear()
+                continue
+            visited.add(key)
+            if not self.follow_symlinks:
+                names[:] = [name for name in names if not (local_directory / name).is_symlink()]
+            relative = local_directory.relative_to(source)
+            remote_directory = (
+                remote_root if str(relative) == "." else posixpath.join(remote_root, str(relative).replace(os.sep, "/"))
+            )
+            yield (
+                TransferItem(str(local_directory), remote_directory, "Upload", total=0),
+                self._mkdir_remote,
+            )
+            for name in sorted(files):
+                file_path = local_directory / name
+                if file_path.is_symlink() and not self.follow_symlinks:
+                    continue
+                file_relative = file_path.relative_to(source)
+                remote_path = posixpath.join(remote_root, str(file_relative).replace(os.sep, "/"))
+                try:
+                    size = file_path.stat().st_size
+                    readable = file_path.is_file() and os.access(file_path, os.R_OK)
+                except OSError:
+                    readable = False
+                    size = None
+                if not readable:
+                    yield (
+                        TransferItem(
+                            str(file_path.resolve()),
+                            remote_path,
+                            "Upload",
+                            total=size,
+                            status=TransferState.FAILED,
+                            error="Local file unreadable",
+                        ),
+                        None,
+                    )
+                    continue
+                yield (
+                    TransferItem(str(file_path.resolve()), remote_path, "Upload", total=size),
+                    self._upload,
+                )
 
     def queue_uploads(self, local_paths: list[str], remote_directory: str) -> list[TransferItem]:
         target_directory = normalize_remote_path(remote_directory or "/")
         queued: list[TransferItem] = []
         for raw_path in local_paths:
-            source = Path(raw_path)
-            if not source.is_file():
+            selected_source = Path(raw_path).expanduser()
+            selected_name = selected_source.name
+            if selected_source.is_symlink() and not self.follow_symlinks:
+                queued.append(
+                    self._record_local_failure(
+                        selected_source.absolute(),
+                        posixpath.join(target_directory, selected_name),
+                        error="Symbolic links are not followed",
+                    )
+                )
+                continue
+            source = selected_source.resolve()
+            if source.is_dir():
+                remote_root = posixpath.join(target_directory, selected_name)
+                batch = self.scheduler.create_batch(TransferBatch(selected_name, "Upload", str(source), remote_root))
+                planning = TransferItem(str(source), remote_root, "Upload")
+
+                def produce(_planning: TransferItem, *, root=source, target=remote_root, parent=batch) -> None:
+                    discovered = 0
+                    for item, operation in self._folder_upload_children(root, target):
+                        if self.scheduler.closed:
+                            return
+                        self.scheduler.add_batch_item(parent, item, operation)
+                        discovered += 1
+                        _planning.transferred = discovered
+
+                self.scheduler.start_producer(planning, produce)
+                batch.children.append(planning.item_id)
+                queued.append(planning)
+                continue
+            target = posixpath.join(target_directory, selected_name)
+            try:
+                readable = source.is_file() and os.access(source, os.R_OK)
+                size = source.stat().st_size if readable else None
+            except OSError:
+                readable = False
+                size = None
+            if not readable:
+                queued.append(self._record_local_failure(source, target))
                 continue
             item = TransferItem(
                 str(source),
-                posixpath.join(target_directory, source.name),
+                target,
                 "Upload",
-                total=source.stat().st_size,
+                total=size,
             )
             queued.append(self.scheduler.enqueue(item, self._upload))
         return queued
@@ -3598,11 +4272,58 @@ class SFTPTransferRouter:
         self,
         remote_entries: list["RemoteBrowserEntry"],
         local_directory: str,
+        browser_client: SFTPBrowserClient | None = None,
     ) -> list[TransferItem]:
         target_directory = Path(local_directory)
         queued: list[TransferItem] = []
         for entry in remote_entries:
             if entry.is_directory:
+                local_root = target_directory / entry.name
+                batch = self.scheduler.create_batch(
+                    TransferBatch(entry.name, "Download", entry.full_path, str(local_root))
+                )
+                scan_item = TransferItem(entry.full_path, str(local_root), "Download")
+
+                def scan(
+                    item: TransferItem,
+                    client: Any,
+                    worker: TransferWorker,
+                    *,
+                    remote_root=entry.full_path,
+                    destination=local_root,
+                    parent=batch,
+                ) -> None:
+                    destination.mkdir(parents=True, exist_ok=True)
+                    listing_client = client if hasattr(client, "list_directory") else SFTPBrowserClient(client)
+                    pending = [(remote_root, destination)]
+                    discovered = 0
+                    while pending:
+                        remote_path, local_path = pending.pop()
+                        for child in list_remote_browser_entries(listing_client, remote_path, show_hidden=True):
+                            child_local = local_path / child.name
+                            if child.is_directory:
+                                self.scheduler.add_batch_item(
+                                    parent,
+                                    TransferItem(child.full_path, str(child_local), "Download", total=0),
+                                    self._mkdir_local,
+                                )
+                                pending.append((child.full_path, child_local))
+                            else:
+                                self.scheduler.add_batch_item(
+                                    parent,
+                                    TransferItem(
+                                        child.full_path,
+                                        str(child_local),
+                                        "Download",
+                                        total=child.size,
+                                    ),
+                                    self._download,
+                                )
+                            discovered += 1
+                            worker.checkpoint(discovered, None)
+
+                self.scheduler.add_batch_item(batch, scan_item, scan)
+                queued.append(scan_item)
                 continue
             item = TransferItem(
                 entry.full_path,
@@ -4326,6 +5047,58 @@ def sort_browser_entries(entries: list[Any], column: str, descending: bool) -> l
     directories = [entry for entry in entries if entry.is_directory]
     files = [entry for entry in entries if not entry.is_directory]
     return sorted(directories, key=key, reverse=descending) + sorted(files, key=key, reverse=descending)
+
+
+def browser_keyboard_index(
+    current: int,
+    count: int,
+    key: str,
+    page_size: int = 10,
+) -> int | None:
+    """Return the next visible row for standard file-list navigation."""
+    if count <= 0:
+        return None
+    current = max(0, min(current, count - 1))
+    delta = {
+        "Up": -1,
+        "Down": 1,
+        "Prior": -max(1, page_size),
+        "Next": max(1, page_size),
+        "Home": -current,
+        "End": count - 1 - current,
+    }.get(key)
+    if delta is None:
+        return current
+    return max(0, min(count - 1, current + delta))
+
+
+def batch_browser_entries(entries: list[Any], batch_size: int = 100) -> list[list[Any]]:
+    """Split rows into bounded UI insertion batches."""
+    size = max(1, int(batch_size))
+    return [entries[index : index + size] for index in range(0, len(entries), size)]
+
+
+class SFTPListingCache:
+    """Small per-view cache for the most recently rendered directories."""
+
+    def __init__(self) -> None:
+        self._entries: dict[str, list[Any]] = {}
+
+    def get(self, key: str) -> list[Any] | None:
+        value = self._entries.get(key)
+        return None if value is None else list(value)
+
+    def put(self, key: str, entries: list[Any]) -> None:
+        self._entries[key] = list(entries)
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+
+def path_entry_shortcut_action(key: str) -> str | None:
+    """Normalize path-entry edit keys independently of Caps Lock state."""
+    action = str(key).casefold()
+    return action if action in {"a", "c", "v", "x"} else None
 
 
 def selected_directory_target(entries: list[Any], selected_paths: list[str]) -> str | None:
@@ -5632,6 +6405,14 @@ def _safe_ssh_target(host: object, username: object) -> str:
     return f"{user_text}@{host_text}"
 
 
+def session_resource_title(resource: str, profile: dict[str, Any]) -> str:
+    """Return a stable, human-readable owner label for a session resource."""
+    user = str(profile.get("user", "")).strip()
+    host = str(profile.get("host", "")).strip().split(".", 1)[0]
+    owner = "@".join(part for part in (user, host) if part)
+    return f"{resource} — {owner or str(profile.get('name', 'SSHVault'))}"
+
+
 def build_native_ssh_argv(profile: dict[str, Any]) -> list[str]:
     """Build a restricted OpenSSH argv; no profile field is shell-expanded."""
     target = _safe_ssh_target(profile.get("host", ""), profile.get("user", ""))
@@ -5731,6 +6512,9 @@ class VTETerminalBackend(TerminalBackend):
         self._terminals: dict[str, dict[str, Any]] = {}
         self._last_window_id: str | None = None
         self.last_terminal_id: str | None = None
+        self._request_lock = threading.Lock()
+        self._last_terminal_poll = 0.0
+        self._terminal_poll_interval = 0.5
 
     @property
     def status(self) -> str:
@@ -5738,7 +6522,7 @@ class VTETerminalBackend(TerminalBackend):
             return "Native VTE ready"
         if not self.availability.available:
             return "Legacy terminal — VTE unavailable"
-        return f"Legacy terminal — VTE helper failed: {self.reason or 'helper exited early'}"
+        return f"Native VTE unavailable: {self.reason or 'helper exited'}"
 
     @staticmethod
     def _helper_path() -> Path:
@@ -5781,11 +6565,15 @@ class VTETerminalBackend(TerminalBackend):
             return None
         request_id = str(uuid4())
         message = {"type": command, "token": self._token, "request_id": request_id, **payload}
-        try:
-            self._connection.sendall((json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8"))
-            response = self._receive(3)
-        except OSError:
-            return None
+        with self._request_lock:
+            try:
+                connection = self._connection
+                if connection is None:
+                    return None
+                connection.sendall((json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8"))
+                response = self._receive(3)
+            except OSError:
+                return None
         if not response or response.get("type") != "response" or response.get("request_id") != request_id:
             return None
         return response
@@ -5793,6 +6581,17 @@ class VTETerminalBackend(TerminalBackend):
     def _start(self) -> bool:
         if self._connection and self._process and self._process.poll() is None:
             return True
+        if self._process is not None and self._process.poll() is not None:
+            if self._connection is not None:
+                try:
+                    self._connection.close()
+                except OSError:
+                    pass
+                self._connection = None
+            self._process = None
+            if self._directory:
+                shutil.rmtree(self._directory, ignore_errors=True)
+                self._directory = None
         if not self.availability.available or not self.availability.interpreter:
             return self._fail(self.availability.reason or "VTE unavailable")
         helper = self._helper_path()
@@ -5800,7 +6599,7 @@ class VTETerminalBackend(TerminalBackend):
             return self._fail("helper module missing")
         try:
             probe = subprocess.run(
-                [self.availability.interpreter, str(helper), "--probe"],
+                [self.availability.interpreter, "-I", str(helper), "--probe"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -5819,6 +6618,7 @@ class VTETerminalBackend(TerminalBackend):
             self._process = subprocess.Popen(
                 [
                     self.availability.interpreter,
+                    "-I",
                     str(helper),
                     "--socket",
                     str(socket_path),
@@ -5879,7 +6679,8 @@ class VTETerminalBackend(TerminalBackend):
         try:
             request: dict[str, Any] = {
                 "argv": build_native_ssh_argv(profile),
-                "title": str(profile.get("name", "SSHVault")),
+                "title": session_resource_title("Terminal", profile),
+                "session_id": str(profile.get("_session_id", "")),
                 "terminal_options": dict(profile.get("terminal_options", {})),
             }
             if command == "open_tab" and self._last_window_id:
@@ -5894,6 +6695,7 @@ class VTETerminalBackend(TerminalBackend):
                 "terminal_id": terminal_id,
                 "window_id": window_id,
                 "title": request["title"],
+                "session_id": request["session_id"],
             }
             self.last_terminal_id = terminal_id
             self._last_window_id = window_id
@@ -5902,7 +6704,16 @@ class VTETerminalBackend(TerminalBackend):
         return True
 
     def list_terminals(self) -> list[dict[str, Any]]:
-        if not self._start():
+        now = time.monotonic()
+        if now - self._last_terminal_poll < self._terminal_poll_interval:
+            return list(self._terminals.values())
+        self._last_terminal_poll = now
+        if not self._connection or not self._process or self._process.poll() is not None:
+            if self._terminals:
+                self.reason = "helper exited"
+                self._terminals.clear()
+                self.last_terminal_id = None
+                self._last_window_id = None
             return []
         response = self._request("list_terminals")
         terminals = response.get("terminals", []) if response and response.get("ok") else []
@@ -5914,15 +6725,28 @@ class VTETerminalBackend(TerminalBackend):
         return []
 
     def close_terminal(self, terminal_id: str) -> bool:
-        """Close one native terminal without affecting sibling tabs/windows."""
-        if terminal_id not in self._terminals or not self._start():
-            return False
-        response = self._request("close_tab", terminal_id=terminal_id)
-        if not response or not response.get("ok"):
+        """Close one native terminal asynchronously without affecting siblings."""
+        if terminal_id not in self._terminals:
             return False
         self._terminals.pop(terminal_id, None)
         if self.last_terminal_id == terminal_id:
             self.last_terminal_id = next(reversed(self._terminals), None)
+        if self._connection and self._process and self._process.poll() is None:
+
+            def close_remote() -> None:
+                self._request("close_tab", terminal_id=terminal_id)
+                process = self._process
+                if not self._terminals and process is not None:
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        return
+
+            threading.Thread(
+                target=close_remote,
+                daemon=True,
+                name="sshvault-vte-close",
+            ).start()
         return True
 
     def agent_diagnostics(self, *, selected_authentication: str = "") -> dict[str, bool]:
@@ -5959,6 +6783,10 @@ class VTETerminalBackend(TerminalBackend):
                 self._process.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 self._process.kill()
+                try:
+                    self._process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
         self._process = None
         self._terminals.clear()
         self._last_window_id = None

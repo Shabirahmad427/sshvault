@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
 import ast
 import tempfile
@@ -8,7 +10,9 @@ from unittest.mock import MagicMock, patch
 
 import paramiko
 
+from sshvault_core import SessionController
 from sshvault_security import (
+    IndependentAgentAuthStrategy,
     InteractiveHostKeyPolicy,
     KnownHostsError,
     KnownHostsStore,
@@ -17,9 +21,45 @@ from sshvault_security import (
     SSHConnectionManager,
     TrustDecision,
     UnknownHostCancelled,
+    agent_environment_diagnostics,
+    prepare_agent_environment,
     host_lookup_name,
     sha256_fingerprint,
 )
+
+
+def _agent_public_key(label: bytes) -> MagicMock:
+    key = MagicMock(spec=paramiko.PKey)
+    key.asbytes.return_value = b"ssh-test-public " + label
+    key.get_name.return_value = "ssh-ed25519" if label == b"destination" else "ssh-rsa"
+    return key
+
+
+class _Agent:
+    def __init__(self, keys: tuple[paramiko.PKey, ...]) -> None:
+        self.keys = keys
+        self.closed = False
+
+    def get_keys(self) -> tuple[paramiko.PKey, ...]:
+        return self.keys
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _AuthenticationTransport:
+    def __init__(self, accepted_key: paramiko.PKey) -> None:
+        self.accepted_key = accepted_key
+        self.offers: list[tuple[str, paramiko.PKey]] = []
+
+    def auth_publickey(self, username: str, key: paramiko.PKey) -> list[str]:
+        self.offers.append((username, key))
+        if key is not self.accepted_key:
+            raise paramiko.AuthenticationException("rejected")
+        return []
+
+    def is_authenticated(self) -> bool:
+        return bool(self.offers and self.offers[-1][1] is self.accepted_key)
 
 
 class SecurityTests(unittest.TestCase):
@@ -231,3 +271,186 @@ class SecurityTests(unittest.TestCase):
         self.assertTrue(unknown.event.is_set() and changed.event.is_set())
         self.assertEqual(unknown.result, TrustDecision.CANCEL)
         self.assertFalse(state.resolve(unknown.identifier, TrustDecision.TRUST_ONCE))
+
+
+class DestinationAgentAuthenticationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.gate_key = _agent_public_key(b"gate")
+        self.destination_rejected_key = _agent_public_key(b"destination-rejected")
+        self.destination_key = _agent_public_key(b"destination")
+        self.keys = (self.gate_key, self.destination_rejected_key, self.destination_key)
+
+    def _strategy(
+        self,
+        username: str,
+        role: str,
+        diagnostics: list[object],
+        agents: list[_Agent] | None = None,
+    ) -> IndependentAgentAuthStrategy:
+        def factory() -> _Agent:
+            agent = _Agent(self.keys)
+            if agents is not None:
+                agents.append(agent)
+            return agent
+
+        return IndependentAgentAuthStrategy(username, role, diagnostics.append, factory)
+
+    def test_gate_and_destination_independently_accept_different_agent_keys(self) -> None:
+        diagnostics: list[object] = []
+        agents: list[_Agent] = []
+        gate = self._strategy("sahmaddo", "Jump host", diagnostics, agents)
+        destination = self._strategy("clauberh", "Destination host", diagnostics, agents)
+        gate_transport = _AuthenticationTransport(self.gate_key)
+        destination_transport = _AuthenticationTransport(self.destination_key)
+
+        gate.authenticate(gate_transport)
+        destination.authenticate(destination_transport)
+
+        self.assertEqual(gate_transport.offers, [("sahmaddo", self.gate_key)])
+        self.assertEqual(
+            destination_transport.offers,
+            [
+                ("clauberh", self.gate_key),
+                ("clauberh", self.destination_rejected_key),
+                ("clauberh", self.destination_key),
+            ],
+        )
+        self.assertEqual(len(agents), 2)
+        self.assertIsNot(agents[0], agents[1])
+        self.assertTrue(all(agent.closed for agent in agents))
+
+    def test_rejected_first_destination_key_continues_to_next_identity(self) -> None:
+        diagnostics: list[object] = []
+        transport = _AuthenticationTransport(self.destination_key)
+        self._strategy("clauberh", "Destination host", diagnostics).authenticate(transport)
+
+        self.assertEqual([key for _username, key in transport.offers], list(self.keys))
+        self.assertEqual(
+            [event.fingerprint for event in diagnostics],
+            [sha256_fingerprint(key) for key in self.keys],
+        )
+        self.assertTrue(all(event.username == "clauberh" for event in diagnostics))
+        self.assertTrue(all(event.host_role == "Destination host" for event in diagnostics))
+
+    def test_clauberh_authentication_uses_immutable_session_snapshot(self) -> None:
+        profile = {
+            "id": "coaraci",
+            "name": "coaraci",
+            "host": "coaraci.ifi.unicamp.br",
+            "port": 22,
+            "user": "clauberh",
+            "auth_method": "agent",
+        }
+        record = SessionController().create_session(profile)
+        profile["user"] = "sahmaddo"
+        diagnostics: list[object] = []
+        transport = _AuthenticationTransport(self.destination_key)
+
+        self._strategy(record.profile_snapshot["user"], "Destination host", diagnostics).authenticate(transport)
+
+        self.assertEqual(record.profile_snapshot["user"], "clauberh")
+        self.assertEqual({username for username, _key in transport.offers}, {"clauberh"})
+
+    def test_simultaneous_jump_and_destination_authentication_stays_isolated(self) -> None:
+        jump_diagnostics: list[object] = []
+        destination_diagnostics: list[object] = []
+        jump_transport = _AuthenticationTransport(self.gate_key)
+        destination_transport = _AuthenticationTransport(self.destination_key)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            jump_result = pool.submit(
+                self._strategy("sahmaddo", "Jump host", jump_diagnostics).authenticate,
+                jump_transport,
+            )
+            destination_result = pool.submit(
+                self._strategy("clauberh", "Destination host", destination_diagnostics).authenticate,
+                destination_transport,
+            )
+            jump_result.result()
+            destination_result.result()
+
+        self.assertEqual({event.username for event in jump_diagnostics}, {"sahmaddo"})
+        self.assertEqual({event.username for event in destination_diagnostics}, {"clauberh"})
+        self.assertEqual(len(jump_diagnostics), 1)
+        self.assertEqual(len(destination_diagnostics), 3)
+
+    def test_agent_mode_never_loads_local_identity_files(self) -> None:
+        profile = {
+            "name": "coaraci",
+            "host": "coaraci.ifi.unicamp.br",
+            "port": 22,
+            "user": "clauberh",
+            "auth_method": "agent",
+        }
+        client = MagicMock()
+        client.get_transport.return_value = MagicMock()
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = SSHConnectionManager(KnownHostsStore(Path(temporary) / "known_hosts"), profile["host"], 22)
+            with patch("sshvault_security.paramiko.SSHClient", return_value=client):
+                manager.connect(profile, lambda _request: None)
+
+        kwargs = client.connect.call_args.kwargs
+        self.assertFalse(kwargs["allow_agent"])
+        self.assertFalse(kwargs["look_for_keys"])
+        self.assertNotIn("key_filename", kwargs)
+        self.assertIsInstance(kwargs["auth_strategy"], IndependentAgentAuthStrategy)
+
+
+class AgentEnvironmentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.required = _agent_public_key(b"required-ed25519")
+        self.required.get_name.return_value = "ssh-ed25519"
+
+    def test_desktop_launch_with_different_environment_selects_active_socket(self) -> None:
+        environment = {"SSH_AUTH_SOCK": "/stale/agent", "XDG_RUNTIME_DIR": "/run/user/1001"}
+        active = "/run/user/1001/gcr/ssh"
+        with (
+            patch("sshvault_security.os.path.exists", return_value=True),
+            patch(
+                "sshvault_security._read_agent_socket",
+                side_effect=[((), ""), ((self.required,), ""), ((self.required,), ""), ((), ""), ((), "")],
+            ),
+        ):
+            result = agent_environment_diagnostics(environment)
+        self.assertEqual(result["inherited_ssh_auth_sock"], "/stale/agent")
+        self.assertEqual(result["ssh_auth_sock"], active)
+        self.assertIn("stale", result["warning"])
+
+    def test_stale_socket_detection_reports_warning(self) -> None:
+        environment = {"SSH_AUTH_SOCK": "/stale/agent", "XDG_RUNTIME_DIR": "/run/user/1001"}
+        with (
+            patch("sshvault_security.os.path.exists", side_effect=lambda path: path == "/stale/agent"),
+            patch("sshvault_security._read_agent_socket", return_value=((), "AuthenticationException")),
+        ):
+            result = agent_environment_diagnostics(environment)
+        self.assertFalse(result["agent_socket_available"])
+        self.assertEqual(result["key_count"], 0)
+        self.assertIn("unavailable", result["warning"])
+
+    def test_correct_socket_selection_makes_required_ed25519_visible(self) -> None:
+        environment = {"SSH_AUTH_SOCK": "/stale/agent", "XDG_RUNTIME_DIR": "/run/user/1001"}
+        active = "/run/user/1001/keyring/ssh"
+        with (
+            patch("sshvault_security.os.path.exists", return_value=True),
+            patch(
+                "sshvault_security._read_agent_socket",
+                side_effect=[((), ""), ((), ""), ((self.required,), ""), ((), ""), ((), "")],
+            ),
+        ):
+            result = agent_environment_diagnostics(environment)
+        self.assertEqual(result["ssh_auth_sock"], active)
+        self.assertEqual(result["keys"][0]["fingerprint"], sha256_fingerprint(self.required))
+
+    def test_prepare_agent_environment_updates_process_socket(self) -> None:
+        environment = {"SSH_AUTH_SOCK": "/stale/agent", "XDG_RUNTIME_DIR": "/run/user/1001"}
+        active = "/run/user/1001/gcr/ssh"
+        with (
+            patch.dict("os.environ", environment, clear=True),
+            patch("sshvault_security.os.path.exists", return_value=True),
+            patch(
+                "sshvault_security._read_agent_socket",
+                side_effect=[((), ""), ((self.required,), ""), ((), ""), ((), ""), ((), "")],
+            ),
+        ):
+            prepare_agent_environment()
+            self.assertEqual(os.environ["SSH_AUTH_SOCK"], active)

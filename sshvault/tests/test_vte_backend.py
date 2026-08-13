@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+import subprocess
+from unittest.mock import Mock, patch
 
 from sshvault_core import (
     ProfileError,
+    SessionController,
+    SessionLifecycleState,
     VTEAvailability,
     VTETerminalBackend,
     build_native_ssh_argv,
@@ -93,18 +96,46 @@ class NativeVTEBackendTests(unittest.TestCase):
 
     def test_backend_never_claims_native_before_handshake(self) -> None:
         backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
-        self.assertEqual(backend.status, "Legacy terminal — VTE helper failed: helper exited early")
+        self.assertEqual(backend.status, "Native VTE unavailable: helper exited")
 
     def test_missing_helper_has_visible_fallback_reason(self) -> None:
         backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
         with patch.object(backend, "_helper_path", return_value=Path("/missing/helper.py")):
             self.assertFalse(backend.ensure_ready())
-        self.assertEqual(backend.status, "Legacy terminal — VTE helper failed: helper module missing")
+        self.assertEqual(backend.status, "Native VTE unavailable: helper module missing")
 
     def test_helper_script_is_present_in_the_project_for_wheel_packaging(self) -> None:
         helper = Path(__file__).resolve().parents[1] / "sshvault_vte_helper.py"
         self.assertTrue(helper.is_file())
-        self.assertIn("def probe()", helper.read_text(encoding="utf-8"))
+        source = helper.read_text(encoding="utf-8")
+        self.assertIn("def probe()", source)
+        self.assertNotIn("import paramiko", source)
+        self.assertNotIn("import sshvault_core", source)
+
+    def test_helper_failure_does_not_restart_or_disconnect_ssh(self) -> None:
+        controller = SessionController()
+        session = controller.create_session(self._profile())
+        session.state = SessionLifecycleState.CONNECTED
+        backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
+        backend._terminals = {"terminal": {"terminal_id": "terminal"}}
+        backend._process = Mock()
+        backend._process.poll.return_value = 1
+        with patch.object(backend, "_start") as start:
+            self.assertEqual(backend.list_terminals(), [])
+        start.assert_not_called()
+        self.assertEqual(backend.status, "Native VTE unavailable: helper exited")
+        self.assertIs(session.state, SessionLifecycleState.CONNECTED)
+
+    def test_close_reaps_helper_after_forced_kill(self) -> None:
+        backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("vte", 1), 0]
+        backend._process = process
+        backend.close()
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        self.assertEqual(process.wait.call_count, 2)
 
     def test_runtime_environment_includes_display_and_agent_variables(self) -> None:
         parent = {

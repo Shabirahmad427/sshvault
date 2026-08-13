@@ -14,6 +14,7 @@ from sshvault import (
     _ProfileSelectionModel,
 )
 from sshvault_core import VTEAvailability
+from sshvault_core import SessionLifecycleState
 
 
 class _Vault:
@@ -140,7 +141,56 @@ class OpeningInterfaceCleanupTests(unittest.TestCase):
         self.app.profile_dirty = False
         self.assertTrue(self.app._select_profile_from_rail("profile-id"))
         self.assertEqual(self.app.selected_profile_id, "profile-id")
+        self.assertFalse(self.app.profile_dirty)
+        self.assertIsInstance(self.app.working_profile["port"], int)
         self.assertEqual(len(self.app._session_controller.sessions), 0)
+
+    def test_switching_profiles_keeps_first_session_connected(self) -> None:
+        second = {
+            "id": "second-profile-id",
+            "name": "Second",
+            "host": "second.example",
+            "port": 22,
+            "user": "bob",
+            "auth_method": "agent",
+        }
+        self.app._vault.entries.append(second)
+        self.app._refresh_list()
+        first_record = self.app._session_controller.create_session(self.app._vault.entries[0])
+        first_record.state = SessionLifecycleState.CONNECTED
+        self.app._selected_session_id = first_record.session_id
+
+        self.assertTrue(self.app._select_profile_from_rail("second-profile-id"))
+
+        self.assertEqual(first_record.state, SessionLifecycleState.CONNECTED)
+        self.assertIsNone(self.app._selected_session_id)
+        self.assertEqual(self.app._connection_action_button.cget("text"), "Log in")
+        self.assertEqual(len(self.app._session_controller.sessions), 1)
+
+    def test_loading_connected_profiles_selects_each_own_session(self) -> None:
+        second = {
+            "id": "second-profile-id",
+            "name": "Second",
+            "host": "second.example",
+            "port": 22,
+            "user": "bob",
+            "auth_method": "agent",
+        }
+        self.app._vault.entries.append(second)
+        self.app._refresh_list()
+        first = self.app._session_controller.create_session(self.app._vault.entries[0])
+        second_record = self.app._session_controller.create_session(second)
+        first.state = SessionLifecycleState.CONNECTED
+        second_record.state = SessionLifecycleState.CONNECTED
+
+        self.assertTrue(self.app._select_profile_from_rail("profile-id"))
+        self.assertEqual(self.app._selected_session_id, first.session_id)
+        self.assertEqual(self.app._connection_action_button.cget("text"), "Log out")
+
+        self.assertTrue(self.app._select_profile_from_rail("second-profile-id"))
+        self.assertEqual(self.app._selected_session_id, second_record.session_id)
+        self.assertEqual(first.state, SessionLifecycleState.CONNECTED)
+        self.assertEqual(second_record.state, SessionLifecycleState.CONNECTED)
 
 
 if __name__ == "__main__":

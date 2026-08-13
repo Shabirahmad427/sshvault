@@ -13,7 +13,7 @@ import socket
 import tempfile
 import threading
 import queue
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterator, Sequence
 from datetime import datetime, timezone
 
 import paramiko
@@ -24,6 +24,9 @@ from sshvault_core import (
     connection_kwargs,
     ssh_runtime_preferences,
 )
+
+
+_AGENT_ENV_LOCK = threading.Lock()
 
 
 class TrustDecision(str, Enum):
@@ -115,6 +118,106 @@ class KnownHostsError(ProfileError):
     """Application known-host storage could not be safely used."""
 
 
+@dataclass(frozen=True)
+class AgentAuthenticationDiagnostic:
+    """Public-only details for one SSH-agent identity offer."""
+
+    host_role: str
+    username: str
+    fingerprint: str
+    key_count: int = 0
+    accepted_fingerprint: str = ""
+    rejection_category: str = ""
+
+    def sanitized_message(self) -> str:
+        return (
+            f"{self.host_role} agent authentication: username={self.username} "
+            f"agent_keys={self.key_count} offered_key={self.fingerprint} "
+            f"accepted_key={self.accepted_fingerprint or 'none'} "
+            f"rejection={self.rejection_category or 'none'}"
+        )
+
+
+def _agent_socket_candidates(environment: dict[str, str] | None = None) -> tuple[str, ...]:
+    """Return user-session agent sockets without guessing temporary paths."""
+    env = os.environ if environment is None else environment
+    runtime = str(env.get("XDG_RUNTIME_DIR", "")).strip()
+    candidates = [str(env.get("SSH_AUTH_SOCK", "")).strip()]
+    if runtime:
+        candidates.extend(
+            [
+                os.path.join(runtime, "gcr", "ssh"),
+                os.path.join(runtime, "keyring", "ssh"),
+                os.path.join(runtime, "keyring", ".ssh"),
+                os.path.join(runtime, "gnupg", "S.gpg-agent.ssh"),
+            ]
+        )
+    return tuple(dict.fromkeys(path for path in candidates if path))
+
+
+def _read_agent_socket(path: str) -> tuple[tuple[Any, ...], str]:
+    """Read only public agent metadata while temporarily selecting ``path``."""
+    previous = os.environ.get("SSH_AUTH_SOCK")
+    with _AGENT_ENV_LOCK:
+        os.environ["SSH_AUTH_SOCK"] = path
+        agent = None
+        try:
+            agent = paramiko.Agent()
+            keys = tuple(agent.get_keys())
+        except Exception as exc:
+            return (), type(exc).__name__
+        finally:
+            if agent is not None:
+                agent.close()
+            if previous is None:
+                os.environ.pop("SSH_AUTH_SOCK", None)
+            else:
+                os.environ["SSH_AUTH_SOCK"] = previous
+    return keys, ""
+
+
+def agent_environment_diagnostics(environment: dict[str, str] | None = None) -> dict[str, Any]:
+    """Return socket, public key fingerprints, and availability warnings."""
+    current = str((os.environ if environment is None else environment).get("SSH_AUTH_SOCK", "")).strip()
+    reports: list[tuple[str, tuple[Any, ...]]] = []
+    errors: dict[str, str] = {}
+    for candidate in _agent_socket_candidates(environment):
+        if not os.path.exists(candidate):
+            errors[candidate] = "missing socket"
+            continue
+        keys, error = _read_agent_socket(candidate)
+        if error:
+            errors[candidate] = error
+            continue
+        reports.append((candidate, keys))
+    selected = max(reports, key=lambda item: (len(item[1]), item[0] == current), default=(current, ()))
+    warning = ""
+    if not reports:
+        warning = "SSH agent socket is unavailable."
+    elif current and selected[0] != current:
+        warning = (
+            "The inherited SSH_AUTH_SOCK was stale or had fewer visible keys; selected an active user-session socket."
+        )
+    return {
+        "ssh_auth_sock": selected[0],
+        "inherited_ssh_auth_sock": current,
+        "agent_socket_available": bool(reports),
+        "key_count": len(selected[1]),
+        "keys": [{"type": key.get_name(), "fingerprint": sha256_fingerprint(key)} for key in selected[1]],
+        "warning": warning,
+        "socket_errors": errors,
+    }
+
+
+def prepare_agent_environment(environment: dict[str, str] | None = None) -> dict[str, Any]:
+    """Select the active user-session agent socket for subsequent Paramiko calls."""
+    diagnostics = agent_environment_diagnostics(environment)
+    selected = str(diagnostics["ssh_auth_sock"])
+    if selected and diagnostics["agent_socket_available"]:
+        os.environ["SSH_AUTH_SOCK"] = selected
+    return diagnostics
+
+
 def host_lookup_name(hostname: str, port: int) -> str:
     return hostname if port == 22 else f"[{hostname}]:{port}"
 
@@ -122,6 +225,66 @@ def host_lookup_name(hostname: str, port: int) -> str:
 def sha256_fingerprint(key: paramiko.PKey) -> str:
     digest = base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
     return f"SHA256:{digest}"
+
+
+class IndependentAgentAuthStrategy(paramiko.auth_strategy.AuthStrategy):
+    """Enumerate a fresh agent snapshot for exactly one SSH connection."""
+
+    def __init__(
+        self,
+        username: str,
+        host_role: str,
+        diagnose: Callable[[AgentAuthenticationDiagnostic], None],
+        agent_factory: Callable[[], Any] | None = None,
+    ) -> None:
+        super().__init__(ssh_config=paramiko.SSHConfig())
+        self.username = username
+        self.host_role = host_role
+        self._diagnose = diagnose
+        self._agent_factory = agent_factory
+        self._keys: tuple[paramiko.PKey, ...] = ()
+
+    def get_sources(self) -> Iterator[Any]:
+        return iter(())
+
+    def authenticate(self, transport: Any) -> Any:
+        factory = self._agent_factory or paramiko.Agent
+        agent = factory()
+        try:
+            # Materialize a connection-owned snapshot.  In particular, a
+            # jump host accepting one key does not select or cache that key
+            # for the destination connection.
+            self._keys = tuple(agent.get_keys())
+            key_count = len(self._keys)
+            for key in self._keys:
+                fingerprint = sha256_fingerprint(key)
+                try:
+                    transport.auth_publickey(self.username, key)
+                except paramiko.AuthenticationException as exc:
+                    self._diagnose(
+                        AgentAuthenticationDiagnostic(
+                            self.host_role,
+                            self.username,
+                            fingerprint,
+                            key_count,
+                            rejection_category=type(exc).__name__,
+                        )
+                    )
+                    continue
+                if transport.is_authenticated():
+                    self._diagnose(
+                        AgentAuthenticationDiagnostic(
+                            self.host_role,
+                            self.username,
+                            fingerprint,
+                            key_count,
+                            accepted_fingerprint=fingerprint,
+                        )
+                    )
+                    return None
+            raise paramiko.AuthenticationException(f"SSH agent authentication rejected all {key_count} identities")
+        finally:
+            agent.close()
 
 
 @dataclass(frozen=True)
@@ -337,6 +500,7 @@ class SSHConnectionManager:
     def __init__(self, known_hosts: KnownHostsStore, hostname: str, port: int) -> None:
         self.known_hosts, self.hostname, self.port = known_hosts, hostname, port
         self.last_runtime_preferences: SSHRuntimePreferences | None = None
+        self.agent_diagnostics: list[AgentAuthenticationDiagnostic] = []
 
     def connect(
         self,
@@ -344,6 +508,7 @@ class SSHConnectionManager:
         decide_trust: Callable[[HostKeyTrustRequest], TrustDecision],
         password: str | None = None,
         extra_kwargs: dict[str, Any] | None = None,
+        diagnose_agent_key: Callable[[AgentAuthenticationDiagnostic], None] | None = None,
     ) -> paramiko.SSHClient:
         client = paramiko.SSHClient()
         self.known_hosts.load()
@@ -357,6 +522,25 @@ class SSHConnectionManager:
             client.close()
             raise
         kwargs["compress"] = runtime.compression
+        if profile.get("auth_method") == "agent":
+            prepare_agent_environment()
+            self.agent_diagnostics = []
+
+            def record_diagnostic(event: AgentAuthenticationDiagnostic) -> None:
+                self.agent_diagnostics.append(event)
+                if diagnose_agent_key is not None:
+                    diagnose_agent_key(event)
+
+            # Bypass SSHClient's legacy implicit authentication sequence so
+            # this connection owns a complete, fresh agent-key enumeration.
+            # Explicitly keep filesystem key discovery disabled as well.
+            kwargs["allow_agent"] = False
+            kwargs["look_for_keys"] = False
+            kwargs["auth_strategy"] = IndependentAgentAuthStrategy(
+                str(profile["user"]),
+                str(profile.get("host_role", "Destination host")),
+                record_diagnostic,
+            )
         if runtime.algorithm_preferences:
             kwargs["transport_factory"] = preferred_transport_factory(runtime)
         if extra_kwargs:

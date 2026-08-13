@@ -55,6 +55,11 @@ class SFTPTransferQueueTests(unittest.TestCase):
         self.assertEqual(row.eta, "8s")
         self.assertEqual(row.status, TransferState.DOWNLOADING)
 
+    def test_pending_rows_show_explicit_speed_and_eta_state(self) -> None:
+        row = sftp_transfer_queue_rows([TransferItem("source", "target", "Upload", total=10)])[0]
+        self.assertEqual(row.speed, "0 B/s")
+        self.assertEqual(row.eta, "calculating…")
+
     def test_pause_resume_and_cancel(self) -> None:
         scheduler = TransferScheduler(None)
         try:
