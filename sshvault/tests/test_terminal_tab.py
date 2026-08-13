@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import Mock
+
+from sshvault import ConnectionTab
 
 from sshvault_core import (
     SessionController,
@@ -13,6 +16,7 @@ from sshvault_core import (
     build_native_ssh_argv,
     default_profile_sections,
     terminal_key_sequence,
+    terminal_launch_settings,
     validate_profile,
 )
 
@@ -99,6 +103,93 @@ class TerminalTabContractTests(unittest.TestCase):
     def test_native_selection_shortcuts_do_not_turn_ctrl_c_into_copy(self) -> None:
         self.assertEqual(terminal_key_sequence("c", "c", 0x0004), "\x03")
         self.assertEqual(terminal_key_sequence("Insert", "Insert", 0x0004), "\x1b[2~")
+
+    def test_backend_selection_respects_native_capability(self) -> None:
+        profile = {"terminal_options": {"backend": "Legacy"}}
+        self.assertEqual(terminal_launch_settings(profile, True).backend, "legacy")
+        profile["terminal_options"]["backend"] = "Native VTE"
+        self.assertEqual(terminal_launch_settings(profile, True).backend, "native")
+        fallback = terminal_launch_settings(profile, False)
+        self.assertEqual(fallback.backend, "legacy")
+        self.assertIn("Native VTE is unavailable; using Legacy terminal.", fallback.warnings)
+
+    def test_terminal_appearance_is_normalized_for_vte(self) -> None:
+        settings = terminal_launch_settings(
+            {
+                "terminal_options": {
+                    "font": "Fira Code",
+                    "font_size": 13,
+                    "cursor_shape": "I-Beam",
+                    "cursor_blink": False,
+                    "foreground": "#abcdef",
+                    "background": "#123456",
+                }
+            },
+            True,
+        )
+        self.assertEqual(
+            {
+                key: settings.options[key]
+                for key in ("font", "font_size", "cursor_shape", "cursor_blink", "foreground", "background")
+            },
+            {
+                "font": "Fira Code",
+                "font_size": 13,
+                "cursor_shape": "I-Beam",
+                "cursor_blink": False,
+                "foreground": "#abcdef",
+                "background": "#123456",
+            },
+        )
+
+    def test_invalid_terminal_settings_fall_back_with_warning(self) -> None:
+        settings = terminal_launch_settings(
+            {
+                "terminal_options": {
+                    "backend": "unknown",
+                    "terminal_type": "bad term",
+                    "font": "",
+                    "font_size": "huge",
+                    "cursor_shape": "arrow",
+                    "foreground": "red",
+                    "background": "none",
+                }
+            },
+            True,
+        )
+        self.assertEqual(settings.backend, "native")
+        self.assertEqual(settings.options["terminal_type"], "xterm-256color")
+        self.assertEqual(settings.options["font"], "Monospace")
+        self.assertEqual(settings.options["font_size"], 10)
+        self.assertEqual(settings.options["cursor_shape"], "Block")
+        self.assertGreaterEqual(len(settings.warnings), 6)
+
+    def test_two_session_snapshots_keep_independent_terminal_settings(self) -> None:
+        controller = SessionController()
+        sahmaddo_profile = {
+            "id": "sahmaddo",
+            "host": "coaraci.ifi.unicamp.br",
+            "user": "sahmaddo",
+            "terminal_options": {"font": "Monospace", "foreground": "#ffffff", "terminal_type": "screen"},
+        }
+        clauberh_profile = {
+            "id": "clauberh",
+            "host": "coaraci.ifi.unicamp.br",
+            "user": "clauberh",
+            "terminal_options": {"font": "Fira Code", "foreground": "#00ff00", "terminal_type": "vt100"},
+        }
+        sahmaddo = controller.create_session(sahmaddo_profile)
+        clauberh = controller.create_session(clauberh_profile)
+        first = terminal_launch_settings(sahmaddo.profile_snapshot, True)
+        second = terminal_launch_settings(clauberh.profile_snapshot, True)
+        sahmaddo_profile["terminal_options"]["font"] = "Edited Later"
+        self.assertEqual((first.options["font"], first.options["terminal_type"]), ("Monospace", "screen"))
+        self.assertEqual((second.options["font"], second.options["terminal_type"]), ("Fira Code", "vt100"))
+
+    def test_legacy_initial_command_is_sent_once(self) -> None:
+        channel = Mock()
+        ConnectionTab._run_terminal_initial_command(channel, " whoami ")
+        channel.send.assert_called_once_with("whoami\n")
 
 
 if __name__ == "__main__":

@@ -38,11 +38,20 @@ from sshvault_security import (
     request_agent_forwarding,
 )
 from sshvault_security import SecurityRequestQueue
+from sshvault_sftp_server import (
+    BuiltinSFTPServerConfig,
+    BuiltinSFTPServerRuntime,
+    SERVER_FAILED,
+    SERVER_RUNNING,
+)
 from sshvault_core import (
     ProfileError,
     ProfileSidebarState,
     ProfileStore,
     SecretStore,
+    SessionKeepaliveState,
+    HostKeySessionStatus,
+    HOST_KEY_POLICY_DISPLAY,
     WorkspaceChromeState,
     application_shortcut_allowed,
     validate_profile,
@@ -50,6 +59,7 @@ from sshvault_core import (
     SFTPPanelState,
     TerminalPanelState,
     terminal_key_sequence,
+    terminal_launch_settings,
     VTETerminalBackend,
     detect_vte_backend,
     session_resource_title,
@@ -87,6 +97,8 @@ from sshvault_core import (
     ImportDecisionModel,
     build_import_preview,
     default_profile_sections,
+    proxy_jump_target,
+    validate_proxy_jump_options,
     friendly_connection_error,
     redact_secrets,
     OPTIONS_GROUPS,
@@ -178,6 +190,10 @@ LOG_FILE = CONFIG_DIR / "sshvault.log"
 SESSION_FILE = CONFIG_DIR / "session.json"
 RECORDINGS_DIR = CONFIG_DIR / "recordings"
 KNOWN_HOSTS_FILE = CONFIG_DIR / "known_hosts"
+LOGIN_AUTH_METHODS = {"SSH Agent": "agent", "Private Key": "key", "Password": "password"}
+LOGIN_AUTH_LABELS = {value: label for label, value in LOGIN_AUTH_METHODS.items()}
+PROXY_AUTH_METHODS = {"SSH Agent": "agent", "Password": "password"}
+PROXY_AUTH_LABELS = {value: label for label, value in PROXY_AUTH_METHODS.items()}
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 BACKUPS_DIR = CONFIG_DIR / "backups"
 SFTP_SERVER_CONFIG_FILE = CONFIG_DIR / "sftp-server.json"
@@ -503,6 +519,8 @@ class TerminalWidget(tk.Frame):
         self._mouse_sgr = False
         self._cursor_shape = "block"
         self._cursor_blink = True
+        self._default_foreground = TEXT
+        self._default_background = _TERM_BG
         self._input_mode_tail = ""
         self._find_matches: list[str] = []
         self._find_index = -1
@@ -556,6 +574,21 @@ class TerminalWidget(tk.Frame):
         # Tk is single-threaded. The SSH worker updates only the terminal
         # model; this timer is the sole path that touches Tk widgets.
         self.after(16, self._render_loop)
+
+    def apply_terminal_options(self, options: dict) -> None:
+        """Capture appearance for this legacy terminal without global mutation."""
+        self._default_foreground = str(options.get("foreground", TEXT))
+        self._default_background = str(options.get("background", _TERM_BG))
+        cursor = str(options.get("cursor_shape", "Block"))
+        self._cursor_shape = {"I-Beam": "bar", "Underline": "underline"}.get(cursor, "block")
+        self._cursor_blink = bool(options.get("cursor_blink", True))
+        self._text.configure(
+            bg=self._default_background,
+            fg=self._default_foreground,
+            insertbackground=self._default_foreground,
+            font=(str(options.get("font", "Monospace")), int(options.get("font_size", 10))),
+        )
+        self._scrollbar.configure(troughcolor=self._default_background)
 
     # ── output pipeline ─────────────────────────────────────────────────
     def write(self, text: str, tag: str = ""):
@@ -739,8 +772,8 @@ class TerminalWidget(tk.Frame):
             pass
 
     def _style_tag(self, ch):
-        fg = _terminal_color(ch.fg, TEXT)
-        bg = _terminal_color(ch.bg, _TERM_BG)
+        fg = _terminal_color(ch.fg, self._default_foreground)
+        bg = _terminal_color(ch.bg, self._default_background)
         if ch.reverse:
             fg, bg = bg, fg
         if getattr(ch, "blink", False):
@@ -1492,6 +1525,147 @@ class SFTPTransferManagerWindow(tk.Toplevel):
                 }
             )
         )
+
+
+class SessionTransferManagerWindow(tk.Toplevel):
+    """Transfer queue and controls bound permanently to one session id."""
+
+    COLUMNS = ("file", "direction", "source", "destination", "progress", "speed", "eta", "status", "error")
+
+    def __init__(self, app, record, scheduler, on_close):
+        super().__init__(app)
+        self.session_id = record.session_id
+        self.scheduler = scheduler
+        self._on_close = on_close
+        self._refresh_after = None
+        self.title(session_resource_title("Transfer Manager", record.profile_snapshot))
+        self.geometry("1000x400")
+        self.minsize(760, 260)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+        frame = ttk.Frame(self, padding=8)
+        frame.pack(fill="both", expand=True)
+        self.summary = tk.StringVar()
+        ttk.Label(frame, textvariable=self.summary).pack(anchor="w", pady=(0, 6))
+        self.tree = ttk.Treeview(frame, columns=self.COLUMNS, show="headings", selectmode="browse")
+        for column in self.COLUMNS:
+            self.tree.heading(column, text=column.replace("_", " ").title())
+            self.tree.column(column, width=170 if column in {"source", "destination", "error"} else 90)
+        self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<<TreeviewSelect>>", lambda _event: self._update_actions())
+
+        actions = ttk.Frame(frame)
+        actions.pack(fill="x", pady=(6, 0))
+        self.buttons = {}
+        for label, action in (
+            ("Pause", "pause"),
+            ("Resume", "resume"),
+            ("Cancel", "cancel"),
+            ("Retry", "retry"),
+            ("Remove Completed", "remove_completed"),
+        ):
+            button = ttk.Button(actions, text=label, command=lambda name=action: self._act(name))
+            button.pack(side="left", padx=(0, 4))
+            self.buttons[label] = button
+        self.refresh()
+
+    @staticmethod
+    def items_for_session(scheduler, session_id: str) -> list[TransferItem]:
+        return [item for item in scheduler.items if item.session_id == session_id]
+
+    @classmethod
+    def apply_action(cls, scheduler, session_id: str, action: str, item_id: str | None = None) -> bool:
+        if action == "remove_completed":
+            removed = False
+            for item in list(cls.items_for_session(scheduler, session_id)):
+                if item.status == TransferState.COMPLETED:
+                    removed = scheduler.remove(item.item_id) or removed
+            return removed
+        item = scheduler.get(item_id) if item_id is not None else None
+        if item is None or item.session_id != session_id or action not in {"pause", "resume", "cancel", "retry"}:
+            return False
+        return bool(getattr(scheduler, action)(item.item_id))
+
+    def _selected_item(self):
+        selected = self.tree.selection()
+        return self.scheduler.get(selected[0]) if len(selected) == 1 else None
+
+    def _act(self, action: str) -> None:
+        selected = self._selected_item()
+        self.apply_action(
+            self.scheduler,
+            self.session_id,
+            action,
+            selected.item_id if selected is not None else None,
+        )
+        self.refresh()
+
+    def _update_actions(self) -> None:
+        items = self.items_for_session(self.scheduler, self.session_id)
+        selected = self._selected_item()
+        if selected is not None and selected.session_id != self.session_id:
+            selected = None
+        states = sftp_transfer_control_states(selected, items)
+        for label, key in (
+            ("Pause", "pause"),
+            ("Resume", "resume"),
+            ("Cancel", "cancel"),
+            ("Retry", "retry"),
+            ("Remove Completed", "remove_completed"),
+        ):
+            self.buttons[label].configure(state="normal" if states[key] else "disabled")
+
+    def refresh(self) -> None:
+        selected = set(self.tree.selection())
+        self.tree.delete(*self.tree.get_children())
+        items = self.items_for_session(self.scheduler, self.session_id)
+        for item, row in zip(items, sftp_transfer_queue_rows(items), strict=True):
+            self.tree.insert(
+                "",
+                "end",
+                iid=item.item_id,
+                values=(
+                    row.file,
+                    row.direction,
+                    item.source,
+                    item.target,
+                    row.progress,
+                    row.speed,
+                    row.eta,
+                    row.status,
+                    item.error,
+                ),
+            )
+        self.tree.selection_set([item_id for item_id in selected if self.tree.exists(item_id)])
+        running_states = {
+            TransferState.PREPARING,
+            TransferState.TRANSFERRING,
+            TransferState.DOWNLOADING,
+            TransferState.RESUMING,
+            TransferState.VERIFYING,
+        }
+        queued = sum(item.status == TransferState.PENDING for item in items)
+        running = sum(item.status in running_states for item in items)
+        paused = sum(item.status == TransferState.PAUSED for item in items)
+        failed = sum(item.status == TransferState.FAILED for item in items)
+        completed = sum(item.status == TransferState.COMPLETED for item in items)
+        self.summary.set(
+            f"Queued: {queued}   Running: {running}   Paused: {paused}   Failed: {failed}   Completed: {completed}"
+        )
+        self._update_actions()
+        self._refresh_after = self.after(250, self.refresh)
+
+    def show(self) -> None:
+        self.deiconify()
+        self.lift()
+        self.focus_set()
+
+    def close(self) -> None:
+        if self._refresh_after is not None:
+            self.after_cancel(self._refresh_after)
+            self._refresh_after = None
+        self._on_close(self.session_id)
+        self.destroy()
 
 
 class SFTPPanel(tk.Frame):
@@ -2816,9 +2990,7 @@ class SFTPPanel(tk.Frame):
         timeout_setter = getattr(worker, "set_operation_timeout", None)
         transfer_manager = getattr(self, "_transfer_manager", None)
         if callable(timeout_setter) and transfer_manager is not None:
-            timeout_setter(
-                SFTPTransferRouter._large_file_timeout(total, transfer_manager.operation_timeout)
-            )
+            timeout_setter(SFTPTransferRouter._large_file_timeout(total, transfer_manager.operation_timeout))
         local.parent.mkdir(parents=True, exist_ok=True)
         plan = inspect_download_resume(
             local,
@@ -2937,8 +3109,7 @@ class SFTPPanel(tk.Frame):
                 pass
             failure = SFTPTransferRouter._channel_failure(exc)
             reconnects = sum(
-                diagnostic in {"SFTP channel timeout", "Connection interrupted"}
-                for diagnostic in item.diagnostics
+                diagnostic in {"SFTP channel timeout", "Connection interrupted"} for diagnostic in item.diagnostics
             )
             if failure is not None:
                 item.diagnostics.append(failure)
@@ -4178,10 +4349,11 @@ class KeyGenDialog(tk.Toplevel):
 
 
 class SFTPServerSettingsDialog(tk.Toplevel):
-    """Persist safe local-server settings; starting a listener remains explicit."""
+    """Configure and control the application-owned built-in SFTP listener."""
 
-    def __init__(self, parent):
+    def __init__(self, parent, runtime: BuiltinSFTPServerRuntime):
         super().__init__(parent, bg=BG)
+        self._runtime = runtime
         self.title("Built-in SFTP Server Settings")
         self.resizable(False, False)
         try:
@@ -4216,7 +4388,7 @@ class SFTPServerSettingsDialog(tk.Toplevel):
                 insertbackground=TEXT,
                 relief="flat",
             ).grid(row=row, column=1, padx=8, pady=4)
-        tk.Label(form, text="Password:", bg=BG, fg=MUTED, font=FONT).grid(row=4, column=0, sticky="e", pady=4)
+        tk.Label(form, text="Runtime password:", bg=BG, fg=MUTED, font=FONT).grid(row=4, column=0, sticky="e", pady=4)
         tk.Entry(
             form,
             textvariable=self._password,
@@ -4230,41 +4402,137 @@ class SFTPServerSettingsDialog(tk.Toplevel):
         ).grid(row=4, column=1, padx=8, pady=4)
         tk.Label(
             self,
-            text="SFTP only; no shell or port forwarding. Defaults bind only to localhost.",
+            text="SFTP only; no shell or port forwarding. The runtime password is never saved.",
             bg=BG,
             fg=YELLOW,
             font=FONT,
         ).pack(padx=16, pady=(0, 8))
+        self._status_var = tk.StringVar()
+        self._status_label = tk.Label(self, textvariable=self._status_var, bg=BG, fg=MUTED, font=FONT_B)
+        self._status_label.pack(padx=16, pady=(0, 8))
+        actions = tk.Frame(self, bg=BG)
+        actions.pack(pady=(0, 12))
         tk.Button(
-            self, text="Save settings", command=self._save, bg=ACCENT, fg=BG, font=FONT, relief="flat", padx=12
-        ).pack(pady=(0, 12))
+            actions, text="Save settings", command=self._save, bg=ACCENT, fg=BG, font=FONT, relief="flat", padx=12
+        ).pack(side="left", padx=4)
+        self._start_button = tk.Button(
+            actions, text="Start server", command=self._start, bg=GREEN, fg=BG, font=FONT, relief="flat", padx=12
+        )
+        self._start_button.pack(side="left", padx=4)
+        self._stop_button = tk.Button(
+            actions, text="Stop server", command=self._stop, bg=RED, fg=BG, font=FONT, relief="flat", padx=12
+        )
+        self._stop_button.pack(side="left", padx=4)
+        self._refresh_status()
         self.grab_set()
 
-    def _save(self):
+    def _config_from_form(self) -> dict[str, object]:
         try:
             port = int(self._vars["port"].get())
             if not 1 <= port <= 65535:
                 raise ValueError
-        except ValueError:
-            messagebox.showerror("SFTP server", "Port must be between 1 and 65535.", parent=self)
-            return
+        except ValueError as exc:
+            raise ValueError("Port must be between 1 and 65535.") from exc
         root = Path(self._vars["root"].get()).expanduser()
         root.mkdir(parents=True, exist_ok=True)
-        config = {key: var.get().strip() for key, var in self._vars.items()}
+        config: dict[str, object] = {key: var.get().strip() for key, var in self._vars.items()}
         config["port"] = port
-        # Password storage is intentionally deferred until an encrypted local
-        # secret store is available; never write it into the JSON vault.
+        return config
+
+    def _save(self) -> None:
+        try:
+            config = self._config_from_form()
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("SFTP server", str(exc), parent=self)
+            return
         SFTP_SERVER_CONFIG_FILE.write_text(json.dumps(config, indent=2))
-        log(f"Saved built-in SFTP server settings for {config['listen_host']}:{port}")
+        log(f"Saved built-in SFTP server settings for {config['listen_host']}:{config['port']}")
         self.destroy()
+
+    def _start(self) -> None:
+        try:
+            config_data = self._config_from_form()
+            config = BuiltinSFTPServerConfig.from_mapping(config_data)
+            SFTP_SERVER_CONFIG_FILE.write_text(json.dumps(config_data, indent=2))
+            self._runtime.start(config, self._password.get())
+            log(f"Started built-in SFTP server on {config.listen_host}:{config.port}")
+        except (OSError, RuntimeError, ValueError) as exc:
+            messagebox.showerror("SFTP server", str(exc), parent=self)
+        self._render_status()
+
+    def _stop(self) -> None:
+        self._runtime.stop()
+        log("Stopped built-in SFTP server")
+        self._render_status()
+
+    def _render_status(self) -> None:
+        status = self._runtime.status
+        detail = f": {self._runtime.error}" if status == SERVER_FAILED and self._runtime.error else ""
+        self._status_var.set(f"Status: {status}{detail}")
+        self._status_label.configure(
+            fg=GREEN if status == SERVER_RUNNING else RED if status == SERVER_FAILED else MUTED
+        )
+        self._start_button.configure(state="disabled" if status == SERVER_RUNNING else "normal")
+        self._stop_button.configure(state="normal" if self._runtime.has_live_resources else "disabled")
+
+    def _refresh_status(self) -> None:
+        if not self.winfo_exists():
+            return
+        self._render_status()
+        self.after(250, self._refresh_status)
 
 
 # ── Connection info panel ────────────────────────────────────────────────────
 class ConnectionInfoPanel(tk.Frame):
-    def __init__(self, parent, client, **kw):
+    def __init__(self, parent, client, profile=None, state_provider=None, **kw):
         super().__init__(parent, bg=BG, **kw)
         self._client = client
+        self._profile = dict(profile or {})
+        self._state_provider = state_provider or (lambda: "connected" if client else "disconnected")
         self._build()
+
+    @staticmethod
+    def connection_details(client, profile: dict, session_state: object) -> dict[str, str]:
+        state = getattr(session_state, "value", session_state)
+        details = {
+            "Session state": str(state or "unknown").replace("_", " ").title(),
+            "Host": str(profile.get("host", "")),
+            "User": str(profile.get("user", "")),
+            "Transport status": "Unavailable",
+        }
+        if client is None:
+            return details
+        try:
+            transport = client.get_transport()
+            if transport is None:
+                return details
+            active = getattr(transport, "is_active", None)
+            details["Transport status"] = "Active" if not callable(active) or active() else "Inactive"
+            negotiated = {
+                "Cipher": getattr(transport, "local_cipher", None),
+                "MAC": getattr(transport, "local_mac", None),
+                "Compression": getattr(transport, "local_compression", None),
+                "Server version": getattr(transport, "remote_version", None),
+            }
+            try:
+                key = transport.get_remote_server_key()
+                negotiated["Server host key"] = key.get_name()
+                negotiated["Host key fingerprint"] = key.get_fingerprint().hex(":")
+            except (AttributeError, OSError):
+                pass
+            details.update({name: str(value) for name, value in negotiated.items() if value not in (None, "")})
+        except Exception as exc:
+            details["Transport status"] = f"Unavailable ({redact_secrets(str(exc))})"
+        return details
+
+    def rebind(self, client, profile=None, state_provider=None) -> None:
+        """Replace only this panel's session backend and refresh in place."""
+        self._client = client
+        if profile is not None:
+            self._profile = dict(profile)
+        if state_provider is not None:
+            self._state_provider = state_provider
+        self._refresh()
 
     def _build(self):
         tk.Label(self, text="Connection Info", bg=BG, fg=ACCENT, font=FONT_B).pack(anchor="w", padx=8, pady=6)
@@ -4279,20 +4547,11 @@ class ConnectionInfoPanel(tk.Frame):
         self._text.configure(state="normal")
         self._text.delete("1.0", "end")
         try:
-            t = self._client.get_transport()
-            if t:
-                info = {
-                    "Cipher": t.local_cipher,
-                    "MAC": t.local_mac,
-                    "Compression": t.local_compression,
-                    "Server version": t.remote_version,
-                    "Server host key": t.get_remote_server_key().get_name(),
-                    "Host key fingerprint": t.get_remote_server_key().get_fingerprint().hex(":"),
-                }
-                for k, v in info.items():
-                    self._text.insert("end", f"{k:<24}: {v}\n")
+            info = self.connection_details(self._client, self._profile, self._state_provider())
+            for key, value in info.items():
+                self._text.insert("end", f"{key:<24}: {value}\n")
         except Exception as e:
-            self._text.insert("end", f"Error: {e}\n")
+            self._text.insert("end", f"Error: {redact_secrets(str(e))}\n")
         self._text.configure(state="disabled")
 
 
@@ -4531,7 +4790,18 @@ class ConnectionTab(tk.Frame):
         self._reconnect_controller = ReconnectController(
             reconnect_options, self._schedule_reconnect, self._reconnect_attempt
         )
+        keepalive = ssh_runtime_preferences(entry)
+        self._keepalive_interval = keepalive.keepalive_interval
+        self._keepalive_state = SessionKeepaliveState(
+            session_id or "",
+            keepalive.maximum_missed_keepalives,
+        )
+        self._keepalive_generation = 0
+        self._keepalive_after_id = None
+        self._keepalive_probe = None
         self._startup_actions = StartupActionCoordinator()
+        self._services_started_generation: int | None = None
+        self._intentionally_stopped_services: set[str] = set()
         self._sftp_opening = False
         self._sftp_open_thread = None
         self._trust_broker = TrustDecisionBroker(self)
@@ -4563,11 +4833,108 @@ class ConnectionTab(tk.Frame):
         self._connect(reconnecting=True)
         return True
 
-    def _on_connection_lost(self, generation):
+    def _on_connection_lost(self, generation, message="Connection lost; reconnect scheduled."):
         if generation != self._session_generation or self._workspace_state.status != "connected":
             return
-        self._set_workspace_status("failed", "Connection lost; reconnect scheduled.")
+        app = self.winfo_toplevel() if hasattr(self, "winfo_toplevel") else None
+        session_id = getattr(self, "session_id", None)
+        if session_id and hasattr(app, "_suspend_sftp_resources_for_reconnect"):
+            app._suspend_sftp_resources_for_reconnect(session_id)
+        self._set_workspace_status("failed", message)
         self._reconnect_controller.unexpected_loss(generation)
+
+    def _stop_keepalive_monitor(self, *, reset: bool = True) -> None:
+        self._keepalive_generation += 1
+        after_id, self._keepalive_after_id = self._keepalive_after_id, None
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except (RuntimeError, tk.TclError):
+                pass
+        self._keepalive_probe = None
+        if reset:
+            self._keepalive_state.reset()
+
+    def _schedule_keepalive_tick(self, monitor_generation: int, session_generation: int) -> None:
+        if self._keepalive_interval <= 0 or monitor_generation != self._keepalive_generation:
+            return
+        try:
+            self._keepalive_after_id = self.after(
+                self._keepalive_interval * 1000,
+                lambda: self._keepalive_tick(monitor_generation, session_generation),
+            )
+        except (RuntimeError, tk.TclError):
+            self._keepalive_after_id = None
+
+    def _record_keepalive_result(self, successful: bool, session_generation: int) -> bool:
+        if session_generation != self._session_generation or self._workspace_state.status != "connected":
+            return False
+        threshold_reached = self._keepalive_state.record(successful)
+        if threshold_reached:
+            self._keepalive_generation += 1
+            self._keepalive_after_id = None
+            self._keepalive_probe = None
+            self._on_connection_lost(
+                session_generation,
+                "Keepalive responses missed; connection recovery started.",
+            )
+        return threshold_reached
+
+    def _keepalive_tick(self, monitor_generation: int, session_generation: int) -> None:
+        self._keepalive_after_id = None
+        if (
+            monitor_generation != self._keepalive_generation
+            or session_generation != self._session_generation
+            or self._workspace_state.status != "connected"
+        ):
+            return
+        pending = self._keepalive_probe
+        if pending is not None:
+            completed, result = pending
+            if completed.is_set():
+                self._keepalive_probe = None
+                failed = self._record_keepalive_result(bool(result.get("successful")), session_generation)
+            else:
+                failed = self._record_keepalive_result(False, session_generation)
+            if failed:
+                return
+        if self._keepalive_probe is None:
+            client = self._client
+            transport = client.get_transport() if client is not None else None
+            if transport is None:
+                if self._record_keepalive_result(False, session_generation):
+                    return
+            else:
+                completed = threading.Event()
+                result = {"successful": False}
+                self._keepalive_probe = (completed, result)
+
+                def probe() -> None:
+                    try:
+                        response = transport.global_request("keepalive@openssh.com", wait=True)
+                        active_check = getattr(transport, "is_active", None)
+                        active = bool(active_check()) if callable(active_check) else bool(active_check)
+                        result["successful"] = bool(response) if isinstance(response, bool) else active
+                    except Exception:
+                        result["successful"] = False
+                    finally:
+                        completed.set()
+
+                threading.Thread(target=probe, daemon=True, name="sshvault-keepalive-probe").start()
+        self._schedule_keepalive_tick(monitor_generation, session_generation)
+
+    def _start_keepalive_monitor(self, session_generation: int) -> None:
+        self._stop_keepalive_monitor()
+        runtime = ssh_runtime_preferences(self._session_profile_snapshot())
+        self._keepalive_interval = runtime.keepalive_interval
+        self._keepalive_state = SessionKeepaliveState(
+            self.session_id or "",
+            runtime.maximum_missed_keepalives,
+        )
+        if self._keepalive_interval <= 0:
+            return
+        monitor_generation = self._keepalive_generation
+        self._schedule_keepalive_tick(monitor_generation, session_generation)
 
     def _cancel_reconnect(self):
         self._reconnect_controller.cancel()
@@ -4575,6 +4942,10 @@ class ConnectionTab(tk.Frame):
     def _reconnect_now(self):
         # An explicit user reconnect starts a fresh generation even after a
         # prior manual logout cancelled automatic reconnect scheduling.
+        app = self.winfo_toplevel() if hasattr(self, "winfo_toplevel") else None
+        session_id = getattr(self, "session_id", None)
+        if session_id and hasattr(app, "_suspend_sftp_resources_for_reconnect"):
+            app._suspend_sftp_resources_for_reconnect(session_id)
         self._reconnect_controller.new_session()
         self._reconnect_controller.reconnect_now()
 
@@ -4771,6 +5142,11 @@ class ConnectionTab(tk.Frame):
 
     def _create_terminal_tab(self, select=True):
         terminal = TerminalWidget(self._nb)
+        settings = terminal_launch_settings(
+            self._owned_session_profile_snapshot(),
+            self._vte_availability.available,
+        )
+        terminal.apply_terminal_options(settings.options)
         self._terminals.append(terminal)
         label = "Terminal" if len(self._terminals) == 1 else f"Terminal {len(self._terminals)}"
         self._nb.add(terminal, text=label)
@@ -4836,12 +5212,11 @@ class ConnectionTab(tk.Frame):
             except (RuntimeError, tk.TclError):
                 pass
 
+        manager = None
         try:
             session_snapshot = self._session_profile_snapshot()
             secure_profile = dict(session_snapshot)
-            secure_profile["auth_method"] = (
-                "key" if session_snapshot.get("key_path") else "password" if self._entry.get("password") else "agent"
-            )
+            secure_profile["auth_method"] = str(session_snapshot.get("auth_method", "agent"))
             secure_profile.setdefault("timeout", 15)
             secure_profile.setdefault("compression", False)
             secure_profile["host_role"] = "Destination host"
@@ -4865,6 +5240,9 @@ class ConnectionTab(tk.Frame):
                 extra,
                 self._report_agent_authentication,
             )
+            verification = getattr(manager, "last_host_key_verification", None)
+            if verification is not None:
+                self._record_host_key_verification(verification)
             if generation != self._session_generation:
                 client.close()
                 if self._proxy_context:
@@ -4877,6 +5255,9 @@ class ConnectionTab(tk.Frame):
             dispatch(lambda: self._on_connected(generation))
             log(f"Connected: {self._entry.get('user')}@{self._entry.get('host')}")
         except UnknownHostCancelled:
+            verification = getattr(manager, "last_host_key_verification", None)
+            if verification is not None:
+                self._record_host_key_verification(verification)
             if self._proxy_context:
                 self._proxy_context.close()
                 self._proxy_context = None
@@ -4900,6 +5281,7 @@ class ConnectionTab(tk.Frame):
                 self._proxy_context.close()
                 self._proxy_context = None
             request = manager.changed_request(secure_profile, e)
+            self._record_changed_host_key(request)
             self._trust_broker.warn_changed_key(request)
             dispatch(
                 lambda: self._set_workspace_status("failed", "Connection blocked because the server identity changed.")
@@ -4919,13 +5301,53 @@ class ConnectionTab(tk.Frame):
         except (RuntimeError, tk.TclError):
             pass
 
+    def _record_host_key_verification(self, status: HostKeySessionStatus) -> None:
+        """Store only public host-key identity on this session record."""
+        if self._session_controller is None or not self.session_id:
+            return
+        self._session_controller.record_host_key_status(self.session_id, status)
+        try:
+            app = self.winfo_toplevel()
+            if hasattr(app, "_refresh_host_key_status"):
+                self.after(0, app._refresh_host_key_status)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _record_changed_host_key(self, request) -> None:
+        self._record_host_key_verification(
+            HostKeySessionStatus(
+                request.host_role,
+                request.hostname,
+                request.key_type,
+                request.received_fingerprint,
+                "Changed key rejected",
+                connected=False,
+            )
+        )
+
     def _make_proxy_sock(self, proxy_alias: str, target_host: str, target_port: int, generation=None):
         self.after(0, lambda: self._terminal.write(f"[proxy] connecting via jump host '{proxy_alias}'…\n", "info"))
 
-        # 1. look up jump host in vault entries by name/host alias
+        login_options = self._session_profile_snapshot().get("login_options", {})
+        direct_options = (
+            validate_proxy_jump_options(login_options)
+            if isinstance(login_options, dict) and "proxy_jump_enabled" in login_options
+            else None
+        )
+
+        # 1. look up jump host in vault entries by name/host alias or exact edited endpoint
         proxy_entry = None
         for ve in self._vault_entries:
-            if ve.get("name", "").lower() == proxy_alias.lower() or ve.get("host", "").lower() == proxy_alias.lower():
+            alias_match = (
+                ve.get("name", "").lower() == proxy_alias.lower() or ve.get("host", "").lower() == proxy_alias.lower()
+            )
+            endpoint_match = bool(
+                direct_options
+                and str(ve.get("host", "")).casefold() == str(direct_options["proxy_jump_host"]).casefold()
+                and int(ve.get("port", 22)) == int(direct_options["proxy_jump_port"])
+                and str(ve.get("user", "")).casefold() == str(direct_options["proxy_jump_user"]).casefold()
+            )
+            if alias_match or endpoint_match:
                 proxy_entry = ve
                 break
 
@@ -4937,7 +5359,14 @@ class ConnectionTab(tk.Frame):
                 ssh_cfg.parse(f)
         cfg_info = ssh_cfg.lookup(proxy_alias)
 
-        if proxy_entry:
+        if direct_options is not None:
+            proxy_host = direct_options["proxy_jump_host"]
+            proxy_port = int(direct_options["proxy_jump_port"])
+            proxy_user = direct_options["proxy_jump_user"]
+            proxy_auth = direct_options["proxy_jump_auth_method"]
+            proxy_key = None
+            proxy_pass = self._entry.get("_proxy_password") or None
+        elif proxy_entry:
             proxy_host = proxy_entry.get("host", proxy_alias)
             proxy_port = int(proxy_entry.get("port", 22))
             proxy_user = proxy_entry.get("user", "root")
@@ -4962,7 +5391,15 @@ class ConnectionTab(tk.Frame):
             "host": proxy_host,
             "port": proxy_port,
             "user": proxy_user,
-            "auth_method": "key" if proxy_key else "password" if proxy_pass else "agent",
+            "auth_method": (
+                proxy_auth
+                if direct_options is not None
+                else "key"
+                if proxy_key
+                else "password"
+                if proxy_pass
+                else "agent"
+            ),
             "key_path": proxy_key or "",
             "timeout": 15,
             "compression": bool(proxy_entry.get("compression", False)) if proxy_entry else False,
@@ -4978,9 +5415,19 @@ class ConnectionTab(tk.Frame):
                 proxy_pass,
                 diagnose_agent_key=self._report_agent_authentication,
             )
+        except UnknownHostCancelled:
+            verification = getattr(manager, "last_host_key_verification", None)
+            if verification is not None:
+                self._record_host_key_verification(verification)
+            raise
         except paramiko.BadHostKeyException as exc:
-            self._trust_broker.warn_changed_key(manager.changed_request(proxy_profile, exc))
+            request = manager.changed_request(proxy_profile, exc)
+            self._record_changed_host_key(request)
+            self._trust_broker.warn_changed_key(request)
             raise ChangedHostKeyRejected("The jump-host server identity changed.") from exc
+        verification = getattr(manager, "last_host_key_verification", None)
+        if verification is not None:
+            self._record_host_key_verification(verification)
         if generation is not None and generation != self._session_generation:
             proxy_client.close()
             raise RuntimeError("Stale SSH session was closed.")
@@ -5004,25 +5451,26 @@ class ConnectionTab(tk.Frame):
             return
         self._set_workspace_status("connected", "Connected securely.")
         self._session_transition(SessionLifecycleState.CONNECTED, "Session established.")
+        self._rebind_connection_info(self._client)
         app = self.winfo_toplevel()
+        if self.session_id and self._client and hasattr(app, "_rebind_sftp_resources_for_session"):
+            app._rebind_sftp_resources_for_session(self.session_id, self._client)
         if hasattr(app, "_refresh_sessions"):
             self.after(0, app._refresh_sessions)
         self._terminal.write("[connected]\n", "ok")
-        self._start_enabled_local_forwarding()
-        self._start_enabled_remote_forwarding()
-        self._start_enabled_dynamic_forwarding()
-        self._start_enabled_http_forwarding()
-        self._start_x11_forwarding()
+        self._start_keepalive_monitor(self._session_generation)
         # Post-login actions are sourced from this ConnectionTab's immutable
         # profile snapshot.  They never run merely from selecting or editing
-        # a profile, and reconnects deliberately do not replay them.
+        # a profile. Reconnects apply only their explicit restart policy.
         if self._is_reconnect_attempt:
+            if self._service_start_allowed(reconnecting=True):
+                self._coordinate_enabled_services(reconnecting=True)
             return
-        prefs = dict(self._entry.get("launch_preferences", {}))
-        prefs["start_enabled_tunnels"] = bool(prefs.get("start_enabled_services", False))
+        prefs = dict(self._session_profile_snapshot().get("launch_preferences", {}))
+        prefs["start_enabled_tunnels"] = self._service_start_allowed(reconnecting=False)
         prefs["startup_command"] = str(self._entry.get("startup_command", prefs.get("startup_command", "")))
         self._startup_actions.handlers = {
-            "tunnels": self._start_saved_tunnels,
+            "tunnels": self._coordinate_enabled_services,
             "terminal": lambda: self._attach_shell(self._terminal),
             "sftp": self._open_phase_one_sftp_view,
             "command": lambda data: self._run_startup_command(
@@ -5030,6 +5478,25 @@ class ConnectionTab(tk.Frame):
             ),
         }
         self._startup_actions.run(prefs, self._session_generation)
+
+    def _service_start_allowed(self, *, reconnecting: bool) -> bool:
+        snapshot = self._session_profile_snapshot()
+        section_name = "connection_options" if reconnecting else "launch_preferences"
+        option_name = "restart_tunnels" if reconnecting else "start_enabled_services"
+        options = snapshot.get(section_name, {})
+        return bool(options.get(option_name, False)) if isinstance(options, dict) else False
+
+    def _connection_info_state(self):
+        if self._session_controller is not None and self.session_id:
+            record = self._session_controller.get(self.session_id)
+            if record is not None:
+                return record.state
+        return self._workspace_state.status
+
+    def _rebind_connection_info(self, client) -> None:
+        panel = self._info_panel
+        if panel is not None:
+            panel.rebind(client, self._session_profile_snapshot(), self._connection_info_state)
 
     def _open_phase_one_sftp_view(self) -> None:
         """Open one session-owned Phase 1 SFTP shell after CONNECTED only."""
@@ -5040,15 +5507,40 @@ class ConnectionTab(tk.Frame):
         if record is not None and hasattr(app, "_open_sftp_placeholder"):
             app._open_sftp_placeholder(record)
 
+    def _coordinate_enabled_services(self, reconnecting: bool = False) -> None:
+        """Start enabled session services once for this connection generation."""
+        if self._services_started_generation == self._session_generation:
+            return
+        starters = (
+            ("local", self._start_enabled_local_forwarding),
+            ("remote", self._start_enabled_remote_forwarding),
+            ("dynamic", self._start_enabled_dynamic_forwarding),
+            ("http", self._start_enabled_http_forwarding),
+            ("x11", self._start_x11_forwarding),
+        )
+        for name, starter in starters:
+            if reconnecting and name in self._intentionally_stopped_services:
+                continue
+            try:
+                starter()
+            except Exception as exc:
+                try:
+                    log(
+                        f"Service startup failed session={str(self.session_id)[:12]} "
+                        f"service={name}: {redact_secrets(str(exc))}"
+                    )
+                except OSError:
+                    pass
+        self._services_started_generation = self._session_generation
+
     def _start_saved_tunnels(self):
-        self._start_enabled_local_forwarding()
-        self._start_enabled_remote_forwarding()
-        self._start_enabled_dynamic_forwarding()
-        self._start_enabled_http_forwarding()
+        """Compatibility entry point for explicit service startup."""
+        self._coordinate_enabled_services()
 
     def _start_enabled_local_forwarding(self):
         if not self._client or self._session_controller is None or not self.session_id:
             return
+        self._intentionally_stopped_services.discard("local")
         if self._local_forwarding_service is not None and not self._local_forwarding_service.closed:
             self._local_forwarding_service.start_enabled()
             return
@@ -5075,7 +5567,9 @@ class ConnectionTab(tk.Frame):
             if record.status == "Failed":
                 log(f"Local forwarding failed: {record.error}")
 
-    def _stop_local_forwarding(self):
+    def _stop_local_forwarding(self, *, intentional: bool = True):
+        if intentional:
+            self._intentionally_stopped_services.add("local")
         service = self._local_forwarding_service
         if service is None:
             return
@@ -5098,6 +5592,7 @@ class ConnectionTab(tk.Frame):
     def _start_enabled_remote_forwarding(self):
         if not self._client or self._session_controller is None or not self.session_id:
             return
+        self._intentionally_stopped_services.discard("remote")
         if self._remote_forwarding_service is not None and not self._remote_forwarding_service.closed:
             self._remote_forwarding_service.start_enabled()
             return
@@ -5124,7 +5619,9 @@ class ConnectionTab(tk.Frame):
             if record.status == "Failed":
                 log(f"Remote forwarding failed: {record.error}")
 
-    def _stop_remote_forwarding(self):
+    def _stop_remote_forwarding(self, *, intentional: bool = True):
+        if intentional:
+            self._intentionally_stopped_services.add("remote")
         service = self._remote_forwarding_service
         if service is None:
             return
@@ -5147,6 +5644,7 @@ class ConnectionTab(tk.Frame):
     def _start_enabled_dynamic_forwarding(self):
         if not self._client or self._session_controller is None or not self.session_id:
             return
+        self._intentionally_stopped_services.discard("dynamic")
         if self._dynamic_forwarding_service is not None and not self._dynamic_forwarding_service.closed:
             self._dynamic_forwarding_service.start_enabled()
             return
@@ -5173,7 +5671,9 @@ class ConnectionTab(tk.Frame):
             if record.status == "Failed":
                 log(f"Dynamic forwarding failed: {record.error}")
 
-    def _stop_dynamic_forwarding(self):
+    def _stop_dynamic_forwarding(self, *, intentional: bool = True):
+        if intentional:
+            self._intentionally_stopped_services.add("dynamic")
         service = self._dynamic_forwarding_service
         if service is None:
             return
@@ -5196,6 +5696,7 @@ class ConnectionTab(tk.Frame):
     def _start_enabled_http_forwarding(self):
         if not self._client or self._session_controller is None or not self.session_id:
             return
+        self._intentionally_stopped_services.discard("http")
         if self._http_forwarding_service is not None and not self._http_forwarding_service.closed:
             self._http_forwarding_service.start_enabled()
             return
@@ -5222,7 +5723,9 @@ class ConnectionTab(tk.Frame):
             if record.status == "Failed":
                 log(f"HTTP CONNECT proxy failed: {record.error}")
 
-    def _stop_http_forwarding(self):
+    def _stop_http_forwarding(self, *, intentional: bool = True):
+        if intentional:
+            self._intentionally_stopped_services.add("http")
         service = self._http_forwarding_service
         if service is None:
             return
@@ -5250,14 +5753,61 @@ class ConnectionTab(tk.Frame):
         return self._entry
 
     def _owned_session_profile_snapshot(self) -> dict:
-        snapshot = dict(self._session_profile_snapshot())
+        snapshot = json.loads(json.dumps(self._session_profile_snapshot()))
         snapshot["_session_id"] = self.session_id or ""
         return snapshot
+
+    def _terminal_launch_snapshot(self):
+        snapshot = self._owned_session_profile_snapshot()
+        settings = terminal_launch_settings(snapshot, self._vte_availability.available)
+        snapshot["terminal_options"] = dict(settings.options)
+        return snapshot, settings
+
+    @staticmethod
+    def _run_terminal_initial_command(channel, command: str) -> None:
+        command = command.strip()
+        if command:
+            channel.send(f"{command}\n")
+
+    def _report_terminal_warnings(self, warnings, terminal=None) -> None:
+        if not warnings:
+            return
+        message = " ".join(dict.fromkeys(str(warning) for warning in warnings if str(warning)))
+        if not message:
+            return
+        log(f"Terminal settings warning session={str(self.session_id)[:12]}: {message}")
+        if terminal is not None:
+            terminal.write(f"[terminal] {message}\n", "info")
+        else:
+            messagebox.showwarning("Terminal settings", message)
+
+    def _native_terminal_close_completed(self, terminal_id: str, remove_ownership: bool, error: str) -> None:
+        """Apply a helper-confirmed native terminal close to this session only."""
+        if remove_ownership:
+            self._native_terminal_ids.discard(terminal_id)
+            if self._session_controller is not None and self.session_id:
+                self._session_controller.unregister_terminal(self.session_id, terminal_id)
+        if not error:
+            return
+        log(f"Native terminal close failed session={str(self.session_id)[:12]}: {error}")
+
+        def report() -> None:
+            try:
+                self._terminal_backend_status.set(error)
+                messagebox.showwarning("Terminal", error)
+            except (RuntimeError, tk.TclError):
+                pass
+
+        try:
+            self.after(0, report)
+        except (RuntimeError, tk.TclError):
+            pass
 
     def _start_x11_forwarding(self) -> None:
         """Capture X11 policy once, after authentication, for this session."""
         if not self.session_id:
             return
+        self._intentionally_stopped_services.discard("x11")
         if self._x11_forwarding_service is not None and not self._x11_forwarding_service.closed:
             return
         snapshot = self._session_profile_snapshot()
@@ -5271,7 +5821,9 @@ class ConnectionTab(tk.Frame):
         if hasattr(app, "_refresh_services_tab"):
             self.after(0, app._refresh_services_tab)
 
-    def _stop_x11_forwarding(self) -> None:
+    def _stop_x11_forwarding(self, *, intentional: bool = True) -> None:
+        if intentional:
+            self._intentionally_stopped_services.add("x11")
         service = self._x11_forwarding_service
         if service is None:
             return
@@ -5302,8 +5854,10 @@ class ConnectionTab(tk.Frame):
         threading.Thread(target=worker, daemon=True, name="sshvault-startup-command").start()
 
     def _attach_shell(self, terminal: TerminalWidget):
-        snapshot = self._owned_session_profile_snapshot()
-        if self._vte_availability.available and self._native_terminal_backend.open_terminal_tab(snapshot):
+        snapshot, settings = self._terminal_launch_snapshot()
+        terminal.apply_terminal_options(settings.options)
+        self._report_terminal_warnings(settings.warnings, terminal)
+        if settings.backend == "native" and self._native_terminal_backend.open_terminal_tab(snapshot):
             if (
                 self._session_controller is not None
                 and self.session_id
@@ -5316,18 +5870,28 @@ class ConnectionTab(tk.Frame):
                 self._native_terminal_ids.add(self._native_terminal_backend.last_terminal_id)
             self._native_vte_ready = True
             self._terminal_backend_status.set(self._native_terminal_backend.status)
+            self._report_terminal_warnings(self._native_terminal_backend.last_warnings, terminal)
             terminal.write("[Native VTE terminal opened in its own window]\n", "info")
             return
+        if settings.backend == "native":
+            self._report_terminal_warnings(
+                (f"{self._native_terminal_backend.status}; using Legacy terminal.",),
+                terminal,
+            )
         if not self._client:
             return
         x11 = self._x11_forwarding_service
         runtime = ssh_runtime_preferences(snapshot)
+        terminal_options = settings.options
+        terminal_type = str(terminal_options["terminal_type"])
+        startup_command = str(terminal_options["startup_command"])
         if (x11 is None or not x11.enabled) and not runtime.agent_forwarding:
             channel = self._client.invoke_shell(
-                term="xterm-256color",
+                term=terminal_type,
                 width=terminal._cols,
                 height=terminal._rows,
             )
+            self._run_terminal_initial_command(channel, startup_command)
             terminal.attach_channel(channel)
             return
         transport = self._client.get_transport()
@@ -5347,21 +5911,22 @@ class ConnectionTab(tk.Frame):
             else:
                 if handler is not None:
                     self._agent_forwarding_handlers.append(handler)
-        terminal_options = snapshot.get("terminal_options", {})
-        terminal_type = str(terminal_options.get("terminal_type", "xterm-256color"))
         channel.get_pty(term=terminal_type, width=terminal._cols, height=terminal._rows)
         channel.invoke_shell()
+        self._run_terminal_initial_command(channel, startup_command)
         terminal.attach_channel(channel)
 
     def _open_terminal(self):
         # Native sessions are separate GTK windows: terminal bytes never pass
         # through Tk, Paramiko, or the legacy pyte renderer.
-        if self._vte_availability.available:
+        snapshot, settings = self._terminal_launch_snapshot()
+        self._report_terminal_warnings(settings.warnings)
+        if settings.backend == "native":
             if self._entry.get("auth_method") == "password":
                 messagebox.showinfo(
                     "Native VTE terminal", "OpenSSH will request the password interactively in the terminal."
                 )
-            if self._native_terminal_backend.open_terminal_tab(self._owned_session_profile_snapshot()):
+            if self._native_terminal_backend.open_terminal_tab(snapshot):
                 if (
                     self._session_controller is not None
                     and self.session_id
@@ -5374,11 +5939,15 @@ class ConnectionTab(tk.Frame):
                     self._native_terminal_ids.add(self._native_terminal_backend.last_terminal_id)
                 self._native_vte_ready = True
                 self._terminal_backend_status.set(self._native_terminal_backend.status)
+                self._report_terminal_warnings(self._native_terminal_backend.last_warnings)
                 return
             self._native_vte_ready = False
             self._terminal_backend_status.set(self._native_terminal_backend.status)
             self._terminal_backend_label.configure(fg=YELLOW)
-            messagebox.showwarning("Native VTE terminal", self._native_terminal_backend.status)
+            messagebox.showwarning(
+                "Native VTE terminal",
+                f"{self._native_terminal_backend.status}; using Legacy terminal.",
+            )
         if not self._client:
             messagebox.showerror("Terminal", "Not connected.")
             return
@@ -5432,37 +6001,48 @@ class ConnectionTab(tk.Frame):
             self.after(0, app._refresh_sessions)
         log(f"Error: {err}")
 
-    def _disconnect(self, manual: bool = True):
+    def _disconnect(self, manual: bool = True, logout_preferences: dict | None = None):
         if self._workspace_state.status in {"disconnected", "disconnecting"}:
             return
+        self._stop_keepalive_monitor()
+        close_terminals = logout_preferences is None or bool(logout_preferences.get("close_terminal_windows", False))
+        close_sftp = logout_preferences is None or bool(logout_preferences.get("close_sftp_windows", False))
+        stop_services = logout_preferences is None or bool(logout_preferences.get("stop_enabled_services", True))
         if manual:
             self._reconnect_controller.cancel()
         self._set_workspace_status("disconnecting")
         self._session_transition(SessionLifecycleState.DISCONNECTING, "Disconnecting session.")
         self._session_generation += 1
-        self._stop_local_forwarding()
-        self._stop_remote_forwarding()
-        self._stop_dynamic_forwarding()
-        self._stop_http_forwarding()
-        self._stop_x11_forwarding()
+        app = self.winfo_toplevel()
+        if not manual and self.session_id and hasattr(app, "_suspend_sftp_resources_for_reconnect"):
+            app._suspend_sftp_resources_for_reconnect(self.session_id)
+        if stop_services:
+            intentional_stop = manual and logout_preferences is not None
+            self._stop_local_forwarding(intentional=intentional_stop)
+            self._stop_remote_forwarding(intentional=intentional_stop)
+            self._stop_dynamic_forwarding(intentional=intentional_stop)
+            self._stop_http_forwarding(intentional=intentional_stop)
+            self._stop_x11_forwarding(intentional=intentional_stop)
         self._sftp_opening = False
         sftp_thread = self._sftp_open_thread
         if sftp_thread is not None and sftp_thread is not threading.current_thread() and sftp_thread.is_alive():
             sftp_thread.join(timeout=0.25)
         self._sftp_open_thread = None
-        self._cleanup_connection_panels()
+        if close_sftp:
+            self._cleanup_connection_panels()
         for terminal in list(self._terminals):
             terminal.detach()
-        for terminal_id in list(self._native_terminal_ids):
-            self._native_terminal_backend.close_terminal(terminal_id)
-            if self._session_controller is not None and self.session_id:
-                self._session_controller.unregister_terminal(self.session_id, terminal_id)
-        self._native_terminal_ids.clear()
-        if self._owns_native_terminal_backend:
-            self._native_terminal_backend.close()
+        if close_terminals:
+            for terminal_id in list(self._native_terminal_ids):
+                self._native_terminal_backend.close_terminal(
+                    terminal_id,
+                    self._native_terminal_close_completed,
+                )
         self._agent_forwarding_handlers.clear()
         # A proxied destination belongs to its context; that context closes
         # destination, channel, and jump client exactly once in order.
+        if self._client:
+            self._rebind_connection_info(None)
         if self._client and not self._proxy_context:
             try:
                 self._client.close()
@@ -5475,14 +6055,15 @@ class ConnectionTab(tk.Frame):
             self._proxy_context = None
         self._set_workspace_status("disconnected")
         if self._session_controller is not None and self.session_id is not None:
+            self._session_controller.mark_host_keys_disconnected(self.session_id)
             try:
                 self._session_controller.disconnect(
                     self.session_id, "Manual disconnect" if manual else "Reconnect cleanup"
                 )
             except ValueError:
                 pass
+        self._rebind_connection_info(None)
         self._terminal.write("\n[disconnected]\n", "info")
-        app = self.winfo_toplevel()
         if hasattr(app, "_refresh_sessions"):
             self.after(0, app._refresh_sessions)
 
@@ -5610,7 +6191,16 @@ class ConnectionTab(tk.Frame):
         if not self._client:
             messagebox.showerror("Info", "Not connected.")
             return
-        self._select_or_create("_info_panel", lambda: ConnectionInfoPanel(self._nb, self._client), "Info")
+        self._select_or_create(
+            "_info_panel",
+            lambda: ConnectionInfoPanel(
+                self._nb,
+                self._client,
+                self._session_profile_snapshot(),
+                self._connection_info_state,
+            ),
+            "Info",
+        )
 
     def _toggle_record(self):
         if not self._recording:
@@ -6594,19 +7184,24 @@ class SSHVaultApp(tk.Tk):
         # Application scope is capability detection only. Connected sessions
         # each construct and own their own backend/helper below.
         self._native_terminal_backend = VTETerminalBackend(detect_vte_backend())
+        self._sftp_server_runtime = BuiltinSFTPServerRuntime()
         self._session_controller = SessionController()
         self.selected_profile_id: str | None = None
         self.loaded_profile_snapshot: dict | None = None
         self.working_profile: dict | None = None
         self.profile_dirty = False
         self.profile_validation_errors: list[str] = []
+        self._working_profile_password = ""
+        self._working_profile_password_changed = False
         # Transitional UI lookup only.  SessionController owns identity/state.
         self._conn_tabs: dict[str, ConnectionTab] = {}
         self._session_serial = 0
         self._sftp_views: dict[str, tk.Toplevel] = {}
         self._sftp_browser_clients = SFTPBrowserRegistry()
         self._sftp_view_state_callbacks = {}
+        self._sftp_view_rebind_callbacks = {}
         self._sftp_transfer_schedulers = {}
+        self._session_transfer_manager_windows = {}
         self._sftp_transfer_status_callbacks = {}
         self._sftp_transfer_queue_callbacks = {}
         self._sftp_change_queue: queue.SimpleQueue[str] = queue.SimpleQueue()
@@ -6697,12 +7292,30 @@ class SSHVaultApp(tk.Tk):
         self.bind_all("<Control-Shift-T>", lambda _event: self._open_transfer_manager())
 
     def _open_transfer_manager(self):
-        """Open the selected session's manager without disturbing workspace focus."""
+        """Open only the transfer queue owned by the selected connected session."""
         record = self._selected_session_record()
-        tab = self._conn_tabs.get(record.session_id) if record else None
-        panel = getattr(tab, "_sftp_panel", None)
-        if panel is not None:
-            panel._show_transfer_manager()
+        if record is None or record.state is not SessionLifecycleState.CONNECTED:
+            messagebox.showinfo("Transfer Manager", "Select a connected session.", parent=self)
+            return "break"
+        try:
+            scheduler = self._sftp_transfer_router(record).scheduler
+        except ProfileError:
+            messagebox.showinfo("Transfer Manager", "Transfers are unavailable for this session.", parent=self)
+            return "break"
+        existing = self._session_transfer_manager_windows.get(record.session_id)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.show()
+                    return "break"
+            except tk.TclError:
+                pass
+
+        def closed(session_id: str) -> None:
+            self._session_transfer_manager_windows.pop(session_id, None)
+
+        window = SessionTransferManagerWindow(self, record, scheduler, closed)
+        self._session_transfer_manager_windows[record.session_id] = window
         return "break"
 
     def _show_about(self):
@@ -6973,6 +7586,8 @@ class SSHVaultApp(tk.Tk):
             self.loaded_profile_snapshot = None
             self.working_profile = profile
             self.profile_dirty = True
+            self._working_profile_password = ""
+            self._working_profile_password_changed = False
             self.profile_validation_errors = []
             self._refresh_login_tab()
             self._refresh_options_tab()
@@ -7024,8 +7639,10 @@ class SSHVaultApp(tk.Tk):
                 "proxy_host",
                 "proxy_port",
                 "proxy_user",
+                "proxy_auth_method",
             )
         }
+        self._login_password_var = tk.StringVar()
         groups = []
         for title in ("Server", "Authentication", "Host Key", "Proxy"):
             group = ttk.LabelFrame(page, text=title, padding=6)
@@ -7050,14 +7667,14 @@ class SSHVaultApp(tk.Tk):
             groups[1],
             textvariable=self._login_vars["auth_method"],
             state="readonly",
-            values=("Automatic", "SSH Agent", "Private Key", "Password", "Keyboard Interactive", "OpenSSH Config"),
+            values=tuple(LOGIN_AUTH_METHODS),
         )
         auth.grid(row=1, column=1, sticky="ew")
         self._auth_summary = ttk.Label(groups[1], text="Automatic authentication uses existing safe defaults.")
         self._auth_summary.grid(row=2, column=1, sticky="w")
         self._password_label = ttk.Label(groups[1], text="Passphrase / password")
         self._password_label.grid(row=2, column=0, sticky="w")
-        self._password_entry = ttk.Entry(groups[1], show="•")
+        self._password_entry = ttk.Entry(groups[1], textvariable=self._login_password_var, show="•")
         self._password_entry.grid(row=2, column=1, sticky="ew")
         self._key_label = ttk.Label(groups[1], text="SSH key / Agent")
         self._key_label.grid(row=3, column=0, sticky="w")
@@ -7065,18 +7682,32 @@ class SSHVaultApp(tk.Tk):
         self._key_entry.grid(row=3, column=1, sticky="ew")
         self._manage_keys_button = ttk.Button(groups[1], text="Manage Keys", command=self._keygen)
         self._manage_keys_button.grid(row=3, column=2)
-        for row, label in enumerate(("Host-key policy", "Known-hosts source", "Fingerprint")):
+        self._host_key_vars = {
+            "policy": tk.StringVar(value=HOST_KEY_POLICY_DISPLAY),
+            "source": tk.StringVar(value=f"SSHVault known_hosts: {KNOWN_HOSTS_FILE}"),
+            "destination": tk.StringVar(value="Not connected; no destination key verified"),
+            "proxy": tk.StringVar(value="Not configured"),
+        }
+        for row, (label, key) in enumerate(
+            (
+                ("Host-key policy", "policy"),
+                ("Known-hosts source", "source"),
+                ("Destination identity", "destination"),
+                ("ProxyJump identity", "proxy"),
+            )
+        ):
             ttk.Label(groups[2], text=label).grid(row=row, column=0, sticky="w")
-            ttk.Label(groups[2], text="Not checked" if label == "Fingerprint" else "System defaults").grid(
+            ttk.Label(groups[2], textvariable=self._host_key_vars[key], wraplength=440).grid(
                 row=row, column=1, sticky="w"
             )
-        ttk.Button(groups[2], text="Manage Host Keys", command=self._open_host_keys).grid(row=3, column=1, sticky="w")
+        ttk.Button(groups[2], text="Manage Host Keys", command=self._open_host_keys).grid(row=4, column=1, sticky="w")
         for row, (label, key) in enumerate(
             (
                 ("Proxy type", "proxy_type"),
                 ("Proxy host", "proxy_host"),
                 ("Proxy port", "proxy_port"),
                 ("Proxy username", "proxy_user"),
+                ("Proxy authentication", "proxy_auth_method"),
             )
         ):
             ttk.Label(groups[3], text=label).grid(row=row, column=0, sticky="w")
@@ -7087,10 +7718,19 @@ class SSHVaultApp(tk.Tk):
                 if key == "proxy_type"
                 else ttk.Entry(groups[3], textvariable=self._login_vars[key])
             )
+            if key == "proxy_auth_method":
+                widget = ttk.Combobox(
+                    groups[3],
+                    textvariable=self._login_vars[key],
+                    values=tuple(PROXY_AUTH_METHODS),
+                    state="readonly",
+                )
             widget.grid(row=row, column=1, sticky="ew")
-        self._login_vars["proxy_type"].trace_add("write", lambda *_: self._login_field_changed("proxy_jump"))
-        self._login_vars["auth_method"].trace_add("write", lambda *_: self._sync_login_visibility())
-        self._proxy_widgets = [groups[3].grid_slaves(row=row, column=1)[0] for row in (1, 2, 3)]
+        for key in ("proxy_type", "proxy_host", "proxy_port", "proxy_user", "proxy_auth_method"):
+            self._login_vars[key].trace_add("write", lambda *_args, name=key: self._login_field_changed(name))
+        self._login_vars["auth_method"].trace_add("write", lambda *_: self._login_field_changed("auth_method"))
+        self._login_password_var.trace_add("write", lambda *_: self._login_password_changed())
+        self._proxy_widgets = [groups[3].grid_slaves(row=row, column=1)[0] for row in (1, 2, 3, 4)]
         self._sync_login_visibility()
 
     def _build_options_tab(self, page):
@@ -7233,6 +7873,8 @@ class SSHVaultApp(tk.Tk):
             "cursor_shape": tk.StringVar(value="Block"),
             "cursor_blink": tk.BooleanVar(value=True),
             "color_theme": tk.StringVar(value="System"),
+            "foreground": tk.StringVar(value="#f1f3f4"),
+            "background": tk.StringVar(value="#202124"),
             "agent_forwarding": tk.BooleanVar(value=False),
             "x11_forwarding": tk.BooleanVar(value=False),
             "close_on_logout": tk.BooleanVar(value=False),
@@ -7272,6 +7914,8 @@ class SSHVaultApp(tk.Tk):
             ("Cursor shape", "cursor_shape", TERMINAL_CURSOR_SHAPES),
             ("Cursor blink", "cursor_blink", "check"),
             ("Color theme", "color_theme", TERMINAL_COLOR_THEMES),
+            ("Foreground", "foreground", None),
+            ("Background", "background", None),
         )
         for row, (label, key, values) in enumerate(appearance):
             ttk.Label(groups[1], text=label).grid(row=row, column=0, sticky="w")
@@ -7332,6 +7976,10 @@ class SSHVaultApp(tk.Tk):
                 self.profile_validation_errors = ["Scrollback lines must be a whole number."]
                 self._refresh_action_states()
                 return
+        elif key in {"foreground", "background"} and not re.fullmatch(r"#[0-9A-Fa-f]{6}", str(value)):
+            self.profile_validation_errors = [f"Terminal {key} must be a color such as #f1f3f4."]
+            self._refresh_action_states()
+            return
         elif isinstance(value, bool):
             value = bool(value)
         options[key] = value
@@ -7358,6 +8006,8 @@ class SSHVaultApp(tk.Tk):
                 "cursor_shape": "Block",
                 "cursor_blink": True,
                 "color_theme": "System",
+                "foreground": "#f1f3f4",
+                "background": "#202124",
                 "agent_forwarding": False,
                 "x11_forwarding": False,
                 "close_on_logout": False,
@@ -7520,7 +8170,7 @@ class SSHVaultApp(tk.Tk):
         connected = bool(
             (record := self._selected_session_record()) and record.state is SessionLifecycleState.CONNECTED
         )
-        for button in self._sftp_action_buttons[:2]:
+        for button in self._sftp_action_buttons:
             button.configure(state="normal" if connected else "disabled")
 
     def _build_services_tab(self, page):
@@ -7970,14 +8620,14 @@ class SSHVaultApp(tk.Tk):
 
     def _sync_login_visibility(self):
         method = self._login_vars["auth_method"].get()
-        password = method in {"Password", "Keyboard Interactive"}
+        password = method == "Password"
         key = method == "Private Key"
         (self._password_label.grid if password else self._password_label.grid_remove)()
         (self._password_entry.grid if password else self._password_entry.grid_remove)()
         (self._key_label.grid if key else self._key_label.grid_remove)()
         (self._key_entry.grid if key else self._key_entry.grid_remove)()
         (self._manage_keys_button.grid if key else self._manage_keys_button.grid_remove)()
-        (self._auth_summary.grid if method == "Automatic" else self._auth_summary.grid_remove)()
+        self._auth_summary.grid_remove()
         proxy_enabled = self._login_vars["proxy_type"].get() == "SSH ProxyJump"
         for widget in self._proxy_widgets:
             widget.configure(state="normal" if proxy_enabled else "disabled")
@@ -7992,11 +8642,42 @@ class SSHVaultApp(tk.Tk):
         mapping = {"user": "user", "host": "host", "port": "port", "key_path": "key_path"}
         if field in mapping:
             self.update_working_profile_field(mapping[field], self._login_vars[field].get())
-        elif field == "proxy_jump":
-            if self._login_vars["proxy_type"].get() == "SSH ProxyJump":
-                self.update_working_profile_field("proxy_jump", self.working_profile.get("proxy_jump", ""))
-            else:
-                self.update_working_profile_field("proxy_jump", "")
+        elif field == "auth_method":
+            method = LOGIN_AUTH_METHODS.get(self._login_vars["auth_method"].get())
+            if method is not None:
+                self.update_working_profile_field("auth_method", method)
+            self._sync_login_visibility()
+        elif field.startswith("proxy_"):
+            enabled = self._login_vars["proxy_type"].get() == "SSH ProxyJump"
+            options = dict(self.working_profile.get("login_options", {}))
+            options.update(
+                {
+                    "proxy_jump_enabled": enabled,
+                    "proxy_jump_host": self._login_vars["proxy_host"].get().strip(),
+                    "proxy_jump_port": self._login_vars["proxy_port"].get().strip() or 22,
+                    "proxy_jump_user": self._login_vars["proxy_user"].get().strip(),
+                    "proxy_jump_auth_method": PROXY_AUTH_METHODS.get(
+                        self._login_vars["proxy_auth_method"].get(), "agent"
+                    ),
+                }
+            )
+            self.working_profile["login_options"] = options
+            try:
+                self.working_profile["proxy_jump"] = proxy_jump_target(options)
+            except ProfileError:
+                self.working_profile["proxy_jump"] = "" if not enabled else self.working_profile.get("proxy_jump", "")
+            self.recalculate_profile_dirty()
+            self._validate_working_profile()
+            self._refresh_action_states()
+            self._sync_login_visibility()
+
+    def _login_password_changed(self) -> None:
+        if getattr(self, "_login_refreshing", False) or self.working_profile is None:
+            return
+        self._working_profile_password = self._login_password_var.get()
+        self._working_profile_password_changed = True
+        self.recalculate_profile_dirty()
+        self._refresh_action_states()
 
     def _refresh_login_tab(self):
         if not hasattr(self, "_login_vars") or self.working_profile is None:
@@ -8006,19 +8687,74 @@ class SSHVaultApp(tk.Tk):
             for key in ("host", "port", "user", "key_path"):
                 self._login_vars[key].set(str(self.working_profile.get(key, "")))
             self._login_vars["auth_method"].set(
-                {"agent": "SSH Agent", "key": "Private Key", "password": "Password"}.get(
-                    self.working_profile.get("auth_method"), "Automatic"
-                )
+                LOGIN_AUTH_LABELS.get(self.working_profile.get("auth_method"), "SSH Agent")
             )
-            self._login_vars["proxy_type"].set("SSH ProxyJump" if self.working_profile.get("proxy_jump") else "None")
-            proxy = str(self.working_profile.get("proxy_jump", ""))
-            user, _, host = proxy.partition("@")
-            self._login_vars["proxy_host"].set(host if host else proxy)
-            self._login_vars["proxy_user"].set(user if host else "")
-            self._login_vars["proxy_port"].set("22" if proxy else "")
+            self._login_password_var.set("")
+            login_options = self.working_profile.get("login_options", {})
+            configured = isinstance(login_options, dict) and "proxy_jump_enabled" in login_options
+            if configured:
+                proxy_options = validate_proxy_jump_options(login_options)
+            else:
+                proxy = str(self.working_profile.get("proxy_jump", ""))
+                proxy_entry = next(
+                    (
+                        item
+                        for item in self._vault.entries
+                        if str(item.get("name", "")).casefold() == proxy.casefold()
+                        or str(item.get("host", "")).casefold() == proxy.casefold()
+                    ),
+                    None,
+                )
+                if proxy_entry is not None:
+                    proxy_options = {
+                        "proxy_jump_enabled": bool(proxy),
+                        "proxy_jump_host": str(proxy_entry.get("host", "")),
+                        "proxy_jump_port": int(proxy_entry.get("port", 22)),
+                        "proxy_jump_user": str(proxy_entry.get("user", "")),
+                        "proxy_jump_auth_method": str(proxy_entry.get("auth_method", "agent")),
+                    }
+                else:
+                    user, separator, host = proxy.partition("@")
+                    host_value = host if separator else proxy
+                    host_value, port_separator, port = host_value.rpartition(":")
+                    proxy_options = {
+                        "proxy_jump_enabled": bool(proxy),
+                        "proxy_jump_host": host_value if port_separator else (host if separator else proxy),
+                        "proxy_jump_port": port if port_separator else 22,
+                        "proxy_jump_user": user if separator else str(self.working_profile.get("user", "")),
+                        "proxy_jump_auth_method": "agent",
+                    }
+            self._login_vars["proxy_type"].set("SSH ProxyJump" if proxy_options["proxy_jump_enabled"] else "None")
+            self._login_vars["proxy_host"].set(str(proxy_options["proxy_jump_host"]))
+            self._login_vars["proxy_user"].set(str(proxy_options["proxy_jump_user"]))
+            self._login_vars["proxy_port"].set(str(proxy_options["proxy_jump_port"]))
+            self._login_vars["proxy_auth_method"].set(
+                PROXY_AUTH_LABELS.get(str(proxy_options["proxy_jump_auth_method"]), "SSH Agent")
+            )
             self._sync_login_visibility()
         finally:
             self._login_refreshing = False
+        self._refresh_host_key_status()
+
+    def _refresh_host_key_status(self) -> None:
+        if not hasattr(self, "_host_key_vars"):
+            return
+        self._host_key_vars["policy"].set(HOST_KEY_POLICY_DISPLAY)
+        self._host_key_vars["source"].set(f"SSHVault known_hosts: {KNOWN_HOSTS_FILE}")
+        record = self._selected_session_record()
+        destination = record.host_key_statuses.get("Destination host") if record is not None else None
+        jump = record.host_key_statuses.get("Jump host") if record is not None else None
+        self._host_key_vars["destination"].set(
+            destination.display() if destination is not None else "Not connected; no destination key verified"
+        )
+        proxy_configured = bool(record and record.profile_snapshot.get("proxy_jump"))
+        self._host_key_vars["proxy"].set(
+            jump.display()
+            if jump is not None
+            else "Not connected; no jump-host key verified"
+            if proxy_configured
+            else "Not configured"
+        )
 
     @staticmethod
     def _profile_dropdown_items(entries) -> list[tuple[str, str]]:
@@ -8083,11 +8819,13 @@ class SSHVaultApp(tk.Tk):
         self._refresh_terminal_action_states()
         self._refresh_sftp_action_states()
         self._refresh_services_tab()
+        self._refresh_host_key_status()
 
     def _sync_sftp_view_session_states(self) -> None:
         for view_id, (session_id, callback) in list(self._sftp_view_state_callbacks.items()):
             if view_id not in self._sftp_views:
                 self._sftp_view_state_callbacks.pop(view_id, None)
+                self._sftp_view_rebind_callbacks.pop(view_id, None)
                 continue
             record = self._session_controller.get(session_id)
             state = record.state if record is not None else SessionLifecycleState.DISCONNECTED
@@ -8104,6 +8842,7 @@ class SSHVaultApp(tk.Tk):
         self._refresh_terminal_action_states()
         self._refresh_sftp_action_states()
         self._refresh_services_tab()
+        self._refresh_host_key_status()
 
     def _refresh_controller_log(self):
         if not hasattr(self, "_controller_log"):
@@ -8217,39 +8956,89 @@ class SSHVaultApp(tk.Tk):
         self._tree.selection_set(str(created["id"]))
         self._update_statusbar()
 
-    def _save_working_profile(self):
-        """Milestone B placeholder: profile dialogs remain the existing safe editor."""
-        self._edit_entry()
-
     def _logout_selected_session(self):
         record = self._selected_session_record()
-        if record and record.profile_snapshot.get("connection_options", {}).get("close_sftp_windows", False):
-            self._close_sftp_views_for_session(record.session_id)
-        if record:
+        if record is None:
+            self._refresh_action_states()
+            return False
+        options = record.profile_snapshot.get("connection_options", {})
+        options = options if isinstance(options, dict) else {}
+        session_id = record.session_id
+        scheduler = getattr(self, "_sftp_transfer_schedulers", {}).get(session_id)
+        active_transfers = bool(
+            scheduler and any(item.status not in TransferState.TERMINAL for item in scheduler.items)
+        )
+        if (
+            active_transfers
+            and bool(options.get("ask_before_cancelling_active_transfers", True))
+            and not messagebox.askyesno(
+                "Log out",
+                "Active transfers will be cancelled. Continue logging out?",
+                parent=self,
+            )
+        ):
+            return False
+        close_sftp = bool(options.get("close_sftp_windows", False))
+        if close_sftp:
+            self._close_sftp_views_for_session(session_id)
+        if close_sftp:
             stop_sftp_resources = getattr(self, "_stop_sftp_resources_for_session", None)
             if callable(stop_sftp_resources):
-                stop_sftp_resources(record.session_id)
-        tab = self._conn_tabs.get(record.session_id) if record else None
+                stop_sftp_resources(session_id)
+        else:
+            shutdown_transfers = getattr(self, "_shutdown_transfer_scheduler_for_session", None)
+            if callable(shutdown_transfers):
+                shutdown_transfers(session_id)
+        tab = self._conn_tabs.get(session_id)
         if tab:
             # Logout leaves the controller workspace reusable.  Full shutdown
             # is reserved for destroying the tab/application.
-            tab._disconnect()
-        elif record:
-            self._stop_local_forwarding_for_session(record.session_id)
-            self._stop_remote_forwarding_for_session(record.session_id)
-            self._stop_dynamic_forwarding_for_session(record.session_id)
-            self._stop_http_forwarding_for_session(record.session_id)
-            self._stop_x11_forwarding_for_session(record.session_id)
-            self._session_controller.disconnect(record.session_id, "User requested log out.")
+            tab._disconnect(logout_preferences=options)
+        else:
+            if bool(options.get("stop_enabled_services", True)):
+                self._stop_local_forwarding_for_session(session_id)
+                self._stop_remote_forwarding_for_session(session_id)
+                self._stop_dynamic_forwarding_for_session(session_id)
+                self._stop_http_forwarding_for_session(session_id)
+                self._stop_x11_forwarding_for_session(session_id)
+            self._session_controller.disconnect(session_id, "User requested log out.")
         self._refresh_action_states()
+        return True
 
     def _stop_sftp_resources_for_session(self, session_id: str) -> None:
         """Stop only the browser channels and transfer workers owned by one session."""
+        self._shutdown_transfer_scheduler_for_session(session_id)
+        self._sftp_browser_clients.close_session(session_id)
+
+    def _shutdown_transfer_scheduler_for_session(self, session_id: str) -> None:
+        """Stop only one session's queue without closing retained SFTP views."""
         scheduler = self._sftp_transfer_schedulers.pop(session_id, None)
         if scheduler is not None:
             scheduler.invalidate_session(fail_active=True)
             scheduler.shutdown()
+
+    def _suspend_sftp_resources_for_reconnect(self, session_id: str) -> None:
+        """Detach only one session's old SFTP channels while retaining its queue."""
+        scheduler = self._sftp_transfer_schedulers.get(session_id)
+        if scheduler is not None:
+            scheduler.suspend_for_reconnect()
         self._sftp_browser_clients.close_session(session_id)
+        for view_session_id, callback in list(self._sftp_view_state_callbacks.values()):
+            if view_session_id == session_id:
+                callback(SessionLifecycleState.DISCONNECTED)
+
+    def _rebind_sftp_resources_for_session(self, session_id: str, client) -> None:
+        """Bind retained views and queued transfers to one new SSH client."""
+        for view_session_id, callback in list(self._sftp_view_rebind_callbacks.values()):
+            if view_session_id != session_id:
+                continue
+            try:
+                callback(client)
+            except Exception as exc:
+                log(f"SFTP view reconnect failed session={session_id[:12]} type={type(exc).__name__}")
+        scheduler = self._sftp_transfer_schedulers.get(session_id)
+        if scheduler is not None:
+            scheduler.rebind_client_factory(lambda connection=client: connection.open_sftp())
 
     def _stop_local_forwarding_for_session(self, session_id: str) -> None:
         service = self._local_forwarding_services.pop(session_id, None)
@@ -8306,6 +9095,7 @@ class SSHVaultApp(tk.Tk):
             self._session_controller.unregister_sftp_view(session_id, view_id)
             self._sftp_views.pop(view_id, None)
             self._sftp_view_state_callbacks.pop(view_id, None)
+            getattr(self, "_sftp_view_rebind_callbacks", {}).pop(view_id, None)
             self._sftp_transfer_status_callbacks.pop(view_id, None)
             self._sftp_transfer_queue_callbacks.pop(view_id, None)
             try:
@@ -8337,6 +9127,46 @@ class SSHVaultApp(tk.Tk):
         if record is not None:
             self._open_sftp_placeholder(record)
 
+    def _confirm_sftp_overwrite(self, record, item: TransferItem) -> bool:
+        """Ask on Tk's thread without losing the transfer's session owner."""
+        decision = {"replace": False}
+        answered = threading.Event()
+        abandoned = threading.Event()
+
+        def ask() -> None:
+            try:
+                if abandoned.is_set():
+                    return
+                current = self._session_controller.get(record.session_id)
+                if current is not None and current.state is SessionLifecycleState.CONNECTED:
+                    decision["replace"] = messagebox.askyesno(
+                        "Replace existing file",
+                        f"Replace the existing destination?\n\n{item.target}",
+                        parent=self,
+                    )
+            finally:
+                answered.set()
+
+        if threading.current_thread() is threading.main_thread():
+            ask()
+        else:
+            try:
+                self.after(0, ask)
+            except (RuntimeError, tk.TclError):
+                return False
+            while not answered.wait(0.05):
+                scheduler = self._sftp_transfer_schedulers.get(record.session_id)
+                current = self._session_controller.get(record.session_id)
+                if (
+                    scheduler is None
+                    or scheduler.closed
+                    or current is None
+                    or current.state is not SessionLifecycleState.CONNECTED
+                ):
+                    abandoned.set()
+                    return False
+        return bool(decision["replace"])
+
     def _sftp_transfer_router(self, record) -> SFTPTransferRouter:
         options = record.profile_snapshot.get("sftp_options", {})
         verify_completed = bool(options.get("verify_completed_transfers", options.get("verify_transfers", True)))
@@ -8361,6 +9191,10 @@ class SSHVaultApp(tk.Tk):
             scheduler,
             verify_completed=verify_completed,
             follow_symlinks=bool(options.get("follow_symlinks", False)),
+            collision_behavior=str(options.get("collision_behavior", "ask")),
+            resume_partial=bool(options.get("resume_partial", True)),
+            preserve_timestamps=bool(options.get("preserve_timestamps", True)),
+            confirm_overwrite=lambda item, owner=record: self._confirm_sftp_overwrite(owner, item),
         )
 
     def _sftp_transfer_changed(self, session_id: str) -> None:
@@ -9346,7 +10180,17 @@ class SSHVaultApp(tk.Tk):
             update_transfer_actions()
             update_mutation_actions()
 
+        def rebind_browser_client(connection) -> None:
+            nonlocal browser_client
+            replacement = SFTPBrowserClient(connection.open_sftp())
+            browser_client = replacement
+            self._sftp_browser_clients.replace(record.session_id, view_id, replacement)
+            remote_cache.clear()
+            state.mark_remote_reconnected(True)
+            load_remote(state.remote_current_path, history_action="refresh")
+
         self._sftp_view_state_callbacks[view_id] = (record.session_id, sync_remote_session)
+        self._sftp_view_rebind_callbacks[view_id] = (record.session_id, rebind_browser_client)
         load()
         load_remote(history_action="initial")
         refresh_transfer_queue()
@@ -9358,6 +10202,7 @@ class SSHVaultApp(tk.Tk):
             self._session_controller.unregister_sftp_view(record.session_id, view_id)
             self._sftp_views.pop(view_id, None)
             self._sftp_view_state_callbacks.pop(view_id, None)
+            self._sftp_view_rebind_callbacks.pop(view_id, None)
             self._sftp_transfer_status_callbacks.pop(view_id, None)
             self._sftp_transfer_queue_callbacks.pop(view_id, None)
             window.destroy()
@@ -9392,6 +10237,8 @@ class SSHVaultApp(tk.Tk):
         self.loaded_profile_snapshot = json.loads(json.dumps(selected))
         self.working_profile = json.loads(json.dumps(selected))
         self.profile_dirty = False
+        self._working_profile_password = ""
+        self._working_profile_password_changed = False
         self.profile_validation_errors = []
         self._refresh_login_tab()
         self._refresh_options_tab()
@@ -9435,6 +10282,8 @@ class SSHVaultApp(tk.Tk):
         self.loaded_profile_snapshot = json.loads(json.dumps(profile))
         self.working_profile = json.loads(json.dumps(profile))
         self.profile_dirty = False
+        self._working_profile_password = ""
+        self._working_profile_password_changed = False
         self.profile_validation_errors = []
         self._refresh_options_tab()
         self._refresh_terminal_tab()
@@ -9455,7 +10304,10 @@ class SSHVaultApp(tk.Tk):
         return True
 
     def recalculate_profile_dirty(self) -> bool:
-        self.profile_dirty = bool(self.working_profile != self.loaded_profile_snapshot)
+        self.profile_dirty = bool(
+            self.working_profile != self.loaded_profile_snapshot
+            or getattr(self, "_working_profile_password_changed", False)
+        )
         self._refresh_profile_heading()
         return self.profile_dirty
 
@@ -9469,6 +10321,8 @@ class SSHVaultApp(tk.Tk):
             json.loads(json.dumps(self.loaded_profile_snapshot)) if self.loaded_profile_snapshot else None
         )
         self.profile_dirty = False
+        self._working_profile_password = ""
+        self._working_profile_password_changed = False
         self.profile_validation_errors = []
         self._refresh_options_tab()
         self._refresh_terminal_tab()
@@ -9482,6 +10336,8 @@ class SSHVaultApp(tk.Tk):
         self.loaded_profile_snapshot = None
         self.working_profile = None
         self.profile_dirty = False
+        self._working_profile_password = ""
+        self._working_profile_password_changed = False
         self.profile_validation_errors = []
         self._refresh_services_tab()
         self._refresh_ssh_tab()
@@ -9496,13 +10352,32 @@ class SSHVaultApp(tk.Tk):
         if idx is None:
             return
         try:
-            self._vault.update(idx, self.working_profile)
+            password = (
+                self._working_profile_password
+                if getattr(self, "_working_profile_password_changed", False)
+                and self.working_profile.get("auth_method") == "password"
+                else None
+            )
+            self._vault.update(
+                idx,
+                self.working_profile,
+                password,
+                remove_password=self.working_profile.get("auth_method") != "password",
+            )
         except ProfileError as exc:
             self.profile_validation_errors = [str(exc)]
             return
         self.loaded_profile_snapshot = json.loads(json.dumps(self._vault.entries[idx]))
         self.working_profile = json.loads(json.dumps(self._vault.entries[idx]))
         self.profile_dirty = False
+        self._working_profile_password = ""
+        self._working_profile_password_changed = False
+        if hasattr(self, "_login_password_var"):
+            self._login_refreshing = True
+            try:
+                self._login_password_var.set("")
+            finally:
+                self._login_refreshing = False
         self._refresh_list()
         self._refresh_profile_heading()
 
@@ -9856,6 +10731,7 @@ class SSHVaultApp(tk.Tk):
         # lived in-memory copy when password authentication needs a credential.
         entry = json.loads(json.dumps(profile))
         entry["timeout"] = self._runtime_settings.get("connection_timeout", 15)
+        proxy_password = ""
         if profile.get("auth_method") == "password":
             try:
                 password = self._vault.secret_for(profile) or ""
@@ -9873,6 +10749,39 @@ class SSHVaultApp(tk.Tk):
             # This is used by this connection attempt only; it is never added
             # to the profile data or written to a local file.
             entry["password"] = password
+        login_options = profile.get("login_options", {})
+        if isinstance(login_options, dict) and login_options.get("proxy_jump_enabled"):
+            proxy_options = validate_proxy_jump_options(login_options)
+            if proxy_options["proxy_jump_auth_method"] == "password":
+                jump_profile = next(
+                    (
+                        candidate
+                        for candidate in self._vault.entries
+                        if str(candidate.get("host", "")).casefold() == str(proxy_options["proxy_jump_host"]).casefold()
+                        and int(candidate.get("port", 22)) == int(proxy_options["proxy_jump_port"])
+                        and str(candidate.get("user", "")).casefold()
+                        == str(proxy_options["proxy_jump_user"]).casefold()
+                    ),
+                    None,
+                )
+                if jump_profile is not None:
+                    try:
+                        proxy_password = self._vault.secret_for(jump_profile) or ""
+                    except ProfileError:
+                        proxy_password = ""
+                if not proxy_password:
+                    proxy_password = (
+                        simpledialog_ask(
+                            "ProxyJump password required",
+                            f"Enter the password for {proxy_options['proxy_jump_user']}@"
+                            f"{proxy_options['proxy_jump_host']}",
+                            secret=True,
+                        )
+                        or ""
+                    )
+                if not proxy_password:
+                    self._status_var.set("Connection cancelled: no ProxyJump password was provided.")
+                    return
         runtime_entries = []
         for candidate in self._vault.entries:
             runtime = dict(candidate)
@@ -9883,6 +10792,8 @@ class SSHVaultApp(tk.Tk):
                     runtime["password"] = ""
             runtime_entries.append(runtime)
         session = self._session_controller.create_session(entry, user_initiated=True)
+        if proxy_password:
+            entry["_proxy_password"] = proxy_password
         # This application-only path belongs to the ConnectionTab adapter, not
         # the validated profile/session snapshot.
         entry["default_download_directory"] = self._runtime_settings.get("download_directory", "")
@@ -10277,7 +11188,7 @@ class SSHVaultApp(tk.Tk):
         KeyGenDialog(self)
 
     def _sftp_server_settings(self):
-        SFTPServerSettingsDialog(self)
+        SFTPServerSettingsDialog(self, self._sftp_server_runtime)
 
     def _open_log(self):
         dialog = tk.Toplevel(self)
@@ -10436,6 +11347,7 @@ class SSHVaultApp(tk.Tk):
 
     def _on_close(self):
         self._save_session()
+        self._sftp_server_runtime.stop()
         # Disconnect every open session before tearing down the window;
         # otherwise SSH clients/channels and their panels are left dangling
         # and the app can linger instead of closing completely.

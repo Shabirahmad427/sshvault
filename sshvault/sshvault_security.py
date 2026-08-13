@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 import paramiko
 
 from sshvault_core import (
+    HostKeySessionStatus,
     ProfileError,
     SSHRuntimePreferences,
     connection_kwargs,
@@ -487,10 +488,32 @@ class InteractiveHostKeyPolicy(paramiko.MissingHostKeyPolicy):
         )
         decision = self.decide(request)
         if decision is TrustDecision.TRUST_ONCE:
+            self.manager.last_host_key_verification = HostKeySessionStatus(
+                request.host_role,
+                request.hostname,
+                request.key_type,
+                request.fingerprint,
+                "Unknown key trusted once",
+            )
             return
         if decision is TrustDecision.TRUST_AND_SAVE:
             self.manager.known_hosts.save_key(self.manager.hostname, self.manager.port, key)
+            self.manager.last_host_key_verification = HostKeySessionStatus(
+                request.host_role,
+                request.hostname,
+                request.key_type,
+                request.fingerprint,
+                "Unknown key trusted and saved",
+            )
             return
+        self.manager.last_host_key_verification = HostKeySessionStatus(
+            request.host_role,
+            request.hostname,
+            request.key_type,
+            request.fingerprint,
+            "Unknown key rejected",
+            connected=False,
+        )
         raise UnknownHostCancelled("Unknown host key was not trusted")
 
 
@@ -500,6 +523,7 @@ class SSHConnectionManager:
     def __init__(self, known_hosts: KnownHostsStore, hostname: str, port: int) -> None:
         self.known_hosts, self.hostname, self.port = known_hosts, hostname, port
         self.last_runtime_preferences: SSHRuntimePreferences | None = None
+        self.last_host_key_verification: HostKeySessionStatus | None = None
         self.agent_diagnostics: list[AgentAuthenticationDiagnostic] = []
 
     def connect(
@@ -560,6 +584,21 @@ class SSHConnectionManager:
             client.close()
             raise
         self.last_runtime_preferences = runtime
+        if self.last_host_key_verification is None:
+            try:
+                key = transport.get_remote_server_key()
+                algorithm = key.get_name()
+                fingerprint = sha256_fingerprint(key)
+            except (AttributeError, TypeError, ValueError):
+                pass
+            else:
+                self.last_host_key_verification = HostKeySessionStatus(
+                    str(profile.get("host_role", "Destination host")),
+                    self.hostname,
+                    algorithm,
+                    fingerprint,
+                    "Verified against known hosts",
+                )
         return client
 
     def changed_request(self, profile: dict[str, Any], error: paramiko.BadHostKeyException) -> ChangedHostKeyRequest:

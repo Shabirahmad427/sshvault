@@ -7,7 +7,8 @@ import json
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from sshvault_core import TransferScheduler, VTEAvailability, VTETerminalBackend
+from sshvault import ConnectionTab
+from sshvault_core import SessionController, TransferScheduler, VTEAvailability, VTETerminalBackend
 from sshvault_vte_helper import (
     NATIVE_VTE_CLOSE_TAB_LABEL,
     _dispatch_terminal_keypress,
@@ -110,11 +111,47 @@ class NativeVTEIndividualCloseTests(unittest.TestCase):
         self.assertTrue(connected)
         self.assertEqual(connection.recv_calls, 3)
 
+    def test_helper_preserves_partial_frame_until_next_read(self) -> None:
+        message = {"type": "focus_tab", "request_id": "fragmented"}
+        wire = json.dumps(message).encode() + b"\n"
+        first = _NonBlockingSocket([wire[:11]])
+        pending, decoded, connected = _read_control_messages(first, b"")  # type: ignore[arg-type]
+        self.assertEqual(decoded, [])
+        self.assertEqual(pending, wire[:11])
+        self.assertTrue(connected)
+        second = _NonBlockingSocket([wire[11:]])
+        pending, decoded, connected = _read_control_messages(second, pending)  # type: ignore[arg-type]
+        self.assertEqual((pending, decoded, connected), (b"", [message], True))
+
+    def test_helper_partial_frame_then_disconnect_is_not_parsed(self) -> None:
+        connection = _NonBlockingSocket([b'{"type":"focus_tab"', b""])
+        pending, decoded, connected = _read_control_messages(connection, b"")  # type: ignore[arg-type]
+        self.assertEqual(decoded, [])
+        self.assertTrue(pending)
+        self.assertFalse(connected)
+
+    def test_helper_discards_only_malformed_frame(self) -> None:
+        valid = {"type": "list_terminals", "request_id": "valid"}
+        connection = _NonBlockingSocket([b"{bad json}\n" + json.dumps(valid).encode() + b"\n"])
+        pending, decoded, connected = _read_control_messages(connection, b"")  # type: ignore[arg-type]
+        self.assertEqual((pending, decoded, connected), (b"", [valid], True))
+
     def test_native_vte_has_no_duplicate_resize_or_focus_forwarding(self) -> None:
         source = (Path(__file__).resolve().parents[1] / "sshvault_vte_helper.py").read_text(encoding="utf-8")
         self.assertNotIn('connect("focus-in-event"', source)
         self.assertNotIn('connect("size-allocate"', source)
         self.assertNotIn("timeout_add", source)
+
+    def test_native_vte_helper_applies_appearance_settings(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "sshvault_vte_helper.py").read_text(encoding="utf-8")
+        for call in (
+            "terminal.set_font(description)",
+            "terminal.set_cursor_shape",
+            "terminal.set_cursor_blink_mode",
+            "terminal.set_color_foreground",
+            "terminal.set_color_background",
+        ):
+            self.assertIn(call, source)
 
     def test_vte_control_remains_responsive_while_sftp_worker_lock_is_held(self) -> None:
         scheduler = TransferScheduler(lambda: Mock())
@@ -159,25 +196,42 @@ class NativeVTEIndividualCloseTests(unittest.TestCase):
         close_button.callback(close_button)
         self.assertEqual(closed, ["second"])
 
-    def test_backend_close_removes_one_terminal_and_preserves_sibling(self) -> None:
+    def test_successful_close_acknowledgement_removes_only_requested_terminal(self) -> None:
         backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
         backend._terminals = {
-            "first": {"terminal_id": "first"},
-            "second": {"terminal_id": "second"},
+            "first": {"terminal_id": "first", "session_id": "sahmaddo"},
+            "second": {"terminal_id": "second", "session_id": "sahmaddo"},
         }
         backend.last_terminal_id = "second"
         backend._connection = Mock()
         backend._process = Mock()
         backend._process.poll.return_value = None
-        with (
-            patch("sshvault_core.threading.Thread") as thread,
-        ):
+        entered = threading.Event()
+        release = threading.Event()
+        completed = threading.Event()
+        result = []
+
+        def request(*_args, **_kwargs):
+            entered.set()
+            release.wait(1)
+            return {"ok": True}
+
+        with patch.object(backend, "_request", side_effect=request):
             self.assertTrue(backend.close_terminal("first"))
-        thread.assert_called_once()
-        thread.return_value.start.assert_called_once_with()
+            self.assertTrue(entered.wait(0.5))
+            self.assertIn("first", backend._terminals)
+            self.assertTrue(
+                backend.close_terminal(
+                    "first",
+                    lambda *values: (result.append(values), completed.set()),
+                )
+            )
+            release.set()
+            self.assertTrue(completed.wait(1))
         self.assertNotIn("first", backend._terminals)
         self.assertIn("second", backend._terminals)
         self.assertEqual(backend.last_terminal_id, "second")
+        self.assertEqual(result, [("first", True, "")])
 
     def test_closing_terminal_returns_before_slow_ipc_reply(self) -> None:
         backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
@@ -186,19 +240,145 @@ class NativeVTEIndividualCloseTests(unittest.TestCase):
         backend._process = Mock()
         backend._process.poll.return_value = None
         finished = threading.Event()
-        reaped = threading.Event()
-        backend._process.wait.side_effect = lambda timeout: reaped.set()
 
         def slow_request(*_args, **_kwargs):
             time.sleep(0.2)
             finished.set()
+            return {"ok": True}
 
         with patch.object(backend, "_request", side_effect=slow_request):
             started = time.monotonic()
             self.assertTrue(backend.close_terminal("terminal"))
             self.assertLess(time.monotonic() - started, 0.1)
             self.assertTrue(finished.wait(1))
+            for _ in range(100):
+                if "terminal" not in backend._terminals:
+                    break
+                time.sleep(0.005)
+            self.assertNotIn("terminal", backend._terminals)
+
+    def test_failed_close_keeps_terminal_ownership(self) -> None:
+        backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
+        backend._terminals = {"terminal": {"terminal_id": "terminal", "session_id": "sahmaddo"}}
+        backend._connection = Mock()
+        backend._process = Mock()
+        backend._process.poll.return_value = None
+        completed = threading.Event()
+        result = []
+        with patch.object(backend, "_request", return_value={"ok": False, "error": "close rejected"}):
+            self.assertTrue(
+                backend.close_terminal(
+                    "terminal",
+                    lambda *values: (result.append(values), completed.set()),
+                )
+            )
+            self.assertTrue(completed.wait(1))
+        self.assertIn("terminal", backend._terminals)
+        self.assertEqual(result, [("terminal", False, "close rejected")])
+        self.assertEqual(backend.last_close_error, "close rejected")
+
+    def test_helper_death_during_close_cleans_stale_session_ownership(self) -> None:
+        controller = SessionController()
+        session = controller.create_session(
+            {"id": "sahmaddo", "host": "coaraci", "port": 22, "user": "sahmaddo", "auth_method": "agent"}
+        )
+        controller.register_terminal(session.session_id, "terminal")
+        tab = type("Tab", (), {})()
+        tab._native_terminal_ids = {"terminal"}
+        tab._session_controller = controller
+        tab.session_id = session.session_id
+        tab._terminal_backend_status = Mock()
+        tab.after = lambda _delay, callback: callback()
+
+        backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
+        backend._terminals = {"terminal": {"terminal_id": "terminal", "session_id": session.session_id}}
+        backend._connection = Mock()
+        backend._process = Mock()
+        backend._process.poll.return_value = None
+        completed = threading.Event()
+
+        def helper_dies(*_args, **_kwargs):
+            backend._process.poll.return_value = 1
+            return None
+
+        def callback(terminal_id, remove, error):
+            ConnectionTab._native_terminal_close_completed(tab, terminal_id, remove, error)
+            completed.set()
+
+        with (
+            patch.object(backend, "_request", side_effect=helper_dies),
+            patch("sshvault.messagebox.showwarning"),
+        ):
+            self.assertTrue(backend.close_terminal("terminal", callback))
+            self.assertTrue(completed.wait(1))
+        self.assertNotIn("terminal", backend._terminals)
+        self.assertNotIn("terminal", tab._native_terminal_ids)
+        self.assertNotIn("terminal", session.terminal_ids)
+        self.assertEqual(backend.reason, "helper exited during terminal close")
+
+    def test_double_close_sends_only_one_helper_request(self) -> None:
+        backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
+        backend._terminals = {"terminal": {"terminal_id": "terminal"}}
+        backend._connection = Mock()
+        backend._process = Mock()
+        backend._process.poll.return_value = None
+        entered = threading.Event()
+        release = threading.Event()
+
+        def request(*_args, **_kwargs):
+            entered.set()
+            release.wait(1)
+            return {"ok": True}
+
+        with patch.object(backend, "_request", side_effect=request) as request_mock:
+            self.assertTrue(backend.close_terminal("terminal"))
+            self.assertTrue(entered.wait(0.5))
+            self.assertTrue(backend.close_terminal("terminal"))
+            release.set()
+            for _ in range(100):
+                if "terminal" not in backend._terminals:
+                    break
+                time.sleep(0.005)
+            self.assertTrue(backend.close_terminal("terminal"))
+        request_mock.assert_called_once_with("close_tab", terminal_id="terminal")
+
+    def test_close_isolated_across_sessions_and_unrelated_resources(self) -> None:
+        backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
+        backend._terminals = {
+            "sahmaddo-one": {"terminal_id": "sahmaddo-one", "session_id": "sahmaddo"},
+            "sahmaddo-two": {"terminal_id": "sahmaddo-two", "session_id": "sahmaddo"},
+            "clauberh-one": {"terminal_id": "clauberh-one", "session_id": "clauberh"},
+        }
+        backend._connection = Mock()
+        backend._process = Mock()
+        backend._process.poll.return_value = None
+        ssh_connection = object()
+        sftp_scheduler = object()
+        with patch.object(backend, "_request", return_value={"ok": True}):
+            self.assertTrue(backend.close_terminal("sahmaddo-one"))
+            for _ in range(100):
+                if "sahmaddo-one" not in backend._terminals:
+                    break
+                time.sleep(0.005)
+        self.assertEqual(set(backend._terminals), {"sahmaddo-two", "clauberh-one"})
+        self.assertIsNotNone(ssh_connection)
+        self.assertIsNotNone(sftp_scheduler)
+
+    def test_last_terminal_close_reaps_helper_without_orphan_metadata(self) -> None:
+        backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
+        backend._terminals = {"terminal": {"terminal_id": "terminal"}}
+        backend._connection = Mock()
+        backend._process = Mock()
+        backend._process.poll.return_value = None
+        reaped = threading.Event()
+        backend._process.wait.side_effect = lambda timeout: reaped.set()
+        with patch.object(backend, "_request", return_value={"ok": True}):
+            self.assertTrue(backend.close_terminal("terminal"))
             self.assertTrue(reaped.wait(1))
+        self.assertEqual(backend._terminals, {})
+        self.assertEqual(backend._closing_terminals, {})
+        helper_source = (Path(__file__).resolve().parents[1] / "sshvault_vte_helper.py").read_text(encoding="utf-8")
+        self.assertIn("os.kill(pid, signal.SIGHUP)", helper_source)
 
 
 if __name__ == "__main__":

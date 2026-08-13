@@ -28,7 +28,7 @@ sshvault = "sshvault:main"
 
 [tool.setuptools]
 package-dir = {"" = "sshvault"}
-py-modules = ["sshvault", "sshvault_core", "sshvault_security", "sshvault_vte_helper"]
+py-modules = ["sshvault", "sshvault_core", "sshvault_security", "sshvault_sftp_server", "sshvault_vte_helper"]
 
 [tool.ruff]
 line-length = 120

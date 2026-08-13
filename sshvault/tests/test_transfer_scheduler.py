@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 
 from sshvault_core import (
+    ProfileError,
     TransferBatch,
     TransferItem,
     TransferScheduler,
@@ -42,6 +43,16 @@ class TimeoutSFTP(FakeSFTP):
 
     def get_channel(self):
         return self.channel
+
+
+class BlockingSFTP(TimeoutSFTP):
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.closed_event = threading.Event()
+
+    def close(self):
+        super().close()
+        self.closed_event.set()
 
 
 class FakeTransport:
@@ -142,6 +153,99 @@ class TransferSchedulerTests(unittest.TestCase):
         self.assertEqual(item.status, TransferState.COMPLETED)
         self.assertEqual(self.clients[0].channel.timeout, 7)
         scheduler.shutdown()
+
+    def test_shutdown_releases_blocked_worker_and_leaves_no_threads(self):
+        entered = threading.Event()
+        scheduler = TransferScheduler(
+            lambda: BlockingSFTP(self),
+            concurrency=1,
+            operation_timeout=0.05,
+            monitor_interval=1000,
+        )
+
+        def blocked(item, client, worker):
+            entered.set()
+            client.closed_event.wait()
+            worker.checkpoint(item.transferred, item.total)
+
+        item = scheduler.enqueue(TransferItem("blocked", "blocked", "Upload", total=1), blocked)
+        self.assertTrue(entered.wait(0.5))
+        worker_threads = list(scheduler._threads.values())
+        monitor = scheduler._monitor_thread
+        started = time.monotonic()
+        scheduler.shutdown(timeout=0.2)
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertEqual(item.status, TransferState.CANCELLED)
+        self.assertTrue(all(client.closed for client in self.clients))
+        self.assertTrue(all(client.channel.timeout == 1.0 for client in self.clients))
+        self.assertTrue(all(not thread.is_alive() for thread in worker_threads))
+        self.assertIsNotNone(monitor)
+        self.assertFalse(monitor.is_alive())
+
+    def test_shutdown_signals_and_joins_blocked_folder_producer(self):
+        scheduler = self.scheduler(1)
+        entered = threading.Event()
+
+        def blocked_producer(_item, stop_event):
+            entered.set()
+            stop_event.wait()
+
+        planning = scheduler.start_producer(
+            TransferItem("folder", "remote", "Upload"),
+            blocked_producer,
+        )
+        self.assertTrue(entered.wait(0.5))
+        producer_threads = list(scheduler._producer_threads)
+        scheduler.shutdown(timeout=0.2)
+        self.assertEqual(planning.status, TransferState.CANCELLED)
+        self.assertTrue(all(not thread.is_alive() for thread in producer_threads))
+        self.assertEqual(scheduler._producer_threads, set())
+
+    def test_repeated_shutdown_is_safe_and_rejects_new_jobs(self):
+        scheduler = self.scheduler(1)
+        scheduler.shutdown(timeout=0.1)
+        scheduler.shutdown(timeout=0.1)
+        with self.assertRaisesRegex(ProfileError, "Transfer queue is closed"):
+            scheduler.enqueue(TransferItem("new", "new", "Upload"), self.blocking_operation)
+
+    def test_shutdown_isolated_between_session_schedulers(self):
+        first_owner = type("Owner", (), {"clients": []})()
+        second_owner = type("Owner", (), {"clients": []})()
+        first_entered = threading.Event()
+        first = TransferScheduler(
+            lambda: BlockingSFTP(first_owner), concurrency=1, session_id="sahmaddo", monitor_interval=1000
+        )
+        second = TransferScheduler(
+            lambda: BlockingSFTP(second_owner),
+            concurrency=1,
+            reuse_worker_channels=True,
+            session_id="clauberh",
+            monitor_interval=1000,
+        )
+
+        def blocked(_item, client, _worker):
+            first_entered.set()
+            client.closed_event.wait()
+
+        try:
+            first.enqueue(TransferItem("first", "first", "Upload", total=1), blocked)
+            self.assertTrue(first_entered.wait(0.5))
+            first.shutdown(timeout=0.2)
+            completed = second.enqueue(
+                TransferItem("second", "second", "Upload", total=1),
+                lambda item, _client, worker: worker.checkpoint(1, item.total),
+            )
+            for _ in range(100):
+                if completed.status == TransferState.COMPLETED:
+                    break
+                time.sleep(0.005)
+            self.assertEqual(completed.status, TransferState.COMPLETED)
+            self.assertFalse(second.closed)
+            self.assertTrue(all(client.closed for client in first_owner.clients))
+            self.assertTrue(all(not client.closed for client in second_owner.clients))
+        finally:
+            first.shutdown(timeout=0.2)
+            second.shutdown(timeout=0.2)
 
     def test_retry_failed_resubmits_only_failed_items(self):
         scheduler = self.scheduler(1)

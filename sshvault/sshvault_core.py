@@ -1112,6 +1112,31 @@ class SSHRuntimePreferences:
         }
 
 
+@dataclass
+class SessionKeepaliveState:
+    """Consecutive keepalive health for exactly one connected session."""
+
+    session_id: str
+    maximum_missed: int
+    missed: int = 0
+    unhealthy: bool = False
+
+    def record(self, successful: bool) -> bool:
+        """Return true only when this observation reaches the failure threshold."""
+        if successful:
+            self.reset()
+            return False
+        self.missed += 1
+        if self.missed >= max(1, int(self.maximum_missed)):
+            self.unhealthy = True
+            return True
+        return False
+
+    def reset(self) -> None:
+        self.missed = 0
+        self.unhealthy = False
+
+
 def ssh_runtime_preferences(profile: object) -> SSHRuntimePreferences:
     """Build one immutable runtime policy; Automatic values are omitted."""
     values = ssh_preferences_from_profile(profile)
@@ -1158,6 +1183,8 @@ def default_profile_sections(raw: dict[str, Any] | None = None) -> dict[str, Any
             "cursor_blink": True,
             "bell": "System bell",
             "color_theme": "System",
+            "foreground": "#f1f3f4",
+            "background": "#202124",
             "agent_forwarding": False,
             "x11_forwarding": False,
             "x11_trusted": False,
@@ -1195,6 +1222,48 @@ def default_profile_sections(raw: dict[str, Any] | None = None) -> dict[str, Any
             "startup_command": "",
         },
     }
+
+
+def validate_proxy_jump_options(raw: object) -> dict[str, Any]:
+    """Validate the editable direct ProxyJump fields without retaining secrets."""
+    if not isinstance(raw, dict):
+        raise ProfileError("ProxyJump settings must be an object.")
+    enabled = raw.get("proxy_jump_enabled", False)
+    if not isinstance(enabled, bool):
+        raise ProfileError("ProxyJump must be enabled or disabled.")
+    host = str(raw.get("proxy_jump_host", "")).strip()
+    user = str(raw.get("proxy_jump_user", "")).strip()
+    port = raw.get("proxy_jump_port", DEFAULT_PORT)
+    auth_method = str(raw.get("proxy_jump_auth_method", "agent")).strip().lower()
+    if enabled:
+        host = validate_host(host)
+        port = validate_port(port)
+        if not user or any(char.isspace() for char in user) or len(user) > 128:
+            raise ProfileError("ProxyJump username is required and cannot contain spaces.")
+        if auth_method not in {"agent", "password"}:
+            raise ProfileError("Choose SSH agent or password authentication for ProxyJump.")
+    else:
+        try:
+            port = validate_port(port)
+        except ProfileError:
+            port = DEFAULT_PORT
+        auth_method = auth_method if auth_method in {"agent", "password"} else "agent"
+    return {
+        "proxy_jump_enabled": enabled,
+        "proxy_jump_host": host,
+        "proxy_jump_port": port,
+        "proxy_jump_user": user,
+        "proxy_jump_auth_method": auth_method,
+    }
+
+
+def proxy_jump_target(options: object) -> str:
+    """Return the OpenSSH-compatible target represented by direct jump settings."""
+    values = validate_proxy_jump_options(options)
+    if not values["proxy_jump_enabled"]:
+        return ""
+    target = f"{values['proxy_jump_user']}@{values['proxy_jump_host']}"
+    return target if values["proxy_jump_port"] == DEFAULT_PORT else f"{target}:{values['proxy_jump_port']}"
 
 
 X11_FORWARDING_STATUSES = ("Stopped", "Active", "Failed")
@@ -2472,6 +2541,19 @@ class AdaptiveTransferTuner:
 
 
 @dataclass
+class TransferPreflightDiagnostics:
+    """Best-effort metadata captured before transfer bytes move."""
+
+    source_size: int | None = None
+    source_mtime: int | float | None = None
+    source_open: bool | None = None
+    destination_free_space: int | None = None
+    existing_partial_size: int | None = None
+    session_id: str | None = None
+    profile_id: str | None = None
+
+
+@dataclass
 class TransferItem:
     """A serializable transfer request and its UI-independent progress."""
 
@@ -2496,6 +2578,7 @@ class TransferItem:
     session_id: str | None = None
     profile_id: str | None = None
     diagnostics: list[str] = field(default_factory=list)
+    preflight: TransferPreflightDiagnostics = field(default_factory=TransferPreflightDiagnostics)
     metrics: TransferTimingMetrics = field(default_factory=TransferTimingMetrics)
 
     def progress(self) -> float | None:
@@ -2849,6 +2932,7 @@ def adopt_legacy_download(plan: DownloadResumePlan, *, now: float | None = None)
 
 
 TransferOperation = Callable[[TransferItem, Any, "TransferWorker"], None]
+TransferProducer = Callable[[TransferItem, threading.Event], None]
 
 
 class TransferWorker:
@@ -2861,6 +2945,7 @@ class TransferWorker:
     def __init__(self, scheduler: "TransferScheduler", item_id: str, attempt: int, client: Any) -> None:
         self.scheduler, self.item_id, self.attempt, self.client = scheduler, item_id, attempt, client
         self.worker_id = uuid4().hex
+        self.operation_timeout = scheduler.operation_timeout
 
     def checkpoint(self, transferred: int | None = None, total: int | None = None) -> None:
         self.scheduler._checkpoint(self.item_id, self.attempt, transferred, total, self.worker_id)
@@ -2876,13 +2961,18 @@ class TransferWorker:
     def reconnect_client(self) -> Any:
         """Replace this worker's failed channel without changing its queue item."""
         self.client = self.scheduler._reconnect_worker_client(
-            self.item_id, self.attempt, self.worker_id, self.client
+            self.item_id,
+            self.attempt,
+            self.worker_id,
+            self.client,
+            self.operation_timeout,
         )
         return self.client
 
     def set_operation_timeout(self, value: float) -> None:
         """Raise the per-operation channel timeout for a known large transfer."""
-        self.scheduler._set_client_timeout(self.client, value)
+        self.operation_timeout = max(1.0, float(value))
+        self.scheduler._set_client_timeout(self.client, self.operation_timeout)
 
     @property
     def cancelled(self) -> bool:
@@ -2936,8 +3026,10 @@ class TransferScheduler:
         self.session_id = session_id
         self.profile_id = profile_id
         self.operation_timeout = max(1.0, float(operation_timeout))
+        self._suspended_for_reconnect = False
         self._idle_worker_clients: list[Any] = []
         self._producer_threads: set[threading.Thread] = set()
+        self._shutdown_event = threading.Event()
         self.diagnostic_events: list[dict[str, Any]] = []
         self._monitor_stop = threading.Event()
         self._monitor_thread: threading.Thread | None = None
@@ -2963,6 +3055,7 @@ class TransferScheduler:
         attempt: int,
         worker_id: str,
         failed_client: Any,
+        operation_timeout: float | None = None,
     ) -> Any:
         """Reconnect one worker and atomically publish its replacement channel."""
         if self.client_factory is None:
@@ -2972,7 +3065,10 @@ class TransferScheduler:
         except Exception:
             pass
         replacement = self.client_factory()
-        self._set_client_timeout(replacement, self.operation_timeout)
+        self._set_client_timeout(
+            replacement,
+            self.operation_timeout if operation_timeout is None else operation_timeout,
+        )
         with self._condition:
             item = self.get(item_id)
             if (
@@ -3066,14 +3162,14 @@ class TransferScheduler:
             batch.children.append(queued.item_id)
         return queued
 
-    def start_producer(self, item: TransferItem, producer: Callable[[TransferItem], None]) -> TransferItem:
+    def start_producer(self, item: TransferItem, producer: TransferProducer) -> TransferItem:
         """Show a planning row immediately and run incremental discovery off-thread."""
         item.status = TransferState.PREPARING
         self.record(item)
 
         def run() -> None:
             try:
-                producer(item)
+                producer(item, self._shutdown_event)
                 with self._condition:
                     if not self.closed and item.status != TransferState.FAILED:
                         item.status = TransferState.COMPLETED
@@ -3092,7 +3188,9 @@ class TransferScheduler:
             if self.closed:
                 raise ProfileError("Transfer queue is closed.")
             self._producer_threads.add(thread)
-        thread.start()
+            # Starting while holding the scheduler lock prevents shutdown from
+            # trying to join a registered thread that has not started yet.
+            thread.start()
         return item
 
     def batch_progress(self, batch_id: str) -> TransferProgress | None:
@@ -3138,6 +3236,8 @@ class TransferScheduler:
     def _schedule_locked(self) -> list[threading.Thread]:
         """Reserve slots and create workers while locked; start them after unlock."""
         threads: list[threading.Thread] = []
+        if self._suspended_for_reconnect:
+            return threads
         # The compatibility queue deliberately has no client factory.  Keep its
         # historical manual lifecycle without spawning a worker.
         if self.client_factory is None:
@@ -3172,10 +3272,23 @@ class TransferScheduler:
             threads.append(thread)
         return threads
 
-    @staticmethod
-    def _start_threads(threads: list[threading.Thread]) -> None:
-        for thread in threads:
-            thread.start()
+    def _start_threads(self, threads: list[threading.Thread]) -> None:
+        if not threads:
+            return
+        with self._condition:
+            if self.closed:
+                unstarted = set(threads)
+                for item_id, thread in list(self._threads.items()):
+                    if thread in unstarted:
+                        self._threads.pop(item_id, None)
+                        self._active.discard(item_id)
+                self._condition.notify_all()
+                return
+            # As with producers, publish and start atomically with respect to
+            # shutdown. The worker waits for this lock before publishing its
+            # client, so no I/O is performed while the lock is held.
+            for thread in threads:
+                thread.start()
 
     def _diagnostic_locked(self, item: TransferItem, worker_id: str, state: str, *, reason: str = "") -> None:
         if not self.debug_transfers:
@@ -3197,6 +3310,14 @@ class TransferScheduler:
         worker: TransferWorker | None = None
         reusable = False
         try:
+            with self._condition:
+                if (
+                    self.closed
+                    or generation != self.generation
+                    or attempt != self._attempts.get(item_id)
+                    or item_id in self._cancelled_ids
+                ):
+                    return
             if self.client_factory is None:
                 raise RuntimeError("No SFTP client factory is available.")
             channel_started = time.perf_counter()
@@ -3578,13 +3699,61 @@ class TransferScheduler:
                 pass
         self._changed()
 
-    def shutdown(self, timeout: float = 1.0) -> None:
+    def suspend_for_reconnect(self) -> None:
+        """Detach old channels while preserving resumable queue state."""
         with self._condition:
+            if self.closed or self._suspended_for_reconnect:
+                return
+            self._suspended_for_reconnect = True
+            self.generation += 1
+            interrupted = set(self._threads) | set(self._active)
+            for item in self.items:
+                if item.status in TransferState.TERMINAL:
+                    continue
+                item.generation = self.generation
+                if item.item_id in interrupted:
+                    self._attempts[item.item_id] = self._attempts.get(item.item_id, 0) + 1
+                    item.status = TransferState.PAUSED if item.item_id in self._paused else TransferState.PENDING
+                    item.speed = 0.0
+            clients = list(self._clients.values())
+            clients.extend(self._idle_worker_clients)
+            self._clients.clear()
+            self._idle_worker_clients.clear()
+            self._active.clear()
+            self._threads.clear()
+            self._condition.notify_all()
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                pass
+        self._changed()
+
+    def rebind_client_factory(self, client_factory: Callable[[], Any]) -> None:
+        """Resume this session's queue using channels from a new SSH transport."""
+        with self._condition:
+            if self.closed:
+                raise ProfileError("Transfer queue is closed.")
+            self.client_factory = client_factory
+            self._suspended_for_reconnect = False
+            threads = self._schedule_locked()
+            self._condition.notify_all()
+        self._start_threads(threads)
+        self._changed()
+
+    def shutdown(self, timeout: float = 1.0) -> None:
+        """Cancel this session queue and perform bounded owned-channel cleanup."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._condition:
+            first_shutdown = not self.closed
             self.closed = True
+            self._shutdown_event.set()
+            if first_shutdown:
+                self.generation += 1
             for item in self.items:
                 if item.status not in TransferState.TERMINAL:
                     item.status = TransferState.CANCELLED
-            self._cancelled_ids.update(self._active)
+                    self._cancelled_ids.add(item.item_id)
             threads = list(self._threads.values())
             producer_threads = list(self._producer_threads)
             clients = list(self._clients.values())
@@ -3592,19 +3761,24 @@ class TransferScheduler:
             self._idle_worker_clients.clear()
             self._condition.notify_all()
         self._monitor_stop.set()
-        for client in clients:
+        owned_clients = list({id(client): client for client in clients}.values())
+        for client in owned_clients:
             try:
                 client.close()
             except Exception:
                 pass
-        for thread in threads:
-            if thread is not threading.current_thread():
-                thread.join(timeout=timeout)
-        for thread in producer_threads:
-            if thread is not threading.current_thread():
-                thread.join(timeout=min(timeout, 0.1))
-        if self._monitor_thread is not None and self._monitor_thread is not threading.current_thread():
-            self._monitor_thread.join(timeout=timeout)
+
+        current = threading.current_thread()
+        cleanup_threads = [*threads, *producer_threads]
+        if self._monitor_thread is not None:
+            cleanup_threads.append(self._monitor_thread)
+        for thread in dict.fromkeys(cleanup_threads):
+            if thread is current or not thread.is_alive():
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
         self._changed()
 
     def _monitor_stalls(self) -> None:
@@ -3700,10 +3874,80 @@ class SFTPTransferRouter:
         *,
         verify_completed: bool = True,
         follow_symlinks: bool = False,
+        collision_behavior: str = "overwrite",
+        resume_partial: bool = True,
+        preserve_timestamps: bool = True,
+        confirm_overwrite: Callable[[TransferItem], bool] | None = None,
     ) -> None:
         self.scheduler = scheduler
         self.verify_completed = verify_completed
         self.follow_symlinks = follow_symlinks
+        normalized_collision = collision_behavior.strip().casefold()
+        if normalized_collision not in {"ask", "overwrite", "skip", "rename"}:
+            raise ProfileError("Invalid SFTP overwrite behavior")
+        self.collision_behavior = normalized_collision
+        self.resume_partial = resume_partial
+        self.preserve_timestamps = preserve_timestamps
+        self.confirm_overwrite = confirm_overwrite
+
+    @staticmethod
+    def _renamed_path(path: str, number: int) -> str:
+        parent, name = posixpath.split(path)
+        stem, suffix = posixpath.splitext(name)
+        return posixpath.join(parent, f"{stem} ({number}){suffix}")
+
+    @staticmethod
+    def _remote_path_exists(client: Any, path: str) -> bool:
+        try:
+            client.stat(path)
+        except (OSError, FileNotFoundError):
+            return False
+        return True
+
+    def _prepare_upload_destination(self, item: TransferItem, client: Any) -> bool:
+        """Resolve one upload collision; return false when the file is skipped."""
+        if not self._remote_path_exists(client, item.target):
+            return True
+        behavior = self.collision_behavior
+        if behavior == "ask":
+            behavior = "overwrite" if self.confirm_overwrite and self.confirm_overwrite(item) else "skip"
+        if behavior == "skip":
+            item.diagnostics.append("Skipped existing destination")
+            return False
+        if behavior == "rename":
+            original = item.target
+            number = 1
+            while True:
+                candidate = self._renamed_path(original, number)
+                if not self._remote_path_exists(client, candidate) and not self._remote_path_exists(
+                    client, f"{candidate}.sshvault-part"
+                ):
+                    item.target = candidate
+                    return True
+                number += 1
+        return True
+
+    def _prepare_download_destination(self, item: TransferItem) -> bool:
+        """Resolve one download collision; return false when the file is skipped."""
+        target = Path(item.target)
+        if not target.exists():
+            return True
+        behavior = self.collision_behavior
+        if behavior == "ask":
+            behavior = "overwrite" if self.confirm_overwrite and self.confirm_overwrite(item) else "skip"
+        if behavior == "skip":
+            item.diagnostics.append("Skipped existing destination")
+            return False
+        if behavior == "rename":
+            original = item.target
+            number = 1
+            while True:
+                candidate = self._renamed_path(original, number)
+                if not Path(candidate).exists() and not Path(f"{candidate}.sshvault-part").exists():
+                    item.target = candidate
+                    return True
+                number += 1
+        return True
 
     @staticmethod
     def _raise_remote_error(exc: BaseException, fallback: str = "Transfer failed") -> None:
@@ -3736,6 +3980,58 @@ class SFTPTransferRouter:
     def _source_snapshot(path: Path) -> tuple[int, int]:
         info = path.stat()
         return int(info.st_size), int(info.st_mtime_ns)
+
+    def _new_preflight(self) -> TransferPreflightDiagnostics:
+        return TransferPreflightDiagnostics(
+            session_id=self.scheduler.session_id,
+            profile_id=self.scheduler.profile_id,
+        )
+
+    @staticmethod
+    def _local_source_open(path: Path) -> bool | None:
+        """Detect an open local inode through procfs; unknown elsewhere."""
+        proc = Path("/proc")
+        if not proc.is_dir():
+            return None
+        try:
+            source = path.stat()
+            processes = list(proc.iterdir())
+        except OSError:
+            return None
+        for process in processes:
+            if not process.name.isdigit():
+                continue
+            try:
+                descriptors = (process / "fd").iterdir()
+                for descriptor in descriptors:
+                    try:
+                        opened = descriptor.stat()
+                    except OSError:
+                        continue
+                    if opened.st_dev == source.st_dev and opened.st_ino == source.st_ino:
+                        return True
+            except OSError:
+                continue
+        return False
+
+    @staticmethod
+    def _remote_free_space(client: Any, path: str) -> int | None:
+        statvfs = getattr(client, "statvfs", None)
+        if not callable(statvfs):
+            return None
+        try:
+            info = statvfs(path or "/")
+            block_size = int(getattr(info, "f_frsize", 0) or getattr(info, "f_bsize", 0))
+            return int(info.f_bavail) * block_size
+        except (OSError, AttributeError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _local_free_space(path: Path) -> int | None:
+        try:
+            return int(shutil.disk_usage(path).free)
+        except OSError:
+            return None
 
     @staticmethod
     def _large_file_timeout(total: int, configured: float) -> float:
@@ -3820,13 +4116,37 @@ class SFTPTransferRouter:
 
     @staticmethod
     def _digest_remote(client: Any, path: str, length: int | None = None) -> bytes | None:
+        """Return a remote SHA-1 using check-file or a streamed fallback."""
         try:
             with client.open(path, "rb") as source:
                 checker = getattr(source, "check", None)
-                if not callable(checker):
+                if callable(checker):
+                    try:
+                        checked = checker("sha1", length=length or 0)
+                        if isinstance(checked, bytes):
+                            return checked
+                    except (OSError, NotImplementedError, AttributeError, TypeError):
+                        pass
+                try:
+                    source.seek(0)
+                except (OSError, AttributeError, TypeError, ValueError):
+                    pass
+                digest = hashlib.sha1()
+                remaining = length
+                while True:
+                    size = 256 * 1024 if remaining is None else min(256 * 1024, remaining)
+                    if size <= 0:
+                        break
+                    chunk = source.read(size)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    if remaining is not None:
+                        remaining -= len(chunk)
+                if remaining is not None and remaining > 0:
                     return None
-                return cast(bytes, checker("sha1", length=length or 0))
-        except (OSError, NotImplementedError, AttributeError, TypeError):
+                return digest.digest()
+        except (OSError, NotImplementedError, AttributeError, TypeError, ValueError):
             return None
 
     def _verify_remote_file(self, client: Any, local: Path, remote: str, total: int) -> bool:
@@ -3838,15 +4158,13 @@ class SFTPTransferRouter:
         if not self.verify_completed:
             return True
         remote_digest = self._digest_remote(client, remote)
-        return remote_digest is None or remote_digest == self._digest_local(local)
+        return remote_digest is not None and remote_digest == self._digest_local(local)
 
     def _partial_matches_source(self, client: Any, local: Path, remote: str, offset: int) -> bool:
         if offset <= 0:
             return True
-        if not self.verify_completed:
-            return True
         remote_digest = self._digest_remote(client, remote, offset)
-        return remote_digest is None or remote_digest == self._digest_local(local, offset)
+        return remote_digest is not None and remote_digest == self._digest_local(local, offset)
 
     @staticmethod
     def _tune_stream(stream: Any, *, remaining: int | None = None) -> None:
@@ -3875,23 +4193,35 @@ class SFTPTransferRouter:
 
     def _upload(self, item: TransferItem, client: Any, worker: TransferWorker) -> None:
         local = Path(item.source)
+        item.preflight = self._new_preflight()
         try:
             start_snapshot = self._source_snapshot(local)
             total = start_snapshot[0]
+            item.preflight.source_size = total
+            item.preflight.source_mtime = start_snapshot[1]
+            item.preflight.source_open = self._local_source_open(local)
             if not local.is_file() or not os.access(local, os.R_OK):
                 raise PermissionError(item.source)
         except OSError as exc:
+            item.diagnostics.append("Unreadable source")
             raise ProfileError("Local file unreadable") from exc
         item.total = total
         set_timeout = getattr(worker, "set_operation_timeout", None)
         if callable(set_timeout):
             set_timeout(self._large_file_timeout(total, self.scheduler.operation_timeout))
         parent = posixpath.dirname(item.target)
-        if parent and parent != "/":
-            current = "/" if parent.startswith("/") else ""
-            for part in parent.strip("/").split("/"):
-                current = posixpath.join(current, part)
-                self._ensure_remote_directory(client, current)
+        try:
+            if parent and parent != "/":
+                current = "/" if parent.startswith("/") else ""
+                for part in parent.strip("/").split("/"):
+                    current = posixpath.join(current, part)
+                    self._ensure_remote_directory(client, current)
+        except ProfileError:
+            item.diagnostics.append("Destination unavailable")
+            raise
+
+        if not self._prepare_upload_destination(item, client):
+            return
 
         try:
             final = client.stat(item.target)
@@ -3914,6 +4244,30 @@ class SFTPTransferRouter:
             return
 
         partial = f"{item.target}.sshvault-part"
+        try:
+            preflight_partial_size = int(client.stat(partial).st_size)
+        except (OSError, FileNotFoundError, AttributeError, TypeError, ValueError):
+            preflight_partial_size = 0
+        item.preflight.existing_partial_size = preflight_partial_size
+        item.preflight.destination_free_space = self._remote_free_space(client, parent or "/")
+        if preflight_partial_size < 0 or preflight_partial_size > total:
+            item.diagnostics.append("Invalid/oversized partial")
+        if self._source_snapshot(local) != start_snapshot:
+            item.diagnostics.append("Source still changing")
+            raise ProfileError("Source file is still being modified")
+        resumable_size = 0
+        if 0 < preflight_partial_size <= total and self.resume_partial:
+            if self._partial_matches_source(client, local, partial, preflight_partial_size):
+                resumable_size = preflight_partial_size
+            else:
+                item.diagnostics.append("Invalid partial file")
+        if self._source_snapshot(local) != start_snapshot:
+            item.diagnostics.append("Source still changing")
+            raise ProfileError("Source file is still being modified")
+        free_space = item.preflight.destination_free_space
+        if free_space is not None and free_space < total - resumable_size:
+            item.diagnostics.append("Insufficient remote free space")
+            raise ProfileError("Remote filesystem full")
         reconnects = 0
         while True:
             partial_present = False
@@ -3924,11 +4278,15 @@ class SFTPTransferRouter:
             except (OSError, FileNotFoundError, TypeError, ValueError):
                 offset = 0
             invalid_partial = offset < 0 or offset > total
-            if partial_present and not invalid_partial:
+            if partial_present and not self.resume_partial:
+                item.diagnostics.append("Resume disabled")
+                offset = 0
+            elif partial_present and not invalid_partial:
                 invalid_partial = not self._partial_matches_source(client, local, partial, offset)
             if invalid_partial:
                 item.restart_required = True
-                item.diagnostics.append("Invalid partial file")
+                if "Invalid partial file" not in item.diagnostics:
+                    item.diagnostics.append("Invalid partial file")
                 offset = 0
             if partial_present and offset == total:
                 break
@@ -3987,8 +4345,16 @@ class SFTPTransferRouter:
         if final_partial_size != total:
             raise ProfileError("Final size mismatch")
         if self.verify_completed:
+            verification_snapshot = self._source_snapshot(local)
             remote_digest = self._digest_remote(client, partial)
-            if remote_digest is not None and remote_digest != self._digest_local(local):
+            local_digest = self._digest_local(local)
+            verification_complete_snapshot = self._source_snapshot(local)
+            if verification_snapshot != start_snapshot or verification_complete_snapshot != verification_snapshot:
+                item.diagnostics.append("Source still changing")
+                raise ProfileError("Source file is still changing")
+            if remote_digest is None:
+                raise ProfileError("Checksum verification unavailable")
+            if remote_digest != local_digest:
                 raise ProfileError("Checksum mismatch")
         try:
             client.remove(item.target)
@@ -4006,20 +4372,34 @@ class SFTPTransferRouter:
         except Exception as exc:
             self._raise_remote_error(exc, "Final size mismatch")
         utime = getattr(client, "utime", None)
-        if callable(utime):
+        if self.preserve_timestamps and callable(utime):
             try:
                 utime(item.target, (source_mtime, source_mtime))
             except OSError:
-                pass
+                item.diagnostics.append("Could not preserve timestamp")
 
     def _download(self, item: TransferItem, client: Any, worker: TransferWorker) -> None:
+        if not self._prepare_download_destination(item):
+            return
+        item.preflight = self._new_preflight()
         target = Path(item.target)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        remote_stat = client.stat(item.source)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            item.diagnostics.append("Destination unavailable")
+            raise ProfileError("Local destination unavailable") from exc
+        try:
+            remote_stat = client.stat(item.source)
+        except OSError as exc:
+            item.diagnostics.append("Unreadable source")
+            self._raise_remote_error(exc, "Remote source unavailable")
         total = int(getattr(remote_stat, "st_size", 0))
         item.total = total
         remote_mtime = getattr(remote_stat, "st_mtime", None)
         start_snapshot = (total, remote_mtime)
+        item.preflight.source_size = total
+        item.preflight.source_mtime = remote_mtime
+        item.preflight.source_open = None
         set_timeout = getattr(worker, "set_operation_timeout", None)
         if callable(set_timeout):
             set_timeout(self._large_file_timeout(total, self.scheduler.operation_timeout))
@@ -4029,16 +4409,40 @@ class SFTPTransferRouter:
             and remote_mtime is not None
             and int(target.stat().st_mtime) == int(remote_mtime)
         ):
-            if not self.verify_completed or self._digest_remote(client, item.source) in {
-                None,
-                self._digest_local(target),
-            }:
+            if not self.verify_completed or self._digest_remote(client, item.source) == self._digest_local(target):
                 item.transferred = total
                 item.resume_offset = total
                 worker.checkpoint(total, total)
                 return
 
         partial = Path(f"{item.target}.sshvault-part")
+        try:
+            preflight_partial_size = partial.stat().st_size
+        except OSError:
+            preflight_partial_size = 0
+        item.preflight.existing_partial_size = preflight_partial_size
+        item.preflight.destination_free_space = self._local_free_space(target.parent)
+        if preflight_partial_size < 0 or preflight_partial_size > total:
+            item.diagnostics.append("Invalid/oversized partial")
+        current_source = client.stat(item.source)
+        if (int(current_source.st_size), getattr(current_source, "st_mtime", None)) != start_snapshot:
+            item.diagnostics.append("Source still changing")
+            raise ProfileError("Source file is still being modified")
+        resumable_size = 0
+        if 0 < preflight_partial_size <= total and self.resume_partial:
+            remote_prefix = self._digest_remote(client, item.source, preflight_partial_size)
+            if remote_prefix is not None and remote_prefix == self._digest_local(partial):
+                resumable_size = preflight_partial_size
+            else:
+                item.diagnostics.append("Invalid partial file")
+        current_source = client.stat(item.source)
+        if (int(current_source.st_size), getattr(current_source, "st_mtime", None)) != start_snapshot:
+            item.diagnostics.append("Source still changing")
+            raise ProfileError("Source file is still being modified")
+        free_space = item.preflight.destination_free_space
+        if free_space is not None and free_space < total - resumable_size:
+            item.diagnostics.append("Insufficient local free space")
+            raise ProfileError("Local filesystem full")
         reconnects = 0
         while True:
             try:
@@ -4048,12 +4452,18 @@ class SFTPTransferRouter:
                 offset = 0
                 partial_present = False
             invalid_partial = offset < 0 or offset > total
-            if partial_present and not invalid_partial and offset and self.verify_completed:
+            if partial_present and not self.resume_partial:
+                item.diagnostics.append("Resume disabled")
+                partial.unlink(missing_ok=True)
+                offset = 0
+                partial_present = False
+            elif partial_present and not invalid_partial and offset:
                 remote_prefix = self._digest_remote(client, item.source, offset)
-                invalid_partial = remote_prefix is not None and remote_prefix != self._digest_local(partial)
+                invalid_partial = remote_prefix is None or remote_prefix != self._digest_local(partial)
             if invalid_partial:
                 item.restart_required = True
-                item.diagnostics.append("Invalid partial file")
+                if "Invalid partial file" not in item.diagnostics:
+                    item.diagnostics.append("Invalid partial file")
                 partial.unlink(missing_ok=True)
                 offset = 0
             if partial_present and offset == total:
@@ -4113,14 +4523,16 @@ class SFTPTransferRouter:
             raise ProfileError("Final size mismatch")
         if self.verify_completed:
             remote_digest = self._digest_remote(client, item.source)
-            if remote_digest is not None and remote_digest != self._digest_local(partial):
+            if remote_digest is None:
+                raise ProfileError("Checksum verification unavailable")
+            if remote_digest != self._digest_local(partial):
                 raise ProfileError("Checksum mismatch")
         partial.replace(target)
-        if remote_mtime is not None:
+        if self.preserve_timestamps and remote_mtime is not None:
             try:
                 os.utime(target, (remote_mtime, remote_mtime))
             except OSError:
-                pass
+                item.diagnostics.append("Could not preserve timestamp")
 
     def _queue_batch(
         self,
@@ -4148,6 +4560,15 @@ class SFTPTransferRouter:
             status=TransferState.FAILED,
             error=error,
         )
+        item.preflight = self._new_preflight()
+        try:
+            snapshot = self._source_snapshot(source)
+            item.preflight.source_size = snapshot[0]
+            item.preflight.source_mtime = snapshot[1]
+            item.preflight.source_open = self._local_source_open(source)
+        except OSError:
+            pass
+        item.diagnostics.append("Unreadable source")
         return self.scheduler.record(item)
 
     def _folder_upload_children(self, source: Path, remote_root: str) -> Any:
@@ -4236,10 +4657,19 @@ class SFTPTransferRouter:
                 batch = self.scheduler.create_batch(TransferBatch(selected_name, "Upload", str(source), remote_root))
                 planning = TransferItem(str(source), remote_root, "Upload")
 
-                def produce(_planning: TransferItem, *, root=source, target=remote_root, parent=batch) -> None:
+                def produce(
+                    _planning: TransferItem,
+                    stop_event: threading.Event,
+                    *,
+                    root=source,
+                    target=remote_root,
+                    parent=batch,
+                ) -> None:
                     discovered = 0
+                    if stop_event.is_set():
+                        return
                     for item, operation in self._folder_upload_children(root, target):
-                        if self.scheduler.closed:
+                        if stop_event.is_set():
                             return
                         self.scheduler.add_batch_item(parent, item, operation)
                         discovered += 1
@@ -4595,6 +5025,25 @@ def _session_snapshot(profile: dict[str, Any]) -> dict[str, Any]:
 
 
 @dataclass
+class HostKeySessionStatus:
+    """Public host identity metadata retained for one session endpoint."""
+
+    role: str
+    hostname: str
+    algorithm: str
+    fingerprint: str
+    verification_result: str
+    connected: bool = True
+
+    def display(self) -> str:
+        state = self.verification_result if self.connected else f"{self.verification_result}; disconnected"
+        return f"{self.hostname} · {self.algorithm} · {self.fingerprint} · {state}"
+
+
+HOST_KEY_POLICY_DISPLAY = "Strict verification; prompt for unknown keys; reject changed keys"
+
+
+@dataclass
 class SessionRecord:
     """Stable runtime identity and safe ownership metadata for one session."""
 
@@ -4611,6 +5060,7 @@ class SessionRecord:
     restore_eligible: bool = True
     cleanly_closed: bool = False
     terminal_ids: set[str] = field(default_factory=set)
+    host_key_statuses: dict[str, HostKeySessionStatus] = field(default_factory=dict)
     sftp_view_ids: set[str] = field(default_factory=set)
     tunnel_ids: set[str] = field(default_factory=set)
     reconnect_status: str = "idle"
@@ -4699,6 +5149,15 @@ class SFTPBrowserRegistry:
 
     def get(self, session_id: str, view_id: str) -> SFTPBrowserClient | None:
         return self._clients.get(session_id, {}).get(view_id)
+
+    def replace(self, session_id: str, view_id: str, client: SFTPBrowserClient) -> SFTPBrowserClient | None:
+        """Publish a replacement before closing the view's previous channel."""
+        views = self._clients.setdefault(session_id, {})
+        previous = views.get(view_id)
+        views[view_id] = client
+        if previous is not None and previous is not client:
+            previous.close()
+        return previous
 
     def close_view(self, session_id: str, view_id: str) -> bool:
         client = self._clients.get(session_id, {}).pop(view_id, None)
@@ -5303,6 +5762,21 @@ class SessionController:
     def unregister_tunnel(self, session_id: str, tunnel_id: str) -> None:
         self._unregister(session_id, tunnel_id, "tunnel_ids")
 
+    def record_host_key_status(self, session_id: str, status: HostKeySessionStatus) -> None:
+        record = self.get(session_id)
+        if record is None:
+            raise KeyError(f"Unknown session: {session_id}")
+        with self._lock:
+            record.host_key_statuses[status.role] = status
+
+    def mark_host_keys_disconnected(self, session_id: str) -> None:
+        record = self.get(session_id)
+        if record is None:
+            return
+        with self._lock:
+            for status in record.host_key_statuses.values():
+                status.connected = False
+
     def restorable_sessions(self) -> list[dict[str, Any]]:
         with self._lock:
             return [record.restoration_record() for record in self.sessions.values() if record.restore_eligible]
@@ -5671,6 +6145,12 @@ def validate_profile(raw: dict[str, Any], *, check_key_exists: bool = True) -> d
             if isinstance(value, dict)
             else defaults[section]
         )
+    raw_login_options = result["login_options"]
+    login_options = dict(raw_login_options) if isinstance(raw_login_options, dict) else {}
+    if "proxy_jump_enabled" in login_options:
+        login_options.update(validate_proxy_jump_options(login_options))
+        result["proxy_jump"] = proxy_jump_target(login_options)
+    result["login_options"] = login_options
     raw_connection_options = result["connection_options"]
     connection_options = dict(raw_connection_options) if isinstance(raw_connection_options, dict) else {}
     if "ssh_preferences" in connection_options:
@@ -6331,6 +6811,77 @@ class VTEAvailability:
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class TerminalLaunchSettings:
+    """Validated settings captured for one newly opened terminal."""
+
+    backend: str
+    options: dict[str, Any]
+    warnings: tuple[str, ...] = ()
+
+
+def terminal_launch_settings(profile: dict[str, Any], native_available: bool) -> TerminalLaunchSettings:
+    """Resolve one session snapshot into safe backend and appearance settings."""
+    source = profile.get("terminal_options", {})
+    source = source if isinstance(source, dict) else {}
+    options = dict(source)
+    warnings: list[str] = []
+
+    requested_backend = str(source.get("backend", "Automatic")).strip().casefold()
+    if requested_backend not in {"automatic", "native vte", "legacy"}:
+        warnings.append("Unsupported terminal backend; using Automatic.")
+        requested_backend = "automatic"
+    backend = "native" if native_available and requested_backend != "legacy" else "legacy"
+    if requested_backend == "native vte" and not native_available:
+        warnings.append("Native VTE is unavailable; using Legacy terminal.")
+    options["backend"] = {"automatic": "Automatic", "native vte": "Native VTE", "legacy": "Legacy"}[requested_backend]
+
+    terminal_type = str(source.get("terminal_type", "xterm-256color")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,64}", terminal_type):
+        terminal_type = "xterm-256color"
+        warnings.append("Invalid terminal type; using xterm-256color.")
+    options["terminal_type"] = terminal_type
+
+    font = str(source.get("font", "Monospace")).strip()
+    if not font or len(font) > 128 or any(ord(character) < 32 for character in font):
+        font = "Monospace"
+        warnings.append("Invalid terminal font; using Monospace.")
+    options["font"] = font
+    try:
+        font_size = int(source.get("font_size", 10))
+    except (TypeError, ValueError):
+        font_size = 10
+        warnings.append("Invalid terminal font size; using 10.")
+    if not 6 <= font_size <= 72:
+        font_size = 10
+        warnings.append("Invalid terminal font size; using 10.")
+    options["font_size"] = font_size
+
+    cursor = str(source.get("cursor_shape", "Block")).strip().casefold()
+    cursor_names = {"block": "Block", "i-beam": "I-Beam", "underline": "Underline"}
+    if cursor not in cursor_names:
+        cursor = "block"
+        warnings.append("Invalid cursor style; using Block.")
+    options["cursor_shape"] = cursor_names[cursor]
+    options["cursor_blink"] = bool(source.get("cursor_blink", True))
+
+    theme = str(source.get("color_theme", "System")).strip().casefold()
+    if theme not in {"system", "light", "dark"}:
+        theme = "system"
+        warnings.append("Invalid terminal colors; using System colors.")
+    options["color_theme"] = theme.title()
+    palette = AppearanceState(theme=theme).palette()
+    for key, palette_key in (("foreground", "terminal_foreground"), ("background", "terminal_background")):
+        color = str(source.get(key, palette[palette_key])).strip()
+        if not re.fullmatch(r"#[0-9A-Fa-f]{6}", color):
+            color = palette[palette_key]
+            warnings.append(f"Invalid terminal {key}; using {options['color_theme']} colors.")
+        options[key] = color
+
+    options["startup_command"] = str(source.get("startup_command", "")).strip()
+    return TerminalLaunchSettings(backend, options, tuple(dict.fromkeys(warnings)))
+
+
 def _gi_probe(interpreter: str) -> bool:
     try:
         result = subprocess.run(
@@ -6456,11 +7007,8 @@ def build_native_ssh_argv(profile: dict[str, Any]) -> list[str]:
         if not path.is_file():
             raise ProfileError("Native terminal identity file is invalid.")
         argv += ["-i", str(path), "-o", "IdentitiesOnly=yes"]
-    terminal_options = profile.get("terminal_options", {})
-    terminal_options = terminal_options if isinstance(terminal_options, dict) else {}
-    terminal_type = str(terminal_options.get("terminal_type", "xterm-256color")).strip()
-    if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,64}", terminal_type):
-        raise ProfileError("Native terminal type is invalid.")
+    terminal_options = terminal_launch_settings(profile, native_available=True).options
+    terminal_type = str(terminal_options["terminal_type"])
     argv += ["-o", f"SetEnv=TERM={terminal_type}"]
     if terminal_options.get("agent_forwarding") is True:
         argv.append("-A")
@@ -6468,7 +7016,7 @@ def build_native_ssh_argv(profile: dict[str, Any]) -> list[str]:
         argv.append("-Y" if terminal_options.get("x11_trusted") is True else "-X")
     # Passwords are deliberately absent: OpenSSH prompts inside VTE.
     argv.append(target)
-    command = str(profile.get("terminal_options", {}).get("startup_command", "")).strip()
+    command = str(terminal_options["startup_command"])
     if command:
         argv.append(command)
     return argv
@@ -6513,8 +7061,14 @@ class VTETerminalBackend(TerminalBackend):
         self._last_window_id: str | None = None
         self.last_terminal_id: str | None = None
         self._request_lock = threading.Lock()
+        self._receive_buffer = bytearray()
+        self._received_frames: list[dict[str, Any] | None] = []
         self._last_terminal_poll = 0.0
         self._terminal_poll_interval = 0.5
+        self.last_warnings: tuple[str, ...] = ()
+        self.last_close_error = ""
+        self._terminal_state_lock = threading.RLock()
+        self._closing_terminals: dict[str, list[Callable[[str, bool, str], None]]] = {}
 
     @property
     def status(self) -> str:
@@ -6548,16 +7102,43 @@ class VTETerminalBackend(TerminalBackend):
         self.close()
         return False
 
+    def _reject_terminal_request(self, reason: str) -> bool:
+        """Reject one open request without destroying unrelated live terminals."""
+        self.reason = reason
+        if self._process is None or self._process.poll() is not None:
+            return self._fail(reason)
+        return False
+
     def _receive(self, timeout: float) -> dict[str, Any] | None:
         if not self._connection:
             return None
-        self._connection.settimeout(timeout)
-        try:
-            payload = self._connection.recv(4096)
-            message = json.loads(payload.decode("utf-8").split("\n", 1)[0])
-            return message if isinstance(message, dict) else None
-        except (OSError, ValueError, json.JSONDecodeError):
-            return None
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._received_frames:
+                return self._received_frames.pop(0)
+            while b"\n" in self._receive_buffer:
+                raw, _, remainder = self._receive_buffer.partition(b"\n")
+                self._receive_buffer = bytearray(remainder)
+                try:
+                    message = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    self._received_frames.append(None)
+                else:
+                    self._received_frames.append(message if isinstance(message, dict) else None)
+            if self._received_frames:
+                return self._received_frames.pop(0)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            self._connection.settimeout(remaining)
+            try:
+                payload = self._connection.recv(65536)
+            except (OSError, ValueError):
+                return None
+            if not payload:
+                self._receive_buffer.clear()
+                return None
+            self._receive_buffer.extend(payload)
 
     def _request(self, command: str, **payload: Any) -> dict[str, Any] | None:
         """Send one authenticated control request and wait for its response."""
@@ -6648,6 +7229,8 @@ class VTETerminalBackend(TerminalBackend):
                         time.sleep(0.05)
                         continue
                     self._connection = connection
+                    self._receive_buffer.clear()
+                    self._received_frames.clear()
                     ready = self._receive(2)
                     if ready != {"type": "ready", "token": self._token}:
                         return self._fail("readiness handshake failed")
@@ -6677,25 +7260,35 @@ class VTETerminalBackend(TerminalBackend):
         if not self._start():
             return False
         try:
+            settings = terminal_launch_settings(profile, self.availability.available)
+            launch_profile = dict(profile)
+            launch_profile["terminal_options"] = settings.options
+            self.last_warnings = settings.warnings
             request: dict[str, Any] = {
-                "argv": build_native_ssh_argv(profile),
-                "title": session_resource_title("Terminal", profile),
-                "session_id": str(profile.get("_session_id", "")),
-                "terminal_options": dict(profile.get("terminal_options", {})),
+                "argv": build_native_ssh_argv(launch_profile),
+                "title": session_resource_title("Terminal", launch_profile),
+                "session_id": str(launch_profile.get("_session_id", "")),
+                "terminal_options": dict(settings.options),
             }
             if command == "open_tab" and self._last_window_id:
                 request["window_id"] = self._last_window_id
             response = self._request(command, **request)
             if not response or not response.get("ok"):
-                return self._fail("helper rejected terminal request")
+                return self._reject_terminal_request("helper rejected terminal request")
+            helper_warnings = response.get("warnings", [])
+            if isinstance(helper_warnings, list):
+                self.last_warnings = tuple(
+                    dict.fromkeys((*self.last_warnings, *(str(item) for item in helper_warnings if str(item))))
+                )
             terminal_id, window_id = response.get("terminal_id"), response.get("window_id")
             if not isinstance(terminal_id, str) or not isinstance(window_id, str):
-                return self._fail("invalid helper response")
+                return self._reject_terminal_request("invalid helper response")
             self._terminals[terminal_id] = {
                 "terminal_id": terminal_id,
                 "window_id": window_id,
                 "title": request["title"],
                 "session_id": request["session_id"],
+                "terminal_options": dict(settings.options),
             }
             self.last_terminal_id = terminal_id
             self._last_window_id = window_id
@@ -6724,29 +7317,67 @@ class VTETerminalBackend(TerminalBackend):
             return list(self._terminals.values())
         return []
 
-    def close_terminal(self, terminal_id: str) -> bool:
-        """Close one native terminal asynchronously without affecting siblings."""
-        if terminal_id not in self._terminals:
-            return False
-        self._terminals.pop(terminal_id, None)
-        if self.last_terminal_id == terminal_id:
-            self.last_terminal_id = next(reversed(self._terminals), None)
-        if self._connection and self._process and self._process.poll() is None:
+    def close_terminal(
+        self,
+        terminal_id: str,
+        on_complete: Callable[[str, bool, str], None] | None = None,
+    ) -> bool:
+        """Request one helper close and commit ownership only after acknowledgement."""
+        with self._terminal_state_lock:
+            if terminal_id not in self._terminals:
+                return True
+            callbacks = self._closing_terminals.get(terminal_id)
+            if callbacks is not None:
+                if on_complete is not None and on_complete not in callbacks:
+                    callbacks.append(on_complete)
+                return True
+            self._closing_terminals[terminal_id] = [on_complete] if on_complete is not None else []
 
-            def close_remote() -> None:
-                self._request("close_tab", terminal_id=terminal_id)
-                process = self._process
-                if not self._terminals and process is not None:
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        return
+        def finish(remove_ownership: bool, error: str = "") -> None:
+            with self._terminal_state_lock:
+                callbacks = self._closing_terminals.pop(terminal_id, [])
+                if remove_ownership:
+                    self._terminals.pop(terminal_id, None)
+                    if self.last_terminal_id == terminal_id:
+                        self.last_terminal_id = next(reversed(self._terminals), None)
+                self.last_close_error = error
+            for callback in callbacks:
+                try:
+                    callback(terminal_id, remove_ownership, error)
+                except Exception:
+                    pass
 
-            threading.Thread(
-                target=close_remote,
-                daemon=True,
-                name="sshvault-vte-close",
-            ).start()
+        def close_remote() -> None:
+            process = self._process
+            if not self._connection or process is None or process.poll() is not None:
+                self.reason = "helper exited during terminal close"
+                finish(True, "VTE helper exited during terminal close")
+                return
+            response = self._request("close_tab", terminal_id=terminal_id)
+            helper_alive = bool(self._connection and self._process and self._process.poll() is None)
+            if response and response.get("ok"):
+                finish(True)
+            elif not helper_alive:
+                self.reason = "helper exited during terminal close"
+                finish(True, "VTE helper exited during terminal close")
+            else:
+                detail = str(response.get("error", "")) if response else ""
+                finish(False, detail or "Could not close terminal")
+                return
+            with self._terminal_state_lock:
+                last_terminal = not self._terminals
+            process = self._process
+            if last_terminal and process is not None:
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+
+        threading.Thread(
+            target=close_remote,
+            daemon=True,
+            name="sshvault-vte-close",
+        ).start()
         return True
 
     def agent_diagnostics(self, *, selected_authentication: str = "") -> dict[str, bool]:
@@ -6777,6 +7408,8 @@ class VTETerminalBackend(TerminalBackend):
                 pass
             self._connection.close()
             self._connection = None
+        self._receive_buffer.clear()
+        self._received_frames.clear()
         if self._process and self._process.poll() is None:
             self._process.terminate()
             try:
@@ -6789,6 +7422,7 @@ class VTETerminalBackend(TerminalBackend):
                     pass
         self._process = None
         self._terminals.clear()
+        self._closing_terminals.clear()
         self._last_window_id = None
         self.last_terminal_id = None
         if self._directory:

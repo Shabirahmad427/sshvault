@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 import subprocess
@@ -18,6 +19,28 @@ from sshvault_core import (
     vte_agent_diagnostics,
     vte_inherited_environment,
 )
+
+
+class _ChunkedControlSocket:
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.sent = []
+        self.timeouts = []
+
+    def settimeout(self, timeout):
+        self.timeouts.append(timeout)
+
+    def recv(self, size):
+        if not self.chunks:
+            return b""
+        chunk = self.chunks.pop(0)
+        if len(chunk) > size:
+            self.chunks.insert(0, chunk[size:])
+            return chunk[:size]
+        return chunk
+
+    def sendall(self, payload):
+        self.sent.append(payload)
 
 
 class NativeVTEBackendTests(unittest.TestCase):
@@ -97,6 +120,107 @@ class NativeVTEBackendTests(unittest.TestCase):
     def test_backend_never_claims_native_before_handshake(self) -> None:
         backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
         self.assertEqual(backend.status, "Native VTE unavailable: helper exited")
+
+    def test_json_response_split_across_multiple_reads(self) -> None:
+        backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
+        wire = json.dumps({"type": "response", "request_id": "split", "ok": True}).encode() + b"\n"
+        backend._connection = _ChunkedControlSocket([wire[:5], wire[5:19], wire[19:]])  # type: ignore[assignment]
+        self.assertEqual(backend._receive(1), {"type": "response", "request_id": "split", "ok": True})
+
+    def test_response_larger_than_4096_bytes(self) -> None:
+        backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
+        expected = {"type": "response", "request_id": "large", "value": "x" * 9000}
+        wire = json.dumps(expected).encode() + b"\n"
+        backend._connection = _ChunkedControlSocket([wire[:4096], wire[4096:8192], wire[8192:]])  # type: ignore[assignment]
+        self.assertEqual(backend._receive(1), expected)
+
+    def test_two_responses_received_together_are_preserved(self) -> None:
+        backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
+        first = {"type": "response", "request_id": "one", "ok": True}
+        second = {"type": "response", "request_id": "two", "ok": True}
+        wire = b"".join(json.dumps(item).encode() + b"\n" for item in (first, second))
+        backend._connection = _ChunkedControlSocket([wire])  # type: ignore[assignment]
+        self.assertEqual(backend._receive(1), first)
+        self.assertEqual(backend._receive(1), second)
+
+    def test_partial_response_followed_by_disconnect_fails_safely(self) -> None:
+        backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
+        backend._connection = _ChunkedControlSocket([b'{"type":"response"', b""])  # type: ignore[assignment]
+        self.assertIsNone(backend._receive(1))
+        self.assertEqual(backend._receive_buffer, bytearray())
+
+    def test_malformed_response_fails_only_its_frame(self) -> None:
+        backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
+        valid = {"type": "response", "request_id": "next", "ok": True}
+        wire = b"{malformed}\n" + json.dumps(valid).encode() + b"\n"
+        backend._connection = _ChunkedControlSocket([wire])  # type: ignore[assignment]
+        self.assertIsNone(backend._receive(1))
+        self.assertEqual(backend._receive(1), valid)
+
+    def test_rejected_open_does_not_close_unrelated_live_terminals(self) -> None:
+        backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
+        backend._process = Mock()
+        backend._process.poll.return_value = None
+        backend._terminals = {"existing": {"terminal_id": "existing", "session_id": "other"}}
+        with (
+            patch.object(backend, "_start", return_value=True),
+            patch.object(backend, "_request", return_value=None),
+            patch.object(backend, "close") as close,
+        ):
+            self.assertFalse(backend.open_terminal_tab(self._profile()))
+        close.assert_not_called()
+        self.assertIn("existing", backend._terminals)
+
+    def test_buffered_responses_keep_multiple_vte_tabs_independent(self) -> None:
+        backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
+        backend._terminals = {
+            "sahmaddo-tab": {"terminal_id": "sahmaddo-tab", "session_id": "sahmaddo"},
+            "clauberh-tab": {"terminal_id": "clauberh-tab", "session_id": "clauberh"},
+        }
+        responses = (
+            {"type": "response", "request_id": "request-one", "ok": True},
+            {"type": "response", "request_id": "request-two", "ok": True},
+        )
+        wire = b"".join(json.dumps(item).encode() + b"\n" for item in responses)
+        backend._connection = _ChunkedControlSocket([wire])  # type: ignore[assignment]
+        with patch("sshvault_core.uuid4", side_effect=("request-one", "request-two")):
+            self.assertTrue(backend._request("focus_tab", terminal_id="sahmaddo-tab")["ok"])
+            self.assertTrue(backend._request("focus_tab", terminal_id="clauberh-tab")["ok"])
+        self.assertEqual(set(backend._terminals), {"sahmaddo-tab", "clauberh-tab"})
+
+    def test_vte_request_propagates_appearance_term_and_initial_command(self) -> None:
+        backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
+        profile = self._profile() | {
+            "_session_id": "sahmaddo-session",
+            "terminal_options": {
+                "backend": "Native VTE",
+                "font": "Fira Code",
+                "font_size": 14,
+                "cursor_shape": "Underline",
+                "cursor_blink": False,
+                "foreground": "#aabbcc",
+                "background": "#112233",
+                "terminal_type": "screen-256color",
+                "startup_command": "whoami",
+            },
+        }
+        with (
+            patch.object(backend, "_start", return_value=True),
+            patch.object(
+                backend,
+                "_request",
+                return_value={"ok": True, "terminal_id": "one", "window_id": "window", "warnings": []},
+            ) as request,
+        ):
+            self.assertTrue(backend.open_terminal_tab(profile))
+        payload = request.call_args.kwargs
+        self.assertEqual(payload["session_id"], "sahmaddo-session")
+        self.assertEqual(payload["terminal_options"]["font"], "Fira Code")
+        self.assertEqual(payload["terminal_options"]["cursor_shape"], "Underline")
+        self.assertEqual(payload["terminal_options"]["foreground"], "#aabbcc")
+        self.assertIn("SetEnv=TERM=screen-256color", payload["argv"])
+        self.assertEqual(payload["argv"][-1], "whoami")
+        self.assertEqual(backend._terminals["one"]["terminal_options"]["background"], "#112233")
 
     def test_missing_helper_has_visible_fallback_reason(self) -> None:
         backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))

@@ -113,16 +113,56 @@ def _environment() -> list[str]:
     return [f"{name}={os.environ[name]}" for name in sorted(names) if os.environ.get(name)]
 
 
-def _load_gtk() -> tuple[Any, Any, Any]:
+def _load_gtk() -> tuple[Any, Any, Any, Any, Any]:
     try:
         import gi
 
         gi.require_version("Gtk", "3.0")
         gi.require_version("Vte", "2.91")
-        from gi.repository import GLib, Gtk, Vte
+        from gi.repository import Gdk, GLib, Gtk, Pango, Vte
     except (ImportError, ValueError) as exc:
         raise RuntimeError(f"GI/VTE import failed: {exc}") from exc
-    return GLib, Gtk, Vte
+    return GLib, Gdk, Gtk, Pango, Vte
+
+
+def _apply_terminal_appearance(
+    terminal: Any,
+    options: dict[str, Any],
+    Gdk: Any,
+    Pango: Any,
+    Vte: Any,
+) -> list[str]:
+    """Apply validated appearance values and report unsupported VTE capabilities."""
+    warnings: list[str] = []
+    try:
+        description = Pango.FontDescription()
+        description.set_family(str(options.get("font", "Monospace")))
+        description.set_size(int(options.get("font_size", 10)) * Pango.SCALE)
+        terminal.set_font(description)
+    except (AttributeError, TypeError, ValueError):
+        warnings.append("Terminal font is unsupported; using the VTE default.")
+    try:
+        shapes = {
+            "Block": Vte.CursorShape.BLOCK,
+            "I-Beam": Vte.CursorShape.IBEAM,
+            "Underline": Vte.CursorShape.UNDERLINE,
+        }
+        terminal.set_cursor_shape(shapes[str(options.get("cursor_shape", "Block"))])
+        blink = Vte.CursorBlinkMode.ON if bool(options.get("cursor_blink", True)) else Vte.CursorBlinkMode.OFF
+        terminal.set_cursor_blink_mode(blink)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        warnings.append("Terminal cursor style is unsupported; using the VTE default.")
+    try:
+        foreground, background = Gdk.RGBA(), Gdk.RGBA()
+        if not foreground.parse(str(options.get("foreground", "#f1f3f4"))) or not background.parse(
+            str(options.get("background", "#202124"))
+        ):
+            raise ValueError("invalid color")
+        terminal.set_color_foreground(foreground)
+        terminal.set_color_background(background)
+    except (AttributeError, TypeError, ValueError):
+        warnings.append("Terminal colors are unsupported; using the VTE default.")
+    return warnings
 
 
 def probe() -> int:
@@ -136,7 +176,7 @@ def probe() -> int:
 
 def main(socket_path: str, token: str) -> int:
     try:
-        GLib, Gtk, Vte = _load_gtk()
+        GLib, Gdk, Gtk, Pango, Vte = _load_gtk()
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -204,7 +244,7 @@ def main(socket_path: str, token: str) -> int:
                 container["window"].destroy()
         return True
 
-    def open_terminal(message: dict[str, Any], force_new_window: bool) -> tuple[str, str]:
+    def open_terminal(message: dict[str, Any], force_new_window: bool) -> tuple[str, str, list[str]]:
         argv = message.get("argv")
         if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
             raise ValueError("invalid OpenSSH command")
@@ -229,6 +269,7 @@ def main(socket_path: str, token: str) -> int:
             terminal.set_audible_bell(options.get("bell", "System bell") == "System bell")
         except AttributeError:
             pass
+        appearance_warnings = _apply_terminal_appearance(terminal, options, Gdk, Pango, Vte)
         base = str(message.get("title", "SSHVault"))
         title_counts[base] = title_counts.get(base, 0) + 1
         title = base if title_counts[base] == 1 else f"{base} ({title_counts[base]})"
@@ -312,7 +353,7 @@ def main(socket_path: str, token: str) -> int:
         terminal.connect("button-press-event", menu)
         container["window"].show_all()
         terminal.grab_focus()
-        return terminal_id, window_id
+        return terminal_id, window_id, appearance_warnings
 
     def handle(message: dict[str, Any]) -> None:
         request_id = message.get("request_id")
@@ -326,17 +367,15 @@ def main(socket_path: str, token: str) -> int:
                 response(request_id, True)
                 Gtk.main_quit()
             elif kind == "open_tab":
-                terminal_id, window_id = open_terminal(message, False)
-                response(request_id, True, terminal_id=terminal_id, window_id=window_id)
+                terminal_id, window_id, warnings = open_terminal(message, False)
+                response(request_id, True, terminal_id=terminal_id, window_id=window_id, warnings=warnings)
             elif kind == "open_window":
-                terminal_id, window_id = open_terminal(message, True)
-                response(request_id, True, terminal_id=terminal_id, window_id=window_id)
+                terminal_id, window_id, warnings = open_terminal(message, True)
+                response(request_id, True, terminal_id=terminal_id, window_id=window_id, warnings=warnings)
             elif kind == "close_tab":
                 terminal_id = str(message.get("terminal_id", ""))
-                exists = terminal_id in terminals
-                response(request_id, exists)
-                if exists:
-                    GLib.idle_add(lambda: (close_tab(terminal_id), False)[1])
+                closed = close_tab(terminal_id)
+                response(request_id, closed, **({} if closed else {"error": "unknown terminal"}))
             elif kind == "close_window":
                 window_id = str(message.get("window_id", ""))
                 window = windows.get(window_id)
