@@ -144,6 +144,8 @@ class NativeVTEIndividualCloseTests(unittest.TestCase):
 
     def test_native_vte_helper_applies_appearance_settings(self) -> None:
         source = (Path(__file__).resolve().parents[1] / "sshvault_vte_helper.py").read_text(encoding="utf-8")
+        self.assertIn('gi.require_version("Gdk", "3.0")', source)
+        self.assertIn('gi.require_version("Pango", "1.0")', source)
         for call in (
             "terminal.set_font(description)",
             "terminal.set_cursor_shape",

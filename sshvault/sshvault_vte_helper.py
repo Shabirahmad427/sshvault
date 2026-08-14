@@ -118,11 +118,45 @@ def _load_gtk() -> tuple[Any, Any, Any, Any, Any]:
         import gi
 
         gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
+        gi.require_version("Pango", "1.0")
         gi.require_version("Vte", "2.91")
         from gi.repository import Gdk, GLib, Gtk, Pango, Vte
     except (ImportError, ValueError) as exc:
         raise RuntimeError(f"GI/VTE import failed: {exc}") from exc
     return GLib, Gdk, Gtk, Pango, Vte
+
+
+def _sanitized_error(error: BaseException) -> str:
+    """Return one useful line without control characters or a home path."""
+    detail = " ".join(str(error).split())
+    home = str(Path.home())
+    if home and home != "/":
+        detail = detail.replace(home, "<home>")
+    return detail[:1000]
+
+
+def probe_details() -> dict[str, object]:
+    """Report GI separately from VTE so fallback diagnostics are precise."""
+    details: dict[str, object] = {
+        "python": sys.executable,
+        "gi_available": False,
+        "vte_available": False,
+        "error": "",
+    }
+    try:
+        import gi  # noqa: F401
+    except (ImportError, ValueError) as exc:
+        details["error"] = _sanitized_error(exc)
+        return details
+    details["gi_available"] = True
+    try:
+        _load_gtk()
+    except RuntimeError as exc:
+        details["error"] = _sanitized_error(exc)
+        return details
+    details["vte_available"] = True
+    return details
 
 
 def _apply_terminal_appearance(
@@ -166,10 +200,10 @@ def _apply_terminal_appearance(
 
 
 def probe() -> int:
-    try:
-        _load_gtk()
-    except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
+    details = probe_details()
+    print(json.dumps(details, separators=(",", ":")))
+    if not details["vte_available"]:
+        print(f"GI/VTE import failed: {details['error']}", file=sys.stderr)
         return 2
     return 0
 

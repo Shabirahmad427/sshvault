@@ -21,6 +21,7 @@ import socket
 import socketserver
 import subprocess
 import secrets
+import sys
 import time
 from pathlib import Path
 import re
@@ -6809,6 +6810,20 @@ class VTEAvailability:
     available: bool
     interpreter: str | None = None
     reason: str = ""
+    gi_available: bool | None = None
+    vte_available: bool | None = None
+    error: str = ""
+
+    def diagnostics(self, main_interpreter: str | None = None) -> str:
+        gi_available = self.available if self.gi_available is None else self.gi_available
+        vte_available = self.available if self.vte_available is None else self.vte_available
+        lines = (
+            f"Main Python: {main_interpreter or sys.executable}",
+            f"VTE Python: {self.interpreter or '/usr/bin/python3'}",
+            f"GI available: {'yes' if gi_available else 'no'}",
+            f"VTE 2.91 available: {'yes' if vte_available else 'no'}",
+        )
+        return "\n".join((*lines, f"Import error: {self.error}")) if self.error else "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -6882,23 +6897,53 @@ def terminal_launch_settings(profile: dict[str, Any], native_available: bool) ->
     return TerminalLaunchSettings(backend, options, tuple(dict.fromkeys(warnings)))
 
 
+def _sanitize_vte_error(detail: str) -> str:
+    sanitized = " ".join(detail.split())
+    home = str(Path.home())
+    if home and home != "/":
+        sanitized = sanitized.replace(home, "<home>")
+    return sanitized[:1000]
+
+
+def _probe_vte_interpreter(interpreter: str) -> VTEAvailability:
+    probes = (
+        ("import gi", False),
+        (
+            'import gi; gi.require_version("Gtk", "3.0"); gi.require_version("Gdk", "3.0"); '
+            'gi.require_version("Pango", "1.0"); gi.require_version("Vte", "2.91"); '
+            "from gi.repository import Gdk, GLib, Gtk, Pango, Vte",
+            True,
+        ),
+    )
+    gi_available = False
+    error = ""
+    for code, is_vte_probe in probes:
+        try:
+            result = subprocess.run(
+                [interpreter, "-c", code],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            error = _sanitize_vte_error(str(exc))
+            break
+        if result.returncode != 0:
+            error = _sanitize_vte_error(result.stderr.decode("utf-8", "replace"))
+            break
+        if not is_vte_probe:
+            gi_available = True
+    else:
+        return VTEAvailability(True, interpreter, gi_available=True, vte_available=True)
+    reason = "System Python cannot import GI." if not gi_available else "System Python cannot import VTE 2.91."
+    return VTEAvailability(False, interpreter, reason, gi_available, False, error)
+
+
 def _gi_probe(interpreter: str) -> bool:
-    try:
-        result = subprocess.run(
-            [
-                interpreter,
-                "-c",
-                'import gi; gi.require_version("Gtk", "3.0"); gi.require_version("Vte", "2.91"); from gi.repository import Gtk, Vte',
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=3,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0
+    """Compatibility wrapper for code that only needs the availability bit."""
+    return _probe_vte_interpreter(interpreter).available
 
 
 def detect_vte_backend() -> VTEAvailability:
@@ -6906,9 +6951,15 @@ def detect_vte_backend() -> VTEAvailability:
     if platform.system() != "Linux":
         return VTEAvailability(False, reason="Native VTE is available only on Linux.")
     candidate = "/usr/bin/python3"
-    if os.path.isfile(candidate) and os.access(candidate, os.X_OK) and _gi_probe(candidate):
-        return VTEAvailability(True, candidate)
-    return VTEAvailability(False, reason="Install python3-gi and the VTE GTK introspection bindings.")
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return _probe_vte_interpreter(candidate)
+    return VTEAvailability(
+        False,
+        candidate,
+        reason="System Python /usr/bin/python3 is unavailable.",
+        gi_available=False,
+        vte_available=False,
+    )
 
 
 _VTE_ENV_NAMES = {
@@ -7090,7 +7141,7 @@ class VTETerminalBackend(TerminalBackend):
         except (OSError, ValueError):
             return fallback
         if "GI/VTE import failed" in detail:
-            return "GI import failed"
+            return _sanitize_vte_error(detail)
         if "display unavailable" in detail:
             return "display unavailable"
         if "Permission denied" in detail:
@@ -7101,6 +7152,21 @@ class VTETerminalBackend(TerminalBackend):
         self.reason = reason
         self.close()
         return False
+
+    @property
+    def startup_diagnostics(self) -> str:
+        """Safe interpreter and import details suitable for a UI error dialog."""
+        availability = self.availability
+        if self.reason and not availability.error:
+            availability = VTEAvailability(
+                availability.available,
+                availability.interpreter,
+                availability.reason,
+                availability.gi_available,
+                availability.vte_available,
+                _sanitize_vte_error(self.reason),
+            )
+        return availability.diagnostics()
 
     def _reject_terminal_request(self, reason: str) -> bool:
         """Reject one open request without destroying unrelated live terminals."""
@@ -7182,7 +7248,7 @@ class VTETerminalBackend(TerminalBackend):
             probe = subprocess.run(
                 [self.availability.interpreter, "-I", str(helper), "--probe"],
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=self._environment,
                 timeout=3,
@@ -7191,7 +7257,14 @@ class VTETerminalBackend(TerminalBackend):
         except (OSError, subprocess.SubprocessError):
             return self._fail("helper module missing")
         if probe.returncode != 0:
-            return self._fail("GI import failed")
+            detail = probe.stderr.decode("utf-8", "replace")
+            try:
+                helper_details = json.loads(probe.stdout.decode("utf-8", "replace"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                helper_details = {}
+            if isinstance(helper_details, dict):
+                detail = str(helper_details.get("error") or detail)
+            return self._fail(f"GI/VTE import failed: {_sanitize_vte_error(detail)}")
         self._directory = Path(tempfile.mkdtemp(prefix="sshvault-vte-"))
         os.chmod(self._directory, 0o700)
         socket_path = self._directory / "control.sock"

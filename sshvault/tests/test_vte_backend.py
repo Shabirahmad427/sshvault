@@ -98,24 +98,58 @@ class NativeVTEBackendTests(unittest.TestCase):
             build_native_ssh_argv(self._profile() | {"port": 0})
 
     def test_vte_detection_uses_safe_fallback(self) -> None:
+        unavailable = VTEAvailability(
+            False,
+            "/usr/bin/python3",
+            "System Python cannot import VTE 2.91.",
+            True,
+            False,
+            "Namespace Vte not available",
+        )
         with (
             patch("sshvault_core.platform.system", return_value="Linux"),
-            patch("sshvault_core._gi_probe", return_value=False),
+            patch("sshvault_core._probe_vte_interpreter", return_value=unavailable),
         ):
             result = detect_vte_backend()
         self.assertFalse(result.available)
-        self.assertIn("python3-gi", result.reason)
+        self.assertTrue(result.gi_available)
+        self.assertFalse(result.vte_available)
+        self.assertIn("Namespace Vte not available", result.error)
         self.assertEqual(VTEAvailability(True, "/usr/bin/python3").interpreter, "/usr/bin/python3")
 
     def test_system_python_is_selected_when_current_interpreter_lacks_vte(self) -> None:
+        available = VTEAvailability(True, "/usr/bin/python3", gi_available=True, vte_available=True)
         with (
             patch("sshvault_core.platform.system", return_value="Linux"),
-            patch("sshvault_core._gi_probe", return_value=True) as probe,
+            patch("sshvault_core._probe_vte_interpreter", return_value=available) as probe,
         ):
             result = detect_vte_backend()
         self.assertTrue(result.available)
         self.assertEqual(result.interpreter, "/usr/bin/python3")
         probe.assert_called_once_with("/usr/bin/python3")
+
+    def test_miniconda_main_process_reports_system_python_vte_helper(self) -> None:
+        availability = VTEAvailability(True, "/usr/bin/python3", gi_available=True, vte_available=True)
+        with patch("sshvault_core.sys.executable", "/home/alice/miniconda3/bin/python"):
+            diagnostics = availability.diagnostics()
+        self.assertIn("Main Python: /home/alice/miniconda3/bin/python", diagnostics)
+        self.assertIn("VTE Python: /usr/bin/python3", diagnostics)
+        self.assertIn("GI available: yes", diagnostics)
+        self.assertIn("VTE 2.91 available: yes", diagnostics)
+
+    def test_gi_unavailable_diagnostics_include_sanitized_error(self) -> None:
+        availability = VTEAvailability(
+            False,
+            "/usr/bin/python3",
+            "System Python cannot import GI.",
+            False,
+            False,
+            "No module named gi",
+        )
+        diagnostics = availability.diagnostics("/opt/conda/bin/python")
+        self.assertIn("GI available: no", diagnostics)
+        self.assertIn("VTE 2.91 available: no", diagnostics)
+        self.assertIn("Import error: No module named gi", diagnostics)
 
     def test_backend_never_claims_native_before_handshake(self) -> None:
         backend = VTETerminalBackend(VTEAvailability(True, "/usr/bin/python3"))
