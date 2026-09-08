@@ -298,9 +298,9 @@ class LargeFileSFTPRegressions(unittest.TestCase):
                 original_digest = router._digest_local
                 changed = False
 
-                def digest(path, length=None):
+                def digest(path, length=None, **kwargs):
                     nonlocal changed
-                    result = original_digest(path, length)
+                    result = original_digest(path, length, **kwargs)
                     if length is None and not changed:
                         changed = True
                         previous = path.stat()
@@ -330,9 +330,9 @@ class LargeFileSFTPRegressions(unittest.TestCase):
                 original_digest = router._digest_local
                 changed = False
 
-                def digest(path, length=None):
+                def digest(path, length=None, **kwargs):
                     nonlocal changed
-                    result = original_digest(path, length)
+                    result = original_digest(path, length, **kwargs)
                     if length is None and not changed:
                         changed = True
                         with path.open("ab") as handle:
@@ -358,9 +358,9 @@ class LargeFileSFTPRegressions(unittest.TestCase):
                 original_digest = router._digest_local
                 changed = False
 
-                def digest(path, length=None):
+                def digest(path, length=None, **kwargs):
                     nonlocal changed
-                    result = original_digest(path, length)
+                    result = original_digest(path, length, **kwargs)
                     if length is None and not changed:
                         changed = True
                         previous = path.stat()
@@ -387,9 +387,9 @@ class LargeFileSFTPRegressions(unittest.TestCase):
                 original_digest = router._digest_local
                 changed = False
 
-                def digest(path, length=None):
+                def digest(path, length=None, **kwargs):
                     nonlocal changed
-                    result = original_digest(path, length)
+                    result = original_digest(path, length, **kwargs)
                     if length is None and not changed:
                         changed = True
                         with path.open("ab") as handle:
@@ -528,6 +528,70 @@ class LargeFileSFTPRegressions(unittest.TestCase):
                 self.assertGreaterEqual(len(storage.channels), 3)
                 self.assertTrue(all(channel.timeout == expected for channel in storage.channels))
                 self.assertEqual(storage.files["/remote/large.bin"], source.read_bytes())
+            finally:
+                scheduler.shutdown()
+
+    def test_multi_gb_style_transfer_interrupted_near_start_resumes_without_rehashing_prefix(self):
+        """Regression for the equil10.nc-style upload failure.
+
+        Verification used to re-hash the *entire* already-uploaded prefix on
+        every reconnect (an O(offset) remote re-read per retry, with no
+        check-file extension available). On a multi-GB transfer with a few
+        transient timeouts near the start, that made verification cost
+        balloon with each retry instead of staying bounded by the file size.
+        This simulates an interruption at roughly 0.1% of a large ".nc"-style
+        file (repeated early reconnects on a file scaled down for test speed)
+        and asserts: (1) the upload still completes with byte-exact content,
+        (2) it resumes from the true remote offset rather than restarting
+        from byte 0, and (3) total bytes re-hashed for verification across
+        all reconnects stays close to the file size instead of scaling with
+        the number of reconnects.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            # Chunking is 1 MiB; three reconnects at consecutive chunk
+            # boundaries stand in for an interruption at ~0.1% progress into
+            # a multi-GB transfer, each one forcing a fresh resume decision.
+            source = Path(root, "equil10.nc")
+            source.write_bytes(os.urandom(4 * 1024 * 1024 + 3))
+            storage = _Storage()
+            storage.checksum_extension = False  # force the streamed re-read fallback path
+            storage.failure, storage.failures_left = ConnectionResetError("connection reset"), 3
+
+            hashed_bytes = {"remote": 0, "local": 0}
+            offsets_seen: list[int] = []
+
+            def configure(router):
+                original_remote = router._digest_remote
+                original_local = router._digest_local
+
+                def counted_remote(client, path, length=None, offset=0, **kwargs):
+                    hashed_bytes["remote"] += length or 0
+                    offsets_seen.append(offset)
+                    return original_remote(client, path, length, offset=offset, **kwargs)
+
+                def counted_local(path, length=None, offset=0, **kwargs):
+                    hashed_bytes["local"] += length or 0
+                    return original_local(path, length, offset=offset, **kwargs)
+
+                router._digest_remote = counted_remote
+                router._digest_local = counted_local
+
+            scheduler, item = self._upload(source, storage, configure=configure)
+            try:
+                self.assertEqual(item.status, TransferState.COMPLETED)
+                self.assertEqual(storage.files["/remote/equil10.nc"], source.read_bytes())
+                self.assertGreaterEqual(storage.clients, 4)
+                # The first call establishes the initial resume offset and the
+                # last is the one-time whole-file completion check; every
+                # reconnect verification in between must resume from the true
+                # remote offset rather than restarting from byte 0.
+                self.assertNotIn(0, offsets_seen[1:-1])
+                total = source.stat().st_size
+                # Bounded by ~file size, not by reconnects * offset (which for
+                # 3 reconnects landing progressively later would be several
+                # times the file size under the old full-prefix re-hash).
+                self.assertLessEqual(hashed_bytes["remote"], total)
+                self.assertLessEqual(hashed_bytes["local"], total)
             finally:
                 scheduler.shutdown()
 

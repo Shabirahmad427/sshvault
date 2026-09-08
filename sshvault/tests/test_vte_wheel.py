@@ -21,6 +21,6 @@ class VTEWheelTests(unittest.TestCase):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            wheel = next(Path(output).glob("sshvault-0.3.4-py3-none-any.whl"))
+            wheel = next(Path(output).glob("sshvault-*-py3-none-any.whl"))
             with zipfile.ZipFile(wheel) as archive:
                 self.assertIn("sshvault_vte_helper.py", archive.namelist())

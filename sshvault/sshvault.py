@@ -46,6 +46,8 @@ from sshvault_sftp_server import (
 )
 from sshvault_core import (
     ProfileError,
+    read_remote_text,
+    save_remote_text,
     ProfileSidebarState,
     ProfileStore,
     SecretStore,
@@ -73,6 +75,7 @@ from sshvault_core import (
     TransferBatch,
     TransferScheduler,
     TransferState,
+    SFTPTransferRefreshTracker,
     TransferManagerWindowState,
     DownloadResumeDecision,
     DurableProgressPolicy,
@@ -153,6 +156,8 @@ from sshvault_core import (
     create_remote_browser_folder,
     delete_local_browser_entries,
     delete_remote_browser_entries,
+    delete_remote_browser_path,
+    filter_browser_entries,
     initial_local_browser_path,
     list_local_browser_entries,
     list_remote_browser_entries,
@@ -1289,6 +1294,23 @@ class TerminalWidget(tk.Frame):
 
 
 # ── SFTP panel ───────────────────────────────────────────────────────────────
+def update_transfer_tree_rows(tree, rows, previous):
+    """Update changed queue rows without rebuilding selection and scroll state."""
+    current = dict(rows)
+    for item_id in previous.keys() - current.keys():
+        tree.delete(item_id)
+    for item_id, values in current.items():
+        if item_id not in previous:
+            tree.insert("", "end", iid=item_id, values=values)
+        elif previous[item_id] != values:
+            tree.item(item_id, values=values)
+    if list(previous) != list(current):
+        for index, item_id in enumerate(current):
+            tree.move(item_id, "", index)
+    previous.clear()
+    previous.update(current)
+
+
 class SFTPTransferManagerWindow(tk.Toplevel):
     """Modeless transfer view. Closing it hides it; work continues."""
 
@@ -1467,9 +1489,8 @@ class SFTPTransferManagerWindow(tk.Toplevel):
     def refresh(self):
         if self._destroyed:
             return
-        selected = self.tree.selection()
-        for iid in self.tree.get_children():
-            self.tree.delete(iid)
+        previous_rows = getattr(self, "_rendered_rows", {})
+        rows = []
         items = list(self.panel._transfer_manager.items)
         key_map = {
             "name": lambda item: Path(item.source).name.casefold(),
@@ -1493,27 +1514,28 @@ class SFTPTransferManagerWindow(tk.Toplevel):
             eta = "—" if item.remaining_seconds() is None else f"{item.remaining_seconds():.0f}s"
             size = "—" if item.total is None else self.panel._fmt_size(item.total)
             remaining = "—" if item.total is None else self.panel._fmt_size(max(0, item.total - item.transferred))
-            self.tree.insert(
-                "",
-                "end",
-                iid=item.item_id,
-                values=(
-                    Path(item.source).name,
-                    item.direction,
-                    item.source,
-                    item.target,
-                    size,
-                    self.panel._fmt_size(item.transferred),
-                    self.panel._fmt_size(item.resume_offset),
-                    remaining,
-                    pct,
-                    self.panel._fmt_size(item.speed) + "/s",
-                    eta,
-                    item.status + (" (Restart required)" if item.restart_required else ""),
-                    item.error,
-                ),
+            rows.append(
+                (
+                    item.item_id,
+                    (
+                        Path(item.source).name,
+                        item.direction,
+                        item.source,
+                        item.target,
+                        size,
+                        self.panel._fmt_size(item.transferred),
+                        self.panel._fmt_size(item.resume_offset),
+                        remaining,
+                        pct,
+                        self.panel._fmt_size(item.speed) + "/s",
+                        eta,
+                        item.status + (" (Restart required)" if item.restart_required else ""),
+                        item.error,
+                    ),
+                )
             )
-        self.tree.selection_set([item_id for item_id in selected if self.tree.exists(item_id)])
+        update_transfer_tree_rows(self.tree, rows, previous_rows)
+        self._rendered_rows = previous_rows
         data = self.panel._transfer_manager.summary()
         self.summary.set(
             "Active: {active}   Pending: {pending}   Paused: {paused}   Completed: {completed}   Failed: {failed}   "
@@ -1668,6 +1690,130 @@ class SessionTransferManagerWindow(tk.Toplevel):
         self.destroy()
 
 
+class LocalEditorChannel:
+    """Filesystem adapter for the shared text editor."""
+
+    def normalize(self, path):
+        return str(Path(path).resolve())
+
+    def open(self, path, mode):
+        return open(path, "xb" if mode == "wx" else mode)
+
+    def stat(self, path):
+        return os.stat(path)
+
+    def chmod(self, path, mode):
+        os.chmod(path, mode)
+
+    def posix_rename(self, source, destination):
+        os.replace(source, destination)
+
+    def remove(self, path):
+        os.unlink(path)
+
+    def close(self):
+        pass
+
+
+class RemoteTextEditor(tk.Toplevel):
+    """Text editing over independent, short-lived SFTP channels."""
+
+    def __init__(self, parent, client_factory, path, on_saved=None, *, location="remote"):
+        super().__init__(parent)
+        self._location = location
+        self.title(f"Edit {location} file — {path}")
+        self.geometry("850x600")
+        self._factory = client_factory
+        self._path = path
+        self._on_saved = on_saved
+        self._original = None
+        self._busy = False
+        self._results = queue.Queue()
+        self._status = tk.StringVar(value="Loading…")
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", padx=8, pady=8)
+        self._save_button = ttk.Button(bar, text=f"Save to {location}", command=self._save, state="disabled")
+        self._save_button.pack(side="left")
+        ttk.Label(bar, textvariable=self._status).pack(side="left", padx=10)
+        self._text = scrolledtext.ScrolledText(self, wrap="none", undo=True, font="TkFixedFont")
+        self._text.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self._text.configure(state="disabled")
+        self.bind("<Control-s>", self._save)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.after(50, self._poll)
+        self._run(None)
+
+    def _run(self, replacement):
+        self._busy = True
+        self._save_button.configure(state="disabled")
+        self._text.configure(state="disabled")
+
+        def worker():
+            channel = None
+            try:
+                channel = self._factory()
+                path = channel.normalize(self._path)
+                if replacement is None:
+                    data = read_remote_text(channel, path)
+                else:
+                    if path != self._path:
+                        raise ProfileError("The remote file target changed. Reopen it before saving.")
+                    save_remote_text(channel, path, self._original, replacement)
+                    data = replacement
+                self._results.put((path, data, None, replacement is not None))
+            except Exception as exc:
+                self._results.put((self._path, None, str(exc), replacement is not None))
+            finally:
+                if channel is not None:
+                    channel.close()
+
+        threading.Thread(target=worker, daemon=True, name="sshvault-remote-editor").start()
+
+    def _poll(self):
+        try:
+            path, data, error, saved = self._results.get_nowait()
+        except queue.Empty:
+            self.after(50, self._poll)
+            return
+        self._busy = False
+        if error is not None:
+            self._status.set("Save failed; your edits are still here." if saved else "Could not open file.")
+            messagebox.showerror("Text editor", error.replace("remote file", f"{self._location} file"), parent=self)
+        else:
+            self._path = path
+            self._original = data
+            self._text.configure(state="normal")
+            if not saved:
+                self._text.insert("1.0", data.decode("utf-8"))
+                self._text.edit_reset()
+            self._text.edit_modified(False)
+            self._status.set(
+                f"Saved to {self._location}" if saved else f"UTF-8 text • Ctrl+S to save to {self._location}"
+            )
+            if saved and self._on_saved is not None:
+                self._on_saved()
+        if self._original is not None:
+            self._text.configure(state="normal")
+            self._save_button.configure(state="normal")
+        self.after(50, self._poll)
+
+    def _save(self, _event=None):
+        if not self._busy and self._original is not None:
+            self._status.set("Saving…")
+            self._run(self._text.get("1.0", "end-1c").encode("utf-8"))
+        return "break"
+
+    def _close(self):
+        if self._busy:
+            self._status.set("Wait for the current operation to finish before closing.")
+            return
+        if self._text.edit_modified() and not messagebox.askyesno(
+            "Unsaved edits", "Discard unsaved changes to this file?", parent=self
+        ):
+            return
+        self.destroy()
+
+
 class SFTPPanel(tk.Frame):
     def __init__(
         self,
@@ -1696,6 +1842,7 @@ class SFTPPanel(tk.Frame):
         self._remote_open_cache.mkdir(parents=True, exist_ok=True)
         self._transfer_queue: queue.Queue = queue.Queue()
         self._transfer_refresh_events: queue.Queue[bool] = queue.Queue(maxsize=1)
+        self._listing_refresh_tracker = SFTPTransferRefreshTracker()
         self._transfer_cancel = threading.Event()
         self._closed = False
         self._remote_generation = 0
@@ -1760,6 +1907,11 @@ class SFTPPanel(tk.Frame):
                 break
         if changed:
             self._refresh_transfer_tree()
+            destinations = self._listing_refresh_tracker.changed_destinations(list(self._transfer_manager.items))
+            if "local" in destinations:
+                self._refresh_local()
+            if "remote" in destinations:
+                self._refresh_remote()
         self.after(150, self._poll_transfer_refresh)
 
     def _build(self):
@@ -2504,17 +2656,10 @@ class SFTPPanel(tk.Frame):
             messagebox.showerror("Open", str(e))
 
     def _open_local_file(self, path: Path):
-        self._open_with_system(path)
+        RemoteTextEditor(self, LocalEditorChannel, str(path), location="local")
 
     def _open_remote_file(self, remote_path: str, name: str):
-        local_name = Path(name).name
-        cached = self._remote_open_cache / local_name
-        self._set_status(f"Opening {local_name}…")
-        self._transfer_queue.put(lambda r=remote_path, local_path=cached: self._download_and_open(r, local_path))
-
-    def _download_and_open(self, remote_path: str, local_path: Path):
-        self._sftp.get(remote_path, str(local_path), callback=self._progress_cb)
-        self.after(0, lambda p=local_path: self._open_with_system(p))
+        RemoteTextEditor(self, self._new_transfer_client, remote_path)
 
     def _set_status(self, msg):
         self._status_var.set(msg)
@@ -3366,7 +3511,10 @@ class SFTPPanel(tk.Frame):
         sel = self._remote_tree.selection()
         settings = getattr(self.winfo_toplevel(), "_runtime_settings", None)
         if not sel or (
-            confirm_delete_enabled(settings) and not messagebox.askyesno("Delete", f"Delete {len(sel)} item(s)?")
+            confirm_delete_enabled(settings)
+            and not messagebox.askyesno(
+                "Delete", f"Permanently delete {len(sel)} item(s), including all folder contents?"
+            )
         ):
             return
         for name in sel:
@@ -3377,10 +3525,13 @@ class SFTPPanel(tk.Frame):
 
     def _delete_remote_path(self, remote):
         try:
-            self._sftp.remove(remote)
-        except Exception:
-            self._sftp.rmdir(remote)
-        self.after(0, self._refresh_remote)
+            delete_remote_browser_path(SFTPBrowserClient(self._sftp), remote)
+        except Exception as exc:
+            self._dispatch(
+                lambda detail=str(exc) or type(exc).__name__: messagebox.showerror("Delete", detail, parent=self)
+            )
+        finally:
+            self._dispatch(self._refresh_remote)
 
     def _remote_rename(self):
         sel = self._remote_tree.selection()
@@ -6773,7 +6924,7 @@ class DiagnosticsDialog(tk.Toplevel):
         session = {
             "state": getattr(getattr(parent, "_workspace_state", None), "status", "disconnected"),
             "generation": getattr(parent, "_session_generation", 0),
-            "version": "0.3.4",
+            "version": "0.3.5",
         }
         self._diagnostics = DiagnosticsCollector.collect(profile, session)
         self._tree = ttk.Treeview(self, columns=("field", "value"), show="headings")
@@ -9402,6 +9553,13 @@ class SSHVaultApp(tk.Tk):
             tags = tree.item(selection[0], "tags")
             if len(tags) >= 2 and tags[1] == "dir":
                 load(str(tags[0]))
+            elif len(tags) >= 2 and tags[1] == "file":
+
+                def refreshed():
+                    local_cache.clear()
+                    load(force=True)
+
+                RemoteTextEditor(window, LocalEditorChannel, str(tags[0]), refreshed, location="local")
 
         tree.bind("<Double-Button-1>", open_selected)
         tree.bind("<Return>", open_selected)
@@ -9470,6 +9628,13 @@ class SSHVaultApp(tk.Tk):
             remote_buttons[label] = button
         remote_entry = ttk.Entry(remote, textvariable=remote_path_var)
         remote_entry.pack(fill="x", pady=3)
+        remote_search_var = tk.StringVar()
+        remote_search_bar = ttk.Frame(remote)
+        remote_search_bar.pack(fill="x", pady=(0, 4))
+        ttk.Label(remote_search_bar, text="Search this directory:").pack(side="left")
+        remote_search_entry = ttk.Entry(remote_search_bar, textvariable=remote_search_var)
+        remote_search_entry.pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(remote_search_bar, text="Clear", command=lambda: remote_search_var.set("")).pack(side="left")
         remote_columns = ("name", "size", "modified", "type", "permissions", "owner")
         remote_table = ttk.Frame(remote)
         remote_table.pack(fill="both", expand=True)
@@ -9571,19 +9736,48 @@ class SSHVaultApp(tk.Tk):
             ):
                 queue_buttons[label].configure(state="normal" if enabled[key] else "disabled")
 
+        rendered_queue_rows = {}
+        listing_refresh_tracker = SFTPTransferRefreshTracker()
+        pending_listing_refresh = set()
+        listing_refresh_timer = None
+
+        def refresh_transfer_destinations() -> None:
+            nonlocal listing_refresh_timer
+            listing_refresh_timer = None
+            if view_id not in self._sftp_views:
+                return
+            if "local" in pending_listing_refresh and not state.local_loading:
+                pending_listing_refresh.remove("local")
+                local_cache.clear()
+                load(force=True)
+            if (
+                "remote" in pending_listing_refresh
+                and state.remote_available
+                and not state.remote_loading
+                and not remote_mutating["active"]
+            ):
+                pending_listing_refresh.remove("remote")
+                remote_cache.clear()
+                load_remote(state.remote_current_path, history_action="refresh")
+            if pending_listing_refresh:
+                listing_refresh_timer = window.after(150, refresh_transfer_destinations)
+
         def refresh_transfer_queue() -> None:
+            nonlocal listing_refresh_timer
             scheduler = current_transfer_scheduler()
-            selected = set(queue_tree.selection())
-            queue_tree.delete(*queue_tree.get_children())
+            destinations = listing_refresh_tracker.changed_destinations(list(scheduler.items) if scheduler else [])
+            pending_listing_refresh.update(destinations)
+            if destinations and listing_refresh_timer is None:
+                listing_refresh_timer = window.after(150, refresh_transfer_destinations)
             rows = sftp_transfer_queue_rows(list(scheduler.items) if scheduler is not None else [])
-            for row in rows:
-                queue_tree.insert(
-                    "",
-                    "end",
-                    iid=row.item_id,
-                    values=(row.file, row.direction, row.progress, row.speed, row.eta, row.status),
-                )
-            queue_tree.selection_set([item_id for item_id in selected if queue_tree.exists(item_id)])
+            update_transfer_tree_rows(
+                queue_tree,
+                [
+                    (row.item_id, (row.file, row.direction, row.progress, row.speed, row.eta, row.status))
+                    for row in rows
+                ],
+                rendered_queue_rows,
+            )
             update_queue_actions()
 
         def act_on_selected_transfer(action: str) -> None:
@@ -9606,6 +9800,13 @@ class SSHVaultApp(tk.Tk):
                 refresh_transfer_queue()
 
         queue_buttons["Remove Completed"].configure(command=remove_completed_transfers)
+
+        def show_transfer_error(_event=None):
+            item = selected_transfer_item()
+            if item is not None and item.error:
+                messagebox.showerror("Transfer failed", item.error, parent=window)
+
+        queue_tree.bind("<Double-Button-1>", show_transfer_error)
         queue_tree.bind("<<TreeviewSelect>>", update_queue_actions)
         self._sftp_transfer_queue_callbacks[view_id] = (record.session_id, refresh_transfer_queue)
 
@@ -9884,8 +10085,9 @@ class SSHVaultApp(tk.Tk):
         local_buttons["Copy Path"].configure(command=local_copy_path)
 
         def render_remote() -> None:
+            selected = set(selected_paths(remote_tree))
             sorted_entries = sort_browser_entries(
-                remote_entries,
+                filter_browser_entries(remote_entries, remote_search_var.get()),
                 state.remote_sort_column,
                 state.remote_sort_descending,
             )
@@ -9905,7 +10107,14 @@ class SSHVaultApp(tk.Tk):
                         ),
                         tags=(item.full_path, "dir" if item.is_directory else "file"),
                     )
-            remote_status_var.set(f"{len(sorted_entries)} items")
+            for item_id in remote_tree.get_children():
+                if str(remote_tree.item(item_id, "tags")[0]) in selected:
+                    remote_tree.selection_add(item_id)
+            remote_status_var.set(
+                f"{len(sorted_entries)} of {len(remote_entries)} items"
+                if remote_search_var.get()
+                else f"{len(sorted_entries)} items"
+            )
             update_transfer_actions()
             update_mutation_actions()
 
@@ -10007,27 +10216,23 @@ class SSHVaultApp(tk.Tk):
             def worker() -> None:
                 try:
                     operation()
-                    failed = False
-                except Exception:
-                    failed = True
+                    error = None
+                except Exception as exc:
+                    error = f"{failure_message}\n\n{str(exc) or type(exc).__name__}"
 
                 def completed() -> None:
                     if view_id not in self._sftp_views or not state.generation_current(generation, True):
                         return
                     state.remote_loading = False
                     remote_mutating["active"] = False
-                    if failed:
-                        remote_status_var.set(failure_message)
-                        for label in ("Back", "Forward", "Up", "Home", "Refresh"):
-                            remote_buttons[label].configure(state="normal")
-                        remote_entry.configure(state="normal")
-                        update_mutation_actions()
-                        return
                     remote_cache.clear()
                     for label in ("Back", "Forward", "Up", "Home", "Refresh"):
                         remote_buttons[label].configure(state="normal")
                     remote_entry.configure(state="normal")
+                    # A failed recursive operation may already have removed some items.
                     load_remote(state.remote_current_path, history_action="refresh")
+                    if error:
+                        messagebox.showerror("Remote file operation", error, parent=window)
 
                 try:
                     self.after(0, completed)
@@ -10087,14 +10292,14 @@ class SSHVaultApp(tk.Tk):
                 selected,
                 messagebox.askyesno(
                     "Delete",
-                    f"Delete {len(selected)} selected remote item(s)?",
+                    f"Permanently delete {len(selected)} selected remote item(s)?\n\nFolders and all their contents will be deleted. This cannot be undone.",
                     parent=window,
                 ),
             )
             if not selected:
                 return
             run_remote_mutation(
-                lambda: delete_remote_browser_entries(browser_client, selected),
+                lambda: delete_remote_browser_entries(browser_client, selected, recursive=True),
                 "Could not delete selected remote item(s).",
             )
 
@@ -10140,6 +10345,16 @@ class SSHVaultApp(tk.Tk):
             target = selected_directory_target(remote_entries, [str(tags[0])] if tags else [])
             if target is not None:
                 load_remote(target, history_action="new")
+            elif tags and state.remote_available and not state.remote_loading:
+                selected = next((item for item in remote_entries if item.full_path == str(tags[0])), None)
+                if selected is not None and not selected.is_directory:
+
+                    def refreshed():
+                        remote_cache.clear()
+                        if view_id in self._sftp_views:
+                            remote_refresh()
+
+                    RemoteTextEditor(window, client.open_sftp, selected.full_path, refreshed)
 
         for label, command in (
             ("Back", remote_back),
@@ -10157,6 +10372,27 @@ class SSHVaultApp(tk.Tk):
         for column in remote_columns:
             remote_tree.heading(column, command=lambda name=column: sort_remote(name))
         bind_path_shortcuts(remote_entry, lambda _event: load_remote(remote_path_var.get()))
+
+        def search_changed(*_args):
+            render_remote()
+
+        def focus_remote_search(_event=None):
+            remote_search_entry.focus_set()
+            remote_search_entry.selection_range(0, "end")
+            return "break"
+
+        def type_remote_search(event):
+            if event.char and event.char.isprintable() and not event.state & 0x000C:
+                remote_search_entry.focus_set()
+                remote_search_var.set(remote_search_var.get() + event.char)
+                remote_search_entry.icursor("end")
+                return "break"
+
+        remote_search_var.trace_add("write", search_changed)
+        remote_search_entry.bind("<Escape>", lambda _event: remote_search_var.set(""))
+        remote_tree.bind("<Control-f>", focus_remote_search)
+        remote_tree.bind("<KeyPress>", type_remote_search, add="+")
+        remote_tree.bind("<Delete>", lambda _event: remote_delete())
         remote_tree.bind("<Double-Button-1>", open_remote_selected)
         remote_tree.bind("<Return>", open_remote_selected)
         bind_list_navigation(remote_tree)

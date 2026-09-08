@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.5
+
+- Add local and remote text editing with Save/Ctrl+S and conflict detection.
+- Support recursive remote deletion and show server error details.
+- Add remote filename search in the current directory.
+- Refresh destination listings automatically after uploads and downloads.
+- Fix false stalls during long transfers and checksum verification, and retain
+  bounded read-ahead when resuming a download.
+- Create missing parent directories for concurrent folder upload jobs.
+- Update changed transfer rows instead of rebuilding the entire queue.
+
 ## 0.3.4
 
 - Separate the SFTP Transfer Manager into a dedicated modeless window.

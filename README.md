@@ -28,7 +28,7 @@ The direct development launch remains available: `python sshvault/sshvault.py`.
 To install a built wheel:
 
 ```bash
-python -m pip install dist/sshvault-0.3.4-py3-none-any.whl
+python -m pip install dist/sshvault-0.3.5-py3-none-any.whl
 ```
 
 ## Usage
@@ -37,6 +37,24 @@ Launch SSHVault, create a profile, choose SSH agent, password, or private-key
 authentication, and connect. The workspace then exposes Terminal, SFTP, Remote
 Command, and Tunnels actions. Use Settings for appearance, timeout, scrollback,
 download-directory, and confirmation preferences.
+
+## SFTP files
+
+Double-click a local or remote text file to edit it in SSHVault. Use Save or
+Ctrl+S to write back to the original location. The editor supports UTF-8 files
+up to 2 MiB, preserves permission bits, and refuses to overwrite detected
+external changes. Remote saves require the server's atomic rename extension;
+a failed save keeps your edits in the editor.
+
+In the remote pane, type in Search this directory (or press Ctrl+F in the file
+list) to filter filenames. Typing in the remote list also starts a search.
+Clear the field to show all listed entries again. Search matches filenames in
+the current directory, not file contents or subdirectories.
+
+Remote Delete removes selected files and folders, including folder contents,
+after confirmation. Symbolic links are removed without following their targets.
+The destination pane refreshes automatically after transfers finish. Double-click
+a failed transfer row to see its error.
 
 ## Profiles and authentication
 

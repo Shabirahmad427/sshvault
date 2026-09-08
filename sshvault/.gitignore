@@ -1,0 +1,13 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+*
+!sshvault_sftp_server.py
+!tests/
+tests/*
+!tests/test_builtin_sftp_server.py
+!tests/test_large_file_sftp_regressions.py
+!tests/test_sftp_transfer_options.py
+
+!tests/test_text_editor.py
+!tests/test_sftp_recursive_delete_search.py
+!tests/test_sftp_refresh_and_stalls.py
+!.gitignore

@@ -937,7 +937,7 @@ class DiagnosticsCollector:
         profile = profile or {}
         session = session or {}
         values = {
-            "SSHVault version": str(session.get("version", "0.3.4")),
+            "SSHVault version": str(session.get("version", "0.3.5")),
             "Python version": platform.python_version(),
             "Paramiko version": str(session.get("paramiko_version", "Unavailable")),
             "Operating system": platform.platform(),
@@ -2951,6 +2951,16 @@ class TransferWorker:
     def checkpoint(self, transferred: int | None = None, total: int | None = None) -> None:
         self.scheduler._checkpoint(self.item_id, self.attempt, transferred, total, self.worker_id)
 
+    def verification_progress(self) -> None:
+        """Record a completed checksum read without changing transferred bytes."""
+        self.checkpoint()
+        with self.scheduler._condition:
+            item = self.scheduler.get(self.item_id)
+            if item is not None:
+                item.last_progress_at = self.scheduler.clock()
+                item.status = TransferState.VERIFYING
+        self.scheduler._changed(item_id=self.item_id, progress=True, force=False)
+
     def mark_resuming(self) -> None:
         """Expose resume state only after both handles are positioned."""
         self.scheduler._mark_resuming(self.item_id, self.attempt, self.worker_id)
@@ -4061,7 +4071,11 @@ class SFTPTransferRouter:
     @classmethod
     def _mkdir_remote(cls, item: TransferItem, client: Any, _worker: TransferWorker) -> None:
         """Create one remote directory, treating an existing directory as success."""
-        cls._ensure_remote_directory(client, item.target)
+        current = "/" if item.target.startswith("/") else ""
+        for part in item.target.strip("/").split("/"):
+            current = posixpath.join(current, part)
+            cls._ensure_remote_directory(client, current)
+            _worker.checkpoint(None, None)
 
     @staticmethod
     def _mkdir_local(item: TransferItem, _client: Any, _worker: TransferWorker) -> None:
@@ -4099,16 +4113,22 @@ class SFTPTransferRouter:
             "download": common or ("" if remote_selected else "no remote item selected"),
         }
 
-    def _digest_local(self, path: Path, length: int | None = None) -> bytes:
+    def _digest_local(
+        self, path: Path, length: int | None = None, offset: int = 0, *, progress: Callable[[], None] | None = None
+    ) -> bytes:
         digest = hashlib.sha1()
         remaining = length
         with path.open("rb") as source:
+            if offset:
+                source.seek(offset)
             while True:
                 size = 256 * 1024 if remaining is None else min(256 * 1024, remaining)
                 chunk = source.read(size)
                 if not chunk:
                     break
                 digest.update(chunk)
+                if progress is not None:
+                    progress()
                 if remaining is not None:
                     remaining -= len(chunk)
                     if remaining <= 0:
@@ -4116,20 +4136,33 @@ class SFTPTransferRouter:
         return digest.digest()
 
     @staticmethod
-    def _digest_remote(client: Any, path: str, length: int | None = None) -> bytes | None:
+    def _digest_remote(
+        client: Any,
+        path: str,
+        length: int | None = None,
+        offset: int = 0,
+        *,
+        progress: Callable[[], None] | None = None,
+    ) -> bytes | None:
         """Return a remote SHA-1 using check-file or a streamed fallback."""
         try:
             with client.open(path, "rb") as source:
                 checker = getattr(source, "check", None)
-                if callable(checker):
+                if callable(checker) and progress is None:
                     try:
-                        checked = checker("sha1", length=length or 0)
+                        checked = checker("sha1", offset=offset, length=length or 0)
                         if isinstance(checked, bytes):
                             return checked
                     except (OSError, NotImplementedError, AttributeError, TypeError):
                         pass
                 try:
-                    source.seek(0)
+                    source.seek(offset)
+                except (OSError, AttributeError, TypeError, ValueError):
+                    pass
+                # Bounded read-ahead also matters during checksum verification.
+                try:
+                    remaining_bytes = length if length is not None else int(client.stat(path).st_size) - offset
+                    SFTPTransferRouter._tune_stream(source, remaining=remaining_bytes, offset=offset)
                 except (OSError, AttributeError, TypeError, ValueError):
                     pass
                 digest = hashlib.sha1()
@@ -4142,15 +4175,21 @@ class SFTPTransferRouter:
                     if not chunk:
                         break
                     digest.update(chunk)
+                    if progress is not None:
+                        progress()
                     if remaining is not None:
                         remaining -= len(chunk)
                 if remaining is not None and remaining > 0:
                     return None
                 return digest.digest()
+        except InterruptedError:
+            raise
         except (OSError, NotImplementedError, AttributeError, TypeError, ValueError):
             return None
 
-    def _verify_remote_file(self, client: Any, local: Path, remote: str, total: int) -> bool:
+    def _verify_remote_file(
+        self, client: Any, local: Path, remote: str, total: int, *, progress: Callable[[], None] | None = None
+    ) -> bool:
         try:
             if int(client.stat(remote).st_size) != total:
                 return False
@@ -4158,17 +4197,37 @@ class SFTPTransferRouter:
             return False
         if not self.verify_completed:
             return True
-        remote_digest = self._digest_remote(client, remote)
-        return remote_digest is not None and remote_digest == self._digest_local(local)
+        remote_digest = self._digest_remote(client, remote, progress=progress)
+        return remote_digest is not None and remote_digest == self._digest_local(local, progress=progress)
 
-    def _partial_matches_source(self, client: Any, local: Path, remote: str, offset: int) -> bool:
-        if offset <= 0:
+    def _partial_matches_source(
+        self,
+        client: Any,
+        local: Path,
+        remote: str,
+        offset: int,
+        *,
+        since: int = 0,
+        progress: Callable[[], None] | None = None,
+    ) -> bool:
+        """Verify only the [since, offset) delta.
+
+        Re-hashing the whole prefix on every reconnect makes verification cost
+        grow with each retry (O(offset) per retry instead of O(total) overall),
+        which is catastrophic for multi-GB transfers with a few transient
+        timeouts. ``since`` lets a caller that already trusts a prefix (because
+        this same worker wrote it earlier in this attempt) skip re-hashing it.
+        """
+        if offset <= since:
             return True
-        remote_digest = self._digest_remote(client, remote, offset)
-        return remote_digest is not None and remote_digest == self._digest_local(local, offset)
+        length = offset - since
+        remote_digest = self._digest_remote(client, remote, length, offset=since, progress=progress)
+        return remote_digest is not None and remote_digest == self._digest_local(
+            local, length, offset=since, progress=progress
+        )
 
     @staticmethod
-    def _tune_stream(stream: Any, *, remaining: int | None = None) -> None:
+    def _tune_stream(stream: Any, *, remaining: int | None = None, offset: int = 0) -> None:
         """Enable Paramiko's safe pipelining/prefetch when the channel supports it.
 
         Lightweight test doubles and non-Paramiko clients simply fall back to
@@ -4185,15 +4244,14 @@ class SFTPTransferRouter:
         prefetch = getattr(stream, "prefetch", None)
         if callable(prefetch):
             try:
-                prefetch(file_size=remaining, max_concurrent_prefetch_requests=32)
+                prefetch(file_size=offset + remaining, max_concurrent_prefetch_requests=32)
             except Exception:
-                try:
-                    prefetch(file_size=remaining)
-                except Exception:
-                    pass
+                # Older clients fall back to streaming; never issue unbounded read-ahead.
+                pass
 
     def _upload(self, item: TransferItem, client: Any, worker: TransferWorker) -> None:
         local = Path(item.source)
+        progress = getattr(worker, "verification_progress", None)
         item.preflight = self._new_preflight()
         try:
             start_snapshot = self._source_snapshot(local)
@@ -4234,7 +4292,7 @@ class SFTPTransferRouter:
             and int(getattr(final, "st_size", -1)) == total
             and getattr(final, "st_mtime", None) is not None
             and int(final.st_mtime) == int(source_mtime)
-            and self._verify_remote_file(client, local, item.target, total)
+            and self._verify_remote_file(client, local, item.target, total, progress=progress)
         ):
             if self._source_snapshot(local) != start_snapshot:
                 item.diagnostics.append("Source still changing")
@@ -4258,7 +4316,7 @@ class SFTPTransferRouter:
             raise ProfileError("Source file is still being modified")
         resumable_size = 0
         if 0 < preflight_partial_size <= total and self.resume_partial:
-            if self._partial_matches_source(client, local, partial, preflight_partial_size):
+            if self._partial_matches_source(client, local, partial, preflight_partial_size, progress=progress):
                 resumable_size = preflight_partial_size
             else:
                 item.diagnostics.append("Invalid partial file")
@@ -4269,6 +4327,13 @@ class SFTPTransferRouter:
         if free_space is not None and free_space < total - resumable_size:
             item.diagnostics.append("Insufficient remote free space")
             raise ProfileError("Remote filesystem full")
+        # Bytes at [0, verified_through) have already been hash-verified against
+        # the local source. Only this worker appends to `partial` during this
+        # call, so on a reconnect the newly observed remote offset is always
+        # our own not-yet-verified tail -- re-checking from byte 0 every retry
+        # would make verification cost grow with each reconnect instead of
+        # staying bounded by the file size.
+        verified_through = resumable_size
         reconnects = 0
         while True:
             partial_present = False
@@ -4283,12 +4348,17 @@ class SFTPTransferRouter:
                 item.diagnostics.append("Resume disabled")
                 offset = 0
             elif partial_present and not invalid_partial:
-                invalid_partial = not self._partial_matches_source(client, local, partial, offset)
+                invalid_partial = not self._partial_matches_source(
+                    client, local, partial, offset, since=verified_through, progress=progress
+                )
+                if not invalid_partial:
+                    verified_through = offset
             if invalid_partial:
                 item.restart_required = True
                 if "Invalid partial file" not in item.diagnostics:
                     item.diagnostics.append("Invalid partial file")
                 offset = 0
+                verified_through = 0
             if partial_present and offset == total:
                 break
             source = target = None
@@ -4307,8 +4377,9 @@ class SFTPTransferRouter:
                         item.diagnostics.append("Source still changing")
                         raise ProfileError("Source file is still being modified")
                     target.write(chunk)
-                    item.transferred += len(chunk)
-                    worker.checkpoint(item.transferred, total)
+                    transferred = item.transferred + len(chunk)
+                    worker.checkpoint(transferred, total)
+                    item.transferred = transferred
                 target.close()
                 target = None
                 break
@@ -4347,8 +4418,8 @@ class SFTPTransferRouter:
             raise ProfileError("Final size mismatch")
         if self.verify_completed:
             verification_snapshot = self._source_snapshot(local)
-            remote_digest = self._digest_remote(client, partial)
-            local_digest = self._digest_local(local)
+            remote_digest = self._digest_remote(client, partial, progress=progress)
+            local_digest = self._digest_local(local, progress=progress)
             verification_complete_snapshot = self._source_snapshot(local)
             if verification_snapshot != start_snapshot or verification_complete_snapshot != verification_snapshot:
                 item.diagnostics.append("Source still changing")
@@ -4382,6 +4453,7 @@ class SFTPTransferRouter:
     def _download(self, item: TransferItem, client: Any, worker: TransferWorker) -> None:
         if not self._prepare_download_destination(item):
             return
+        progress = getattr(worker, "verification_progress", None)
         item.preflight = self._new_preflight()
         target = Path(item.target)
         try:
@@ -4410,7 +4482,9 @@ class SFTPTransferRouter:
             and remote_mtime is not None
             and int(target.stat().st_mtime) == int(remote_mtime)
         ):
-            if not self.verify_completed or self._digest_remote(client, item.source) == self._digest_local(target):
+            if not self.verify_completed or self._digest_remote(
+                client, item.source, progress=progress
+            ) == self._digest_local(target, progress=progress):
                 item.transferred = total
                 item.resume_offset = total
                 worker.checkpoint(total, total)
@@ -4431,8 +4505,10 @@ class SFTPTransferRouter:
             raise ProfileError("Source file is still being modified")
         resumable_size = 0
         if 0 < preflight_partial_size <= total and self.resume_partial:
-            remote_prefix = self._digest_remote(client, item.source, preflight_partial_size)
-            if remote_prefix is not None and remote_prefix == self._digest_local(partial):
+            remote_prefix = self._digest_remote(client, item.source, preflight_partial_size, progress=progress)
+            if remote_prefix is not None and remote_prefix == self._digest_local(
+                partial, preflight_partial_size, progress=progress
+            ):
                 resumable_size = preflight_partial_size
             else:
                 item.diagnostics.append("Invalid partial file")
@@ -4444,6 +4520,11 @@ class SFTPTransferRouter:
         if free_space is not None and free_space < total - resumable_size:
             item.diagnostics.append("Insufficient local free space")
             raise ProfileError("Local filesystem full")
+        # See the matching comment in _upload: only this worker appends to
+        # `partial` during this call, so re-verifying the whole prefix from
+        # byte 0 on every reconnect makes cost grow with each retry instead of
+        # staying bounded by the file size.
+        verified_through = resumable_size
         reconnects = 0
         while True:
             try:
@@ -4458,15 +4539,23 @@ class SFTPTransferRouter:
                 partial.unlink(missing_ok=True)
                 offset = 0
                 partial_present = False
-            elif partial_present and not invalid_partial and offset:
-                remote_prefix = self._digest_remote(client, item.source, offset)
-                invalid_partial = remote_prefix is None or remote_prefix != self._digest_local(partial)
+            elif partial_present and not invalid_partial and offset > verified_through:
+                delta = offset - verified_through
+                remote_prefix = self._digest_remote(
+                    client, item.source, delta, offset=verified_through, progress=progress
+                )
+                invalid_partial = remote_prefix is None or remote_prefix != self._digest_local(
+                    partial, delta, offset=verified_through, progress=progress
+                )
+                if not invalid_partial:
+                    verified_through = offset
             if invalid_partial:
                 item.restart_required = True
                 if "Invalid partial file" not in item.diagnostics:
                     item.diagnostics.append("Invalid partial file")
                 partial.unlink(missing_ok=True)
                 offset = 0
+                verified_through = 0
             if partial_present and offset == total:
                 break
             source = destination = None
@@ -4478,13 +4567,14 @@ class SFTPTransferRouter:
                     destination.seek(offset)
                 item.resume_offset = offset
                 item.transferred = offset
-                self._tune_stream(source, remaining=total - offset)
+                self._tune_stream(source, remaining=total - offset, offset=offset)
                 worker.checkpoint(offset, total)
                 checked_at = offset
                 while chunk := source.read(1024 * 1024):
                     destination.write(chunk)
-                    item.transferred += len(chunk)
-                    worker.checkpoint(item.transferred, total)
+                    transferred = item.transferred + len(chunk)
+                    worker.checkpoint(transferred, total)
+                    item.transferred = transferred
                     if item.transferred - checked_at >= 16 * 1024 * 1024:
                         current = client.stat(item.source)
                         if (int(current.st_size), getattr(current, "st_mtime", None)) != start_snapshot:
@@ -4523,10 +4613,10 @@ class SFTPTransferRouter:
         if partial.stat().st_size != total:
             raise ProfileError("Final size mismatch")
         if self.verify_completed:
-            remote_digest = self._digest_remote(client, item.source)
+            remote_digest = self._digest_remote(client, item.source, progress=progress)
             if remote_digest is None:
                 raise ProfileError("Checksum verification unavailable")
-            if remote_digest != self._digest_local(partial):
+            if remote_digest != self._digest_local(partial, progress=progress):
                 raise ProfileError("Checksum mismatch")
         partial.replace(target)
         if self.preserve_timestamps and remote_mtime is not None:
@@ -5096,6 +5186,9 @@ class SFTPBrowserClient:
     def stat(self, path: str) -> Any:
         return self._channel.stat(path)
 
+    def lstat(self, path: str) -> Any:
+        return self._channel.lstat(path)
+
     def mkdir(self, path: str) -> None:
         self._channel.mkdir(path)
 
@@ -5404,18 +5497,54 @@ def rename_remote_browser_entry(client: SFTPBrowserClient, source: str, name: st
     return target
 
 
-def delete_remote_browser_entries(client: SFTPBrowserClient, entries: list[Any]) -> list[str]:
-    for entry in entries:
-        if entry.is_directory and list(client.list_directory(entry.full_path)):
-            raise ProfileError("Directory must be empty before deletion.")
+def delete_remote_browser_entries(
+    client: SFTPBrowserClient, entries: list[Any], *, recursive: bool = False
+) -> list[str]:
+    paths = [normalize_remote_path(str(entry.full_path)) for entry in entries]
+    if "/" in paths:
+        raise ProfileError("The remote root directory cannot be deleted.")
+    if not recursive:
+        for entry in entries:
+            if entry.is_directory and not entry.is_symlink and list(client.list_directory(entry.full_path)):
+                raise ProfileError("Directory must be empty before deletion.")
     deleted = []
     for entry in entries:
-        if entry.is_directory:
+        if recursive:
+            delete_remote_browser_path(client, str(entry.full_path))
+        elif entry.is_directory and not entry.is_symlink:
             client.rmdir(entry.full_path)
         else:
             client.remove(entry.full_path)
         deleted.append(str(entry.full_path))
     return deleted
+
+
+def delete_remote_browser_path(client: SFTPBrowserClient, path: str) -> None:
+    """Delete a tree without following symbolic links or filtering hidden files."""
+    path = normalize_remote_path(path)
+    if path == "/":
+        raise ProfileError("The remote root directory cannot be deleted.")
+    pending = [(path, False)]
+    while pending:
+        current, visited = pending.pop()
+        mode = client.lstat(current).st_mode
+        if mode is None:
+            raise ProfileError(f"Cannot determine the remote item type: {current}")
+        if int(mode) & 0o170000 != 0o040000:
+            client.remove(current)
+        elif visited:
+            client.rmdir(current)
+        else:
+            children = list(client.list_directory(current))
+            names = [validate_sftp_item_name(str(child.filename)) for child in children]
+            pending.append((current, True))
+            pending.extend((posixpath.join(current, name), False) for name in names)
+
+
+def filter_browser_entries(entries: list[Any], query: str) -> list[Any]:
+    """Match a literal, case-insensitive substring of the displayed filename."""
+    needle = query.casefold()
+    return [entry for entry in entries if needle in entry.name.casefold()]
 
 
 def _permissions(mode: int | None) -> str:
@@ -7501,3 +7630,68 @@ class VTETerminalBackend(TerminalBackend):
         if self._directory:
             shutil.rmtree(self._directory, ignore_errors=True)
             self._directory = None
+
+
+REMOTE_TEXT_LIMIT = 2 * 1024 * 1024
+
+
+def read_remote_text(channel: Any, path: str) -> bytes:
+    """Bound editor reads and reject binary/non-UTF-8 content without changing it."""
+    with channel.open(path, "rb") as stream:
+        data = stream.read(REMOTE_TEXT_LIMIT + 1)
+    if len(data) > REMOTE_TEXT_LIMIT:
+        raise ProfileError("The text editor supports files up to 2 MiB. Download this file instead.")
+    if b"\x00" in data:
+        raise ProfileError("This is a binary file. Download it to open it locally.")
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProfileError("The text editor requires UTF-8 text. Download this file instead.") from exc
+    return data
+
+
+def save_remote_text(channel: Any, path: str, original: bytes, replacement: bytes) -> None:
+    """Stage a complete replacement; refuse to overwrite externally edited text."""
+    if len(replacement) > REMOTE_TEXT_LIMIT:
+        raise ProfileError("The text editor supports files up to 2 MiB.")
+    if read_remote_text(channel, path) != original:
+        raise ProfileError("The remote file changed. Reopen it and merge your edits before saving.")
+    mode = channel.stat(path).st_mode & 0o7777
+    temporary = posixpath.join(posixpath.dirname(path), ".sshvault-edit-" + uuid4().hex)
+    try:
+        with channel.open(temporary, "wx") as stream:
+            stream.write(replacement)
+        channel.chmod(temporary, mode)
+        if read_remote_text(channel, path) != original:
+            raise ProfileError("The remote file changed while saving. Your edits have been kept in the editor.")
+        channel.posix_rename(temporary, path)
+    finally:
+        try:
+            channel.remove(temporary)
+        except OSError:
+            pass
+
+
+class SFTPTransferRefreshTracker:
+    """Invalidate destination listings once per terminal transfer transition."""
+
+    def __init__(self) -> None:
+        self._seen: dict[str, tuple[Any, ...]] = {}
+
+    def changed_destinations(self, items: list[TransferItem]) -> set[str]:
+        changed = set()
+        current = {}
+        for item in items:
+            marker = (item.status, item.generation, item.started_at)
+            current[item.item_id] = marker
+            if self._seen.get(item.item_id) != marker and item.status in {
+                TransferState.COMPLETED,
+                TransferState.FAILED,
+                TransferState.CANCELLED,
+            }:
+                if item.direction == "Upload":
+                    changed.add("remote")
+                elif item.direction == "Download":
+                    changed.add("local")
+        self._seen = current
+        return changed
