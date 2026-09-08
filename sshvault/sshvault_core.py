@@ -7639,6 +7639,8 @@ def read_remote_text(channel: Any, path: str) -> bytes:
     """Bound editor reads and reject binary/non-UTF-8 content without changing it."""
     with channel.open(path, "rb") as stream:
         data = stream.read(REMOTE_TEXT_LIMIT + 1)
+    if not isinstance(data, bytes):
+        raise ProfileError("The file could not be read as bytes.")
     if len(data) > REMOTE_TEXT_LIMIT:
         raise ProfileError("The text editor supports files up to 2 MiB. Download this file instead.")
     if b"\x00" in data:
